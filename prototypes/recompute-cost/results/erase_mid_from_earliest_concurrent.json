@@ -1,0 +1,138 @@
+{
+ "label": "mid",
+ "strategy": "from_earliest",
+ "concurrent": true,
+ "clone_s": 1.1211485862731934,
+ "episode_cited_by_versions": 2086,
+ "citation_rows": 2086,
+ "cited_nodes": 500,
+ "affected_nodes": 500,
+ "affected_node_versions_before": 64111,
+ "affected_node_contributions_before": 36061,
+ "wall_ms": 25746.702560019912,
+ "function_metrics": {
+  "nodes": 500,
+  "steps": 8898,
+  "ms_lock": 7.749,
+  "ms_delete": 59.989,
+  "ms_rebuild": 25673.412,
+  "versions_reopened": 9222,
+  "contributions_deleted": 500,
+  "citations_deleted_direct": 2086,
+  "versions_closed_by_replay": 28195,
+  "versions_inserted_by_replay": 37656,
+  "versions_deleted_by_truncate": 39863
+ },
+ "tenant_counts_before": {
+  "versions": 121542,
+  "citations": 515559,
+  "contributions": 78880,
+  "episodes": 39216
+ },
+ "tenant_counts_after": {
+  "versions": 119339,
+  "citations": 507682,
+  "contributions": 78384,
+  "episodes": 39217
+ },
+ "semantic_diff": {
+  "pre_rows": 64111,
+  "post_rows": 61907,
+  "rows_gone": 3441,
+  "rows_values_rewritten": 382,
+  "rows_recorded_to_rewritten": 541,
+  "rows_new": 1237,
+  "pre_cites": 284004,
+  "post_cites": 276125
+ },
+ "oracle_samples": 3000,
+ "oracle_disagree": 0,
+ "citations_of_erased_left": 0,
+ "contributions_of_erased_left": 0,
+ "reads": {
+  "control": {
+   "n": 10122,
+   "p50": 4.616838006768376,
+   "p95": 6.303185511205812,
+   "p99": 7.146664216124919,
+   "mean": 4.712342084927047,
+   "max": 10.498589021153748
+  },
+  "during_erasure": {
+   "n": 47365,
+   "p50": 4.244181007379666,
+   "p95": 5.7411459856666625,
+   "p99": 6.721957960398868,
+   "mean": 4.336960764052402,
+   "max": 25.658010999904945
+  },
+  "after": {
+   "n": 7704,
+   "p50": 4.089226989890449,
+   "p95": 5.2339179936097935,
+   "p99": 5.9454627559171085,
+   "mean": 4.145555883024162,
+   "max": 7.415150990709662
+  },
+  "during_affected_nodes": {
+   "n": 23762,
+   "p50": 4.254306506481953,
+   "p95": 5.7440819800831395,
+   "p99": 6.727057512616737,
+   "mean": 4.349240586295509,
+   "max": 25.658010999904945
+  },
+  "during_other_nodes": {
+   "n": 23603,
+   "p50": 4.232962004607543,
+   "p95": 5.739651990006681,
+   "p99": 6.715395411010832,
+   "mean": 4.3245982196241215,
+   "max": 20.72147699072957
+  },
+  "control_affected_nodes": {
+   "n": 5123,
+   "p50": 4.619412997271866,
+   "p95": 6.275458115851506,
+   "p99": 7.063248595804904,
+   "mean": 4.7125708172588645,
+   "max": 8.916405000491068
+  },
+  "control_other_nodes": {
+   "n": 4999,
+   "p50": 4.61441301740706,
+   "p95": 6.3334830017993236,
+   "p99": 7.208514202502564,
+   "mean": 4.712107678898661,
+   "max": 10.498589021153748
+  },
+  "control_qps": 1687.0,
+  "erasing_qps": 1839.653054195355
+ },
+ "writers": {
+  "affected": {
+   "ms": 22748.760361981113,
+   "finished_at": 1795303377.918955,
+   "erasure_ended_at_offset_s": 25.74671769142151,
+   "started_offset_s": 3
+  },
+  "unaffected": {
+   "ms": 7.5600010168273,
+   "finished_at": 1795303377.9265935,
+   "erasure_ended_at_offset_s": 25.74671769142151,
+   "started_offset_s": 3
+  }
+ },
+ "lock_summary_max_per_sample": {
+  "advisory/ExclusiveLock/granted": 500,
+  "relation/AccessShareLock/granted": 14,
+  "relation/RowExclusiveLock/granted": 13,
+  "transactionid/ExclusiveLock/granted": 1,
+  "virtualxid/ExclusiveLock/granted": 1,
+  "relation/RowShareLock/granted": 12,
+  "others waiting on advisory": 1,
+  "spectoken/ExclusiveLock/granted": 1
+ },
+ "lock_samples": 116,
+ "max_ungranted_locks_seen_from_other_backends": 1
+}

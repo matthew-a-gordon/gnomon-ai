@@ -1,0 +1,52 @@
+{
+ "label": "late",
+ "strategy": "full",
+ "concurrent": false,
+ "clone_s": 1.1036040782928467,
+ "episode_cited_by_versions": 1305,
+ "citation_rows": 1305,
+ "cited_nodes": 500,
+ "affected_nodes": 500,
+ "affected_node_versions_before": 59664,
+ "affected_node_contributions_before": 34961,
+ "wall_ms": 32869.32715898729,
+ "function_metrics": {
+  "nodes": 500,
+  "steps": 17196,
+  "ms_lock": 7.829,
+  "ms_delete": 29.608,
+  "ms_rebuild": 32829.604,
+  "versions_reopened": 0,
+  "contributions_deleted": 500,
+  "citations_deleted_direct": 1305,
+  "versions_closed_by_replay": 37466,
+  "versions_inserted_by_replay": 57783,
+  "versions_deleted_by_truncate": 59664
+ },
+ "tenant_counts_before": {
+  "versions": 122727,
+  "citations": 513952,
+  "contributions": 81034,
+  "episodes": 40215
+ },
+ "tenant_counts_after": {
+  "versions": 120846,
+  "citations": 506620,
+  "contributions": 80534,
+  "episodes": 40214
+ },
+ "semantic_diff": {
+  "pre_rows": 59664,
+  "post_rows": 57783,
+  "rows_gone": 2234,
+  "rows_values_rewritten": 120,
+  "rows_recorded_to_rewritten": 779,
+  "rows_new": 353,
+  "pre_cites": 261194,
+  "post_cites": 253862
+ },
+ "oracle_samples": 3000,
+ "oracle_disagree": 0,
+ "citations_of_erased_left": 0,
+ "contributions_of_erased_left": 0
+}
