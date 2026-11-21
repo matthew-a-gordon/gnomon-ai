@@ -17,7 +17,7 @@ Driver configurations: `tokio-postgres` with named statements, and with unnamed 
 ## Targets
 
 1. Local: `postgres:17` on host port 55435 behind a PgBouncer container in transaction mode on host port 56432. Add a local Supavisor if practical, on host port 56543.
-2. Hosted Supabase Supavisor, transaction mode (port 6543). The user has approved using the Supabase project `szdzzrluksxakkxvuymp`. Its `main` branch is production: there, run only `SELECT` statements and `set_config`, with no DDL and no table writes. If you need any schema, create a separate Supabase branch with the Supabase MCP tools (confirm the cost), and delete it when finished. Ask the user for the pooler connection string and password; do not search other repositories for secrets.
+2. Supavisor through a local stack run with the Supabase CLI, on its own `project_id` and ports, with the pooler in transaction mode. By the user's instruction, the hosted Supabase project is not used at all: no connections, no MCP calls, no branches.
 3. DigitalOcean managed PostgreSQL. `doctl` is installed and authenticated, and the account has no database clusters. Create the smallest PostgreSQL 17 cluster (one node, `db-s-1vcpu-1gb`) in a nearby region, add a transaction-mode pool, and restrict trusted sources to this machine's public IP. Tell the user when you create it, with its hourly cost. Destroy it as soon as the tests finish, confirm with `doctl databases list` that it is gone, and report how long it ran.
 
 Record the pooler versions where they can be seen.
