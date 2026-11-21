@@ -1,0 +1,77 @@
+local-pgbouncer-1.26.1 max_prepared_statements=0 | tp-named | clients=60 txns/client=50 | ok=11 err=1568 leaks=0 (of 53 checks) | 75 txn/s | p50=6.4ms p95=6.8ms p99=6.8ms
+    1247 x db error: prepared statement "s##" does not exist
+    162 x db error: prepared statement "s###" does not exist
+    127 x db error: prepared statement "s#" does not exist
+    23 x connect/prepare: db error: prepared statement "s###" already exists
+    6 x connect/prepare: db error: prepared statement "s##" already exists
+    3 x db error: bind message supplies # parameters, but prepared statement "s###" requires #
+local-pgbouncer-1.26.1 max_prepared_statements=0 | tp-typed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 4173 txn/s | p50=14.2ms p95=15.9ms p99=16.8ms
+local-pgbouncer-1.26.1 max_prepared_statements=0 | sqlx-cache | clients=60 txns/client=50 | ok=0 err=3000 leaks=0 (of 0 checks) | 0 txn/s | p50=NaNms p95=NaNms p99=NaNms
+    2460 x error returned from database: prepared statement "sqlx_s_##" already exists
+    540 x error returned from database: prepared statement "sqlx_s_#" already exists
+local-pgbouncer-1.26.1 max_prepared_statements=0 | sqlx-nocache | clients=60 txns/client=50 | ok=0 err=3000 leaks=0 (of 0 checks) | 0 txn/s | p50=NaNms p95=NaNms p99=NaNms
+    2460 x error returned from database: prepared statement "sqlx_s_##" already exists
+    540 x error returned from database: prepared statement "sqlx_s_#" already exists
+local-pgbouncer-1.26.1 max_prepared_statements=0 | sqlx-unnamed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 3142 txn/s | p50=18.9ms p95=20.8ms p99=21.4ms
+local-pgbouncer-1.26.1 mps=0 (autocommit probe) | sqlx-unnamed | clients=60 txns/client=50 | ok=1116 err=1884 leaks=0 (of 4116 checks) | 1196 txn/s | p50=15.9ms p95=18.2ms p99=20.7ms
+    1884 x error returned from database: unnamed prepared statement does not exist
+local-pgbouncer-1.26.1 max_prepared_statements=200 | tp-named | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 3638 txn/s | p50=15.8ms p95=17.6ms p99=45.8ms
+local-pgbouncer-1.26.1 max_prepared_statements=200 | tp-typed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 4272 txn/s | p50=13.9ms p95=15.3ms p99=15.8ms
+local-pgbouncer-1.26.1 max_prepared_statements=200 | sqlx-cache | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 3821 txn/s | p50=15.2ms p95=18.4ms p99=22.5ms
+local-pgbouncer-1.26.1 max_prepared_statements=200 | sqlx-nocache | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 2467 txn/s | p50=24.0ms p95=26.3ms p99=27.1ms
+local-pgbouncer-1.26.1 max_prepared_statements=200 | sqlx-unnamed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 3121 txn/s | p50=18.8ms p95=21.5ms p99=22.9ms
+local-pgbouncer-1.26.1 mps=200 HEAVY | tp-named | clients=200 txns/client=100 | ok=20000 err=0 leaks=0 (of 40000 checks) | 3765 txn/s | p50=53.2ms p95=56.3ms p99=58.4ms
+local-pgbouncer-1.26.1 mps=200 HEAVY | tp-typed | clients=200 txns/client=100 | ok=20000 err=0 leaks=0 (of 40000 checks) | 4231 txn/s | p50=47.2ms p95=50.3ms p99=52.1ms
+local-pgbouncer-1.26.1 mps=200 HEAVY | sqlx-cache | clients=200 txns/client=100 | ok=20000 err=0 leaks=0 (of 40000 checks) | 3496 txn/s | p50=52.9ms p95=71.5ms p99=80.5ms
+local-pgbouncer-1.26.1 mps=200 HEAVY | sqlx-nocache | clients=200 txns/client=100 | ok=20000 err=0 leaks=0 (of 40000 checks) | 2288 txn/s | p50=84.7ms p95=106.5ms p99=116.4ms
+local-pgbouncer-1.26.1 mps=200 HEAVY | sqlx-unnamed | clients=200 txns/client=100 | ok=20000 err=0 leaks=0 (of 40000 checks) | 3061 txn/s | p50=64.5ms p95=69.0ms p99=95.0ms
+local-supavisor-2.10.1 transaction | tp-named | clients=60 txns/client=50 | ok=2 err=2998 leaks=0 (of 15 checks) | 8 txn/s | p50=10.6ms p95=10.6ms p99=10.6ms
+    2423 x db error: prepared statement "s##" does not exist
+    465 x db error: prepared statement "s#" does not exist
+    110 x db error: prepared statement "s###" does not exist
+local-supavisor-2.10.1 transaction | tp-typed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 3994 txn/s | p50=14.8ms p95=17.0ms p99=19.1ms
+local-supavisor-2.10.1 transaction | sqlx-cache | clients=60 txns/client=50 | ok=958 err=2042 leaks=0 (of 2435 checks) | 1072 txn/s | p50=13.4ms p95=28.5ms p99=33.8ms
+    531 x error returned from database: incorrect binary data format in bind parameter #
+    498 x error returned from database: bind message supplies # parameters, but prepared statement "sqlx_s_##" requires 
+    378 x error returned from database: prepared statement "sqlx_s_#" already exists
+    291 x error returned from database: bind message supplies # parameters, but prepared statement "sqlx_s_#" requires #
+    220 x error returned from database: prepared statement "sqlx_s_##" already exists
+    94 x error returned from database: prepared statement "sqlx_s_##" does not exist
+    25 x error returned from database: invalid byte sequence for encoding "UTF#": #x##
+    5 x error returned from database: insufficient data left in message
+local-supavisor-2.10.1 transaction | sqlx-nocache | clients=60 txns/client=50 | ok=124 err=2876 leaks=0 (of 287 checks) | 397 txn/s | p50=11.5ms p95=13.4ms p99=13.7ms
+    2326 x error returned from database: prepared statement "sqlx_s_##" already exists
+    540 x error returned from database: prepared statement "sqlx_s_#" already exists
+    10 x error returned from database: prepared statement "sqlx_s_###" already exists
+local-supavisor-2.10.1 transaction | sqlx-unnamed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 2754 txn/s | p50=21.6ms p95=24.2ms p99=25.3ms
+local-supavisor-2.10.1 transaction named_prepared_statements=on | tp-named | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 3207 txn/s | p50=18.4ms p95=22.7ms p99=26.4ms
+local-supavisor-2.10.1 transaction named_prepared_statements=on | tp-typed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 3185 txn/s | p50=18.1ms p95=24.4ms p99=25.6ms
+local-supavisor-2.10.1 transaction named_prepared_statements=on | sqlx-cache | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 3094 txn/s | p50=18.2ms p95=25.2ms p99=30.8ms
+local-supavisor-2.10.1 transaction named_prepared_statements=on | sqlx-nocache | clients=60 txns/client=50 | ok=1498 err=1502 leaks=0 (of 2998 checks) | 1983 txn/s | p50=26.9ms p95=32.7ms p99=66.4ms
+    1442 x error communicating with database: expected to read # bytes, got # bytes at EOF
+    57 x error returned from database: (EMAXPREPARED) max prepared statements limit reached. Limit: ### per connection
+    3 x error returned from database: (ECHECKOUTRETRIES) failed to check out a connection after multiple retries
+local-supavisor-2.10.1 transaction named_prepared_statements=on | sqlx-unnamed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 2359 txn/s | p50=23.8ms p95=32.9ms p99=60.2ms
+supabase-cli-local-stack supavisor-2.10.1 transaction (default flags) | tp-named | clients=60 txns/client=50 | ok=0 err=3000 leaks=0 (of 3 checks) | 0 txn/s | p50=NaNms p95=NaNms p99=NaNms
+    2462 x db error: prepared statement "s##" does not exist
+    486 x db error: prepared statement "s#" does not exist
+    52 x db error: prepared statement "s###" does not exist
+supabase-cli-local-stack supavisor-2.10.1 transaction (default flags) | tp-typed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 4486 txn/s | p50=13.1ms p95=15.9ms p99=17.4ms
+supabase-cli-local-stack supavisor-2.10.1 transaction (default flags) | sqlx-cache | clients=60 txns/client=50 | ok=1657 err=1343 leaks=0 (of 3898 checks) | 2562 txn/s | p50=12.2ms p95=16.1ms p99=19.4ms
+    490 x error returned from database: bind message supplies # parameters, but prepared statement "sqlx_s_#" requires #
+    234 x error returned from database: prepared statement "sqlx_s_#" already exists
+    217 x error returned from database: prepared statement "sqlx_s_##" does not exist
+    180 x error returned from database: incorrect binary data format in bind parameter #
+    111 x error returned from database: prepared statement "sqlx_s_#" does not exist
+    96 x error returned from database: bind message supplies # parameters, but prepared statement "sqlx_s_##" requires 
+    15 x error returned from database: prepared statement "sqlx_s_##" already exists
+supabase-cli-local-stack supavisor-2.10.1 transaction (default flags) | sqlx-nocache | clients=60 txns/client=50 | ok=292 err=2708 leaks=0 (of 686 checks) | 620 txn/s | p50=16.3ms p95=22.7ms p99=24.6ms
+    2120 x error returned from database: prepared statement "sqlx_s_##" already exists
+    536 x error returned from database: prepared statement "sqlx_s_#" already exists
+    52 x error returned from database: prepared statement "sqlx_s_###" already exists
+supabase-cli-local-stack supavisor-2.10.1 transaction (default flags) | sqlx-unnamed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 2822 txn/s | p50=20.4ms p95=27.6ms p99=36.2ms
+do-managed-pgbouncer-1.26.1 transaction pool size 20 (sfo3, TLS, WAN) | tp-named | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 55 txn/s | p50=1069.9ms p95=1234.5ms p99=1541.0ms
+do-managed-pgbouncer-1.26.1 transaction pool size 20 (sfo3, TLS, WAN) | tp-typed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 54 txn/s | p50=1092.5ms p95=1187.7ms p99=1246.5ms
+do-managed-pgbouncer-1.26.1 transaction pool size 20 (sfo3, TLS, WAN) | sqlx-cache | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 55 txn/s | p50=1066.1ms p95=1162.8ms p99=1596.3ms
+do-managed-pgbouncer-1.26.1 transaction pool size 20 (sfo3, TLS, WAN) | sqlx-nocache | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 34 txn/s | p50=1714.1ms p95=1904.7ms p99=2012.9ms
+do-managed-pgbouncer-1.26.1 transaction pool size 20 (sfo3, TLS, WAN) | sqlx-unnamed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 35 txn/s | p50=1675.8ms p95=1864.3ms p99=1978.4ms

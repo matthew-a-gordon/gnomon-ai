@@ -1,0 +1,17 @@
+[package]
+name = "pooler-proto"
+version = "0.0.0"
+edition = "2021"
+publish = false
+# PROTOTYPE, throwaway. Answers: do prepared statements and per-transaction
+# tenant context survive transaction-mode poolers? Do not build on this.
+
+[workspace]
+
+[dependencies]
+futures = "0.3.34"
+native-tls = "0.2.18"
+postgres-native-tls = "0.5.3"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-native-tls", "postgres"] }
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-postgres = "0.7.18"

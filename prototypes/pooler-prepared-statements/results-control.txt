@@ -1,0 +1,5 @@
+direct-pg17(control) | tp-named | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 18828 txn/s | p50=2.7ms p95=5.3ms p99=6.7ms
+direct-pg17(control) | tp-typed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 17193 txn/s | p50=3.2ms p95=5.2ms p99=6.3ms
+direct-pg17(control) | sqlx-cache | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 8291 txn/s | p50=7.0ms p95=8.3ms p99=10.9ms
+direct-pg17(control) | sqlx-nocache | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 5337 txn/s | p50=11.0ms p95=12.3ms p99=13.2ms
+direct-pg17(control) | sqlx-unnamed | clients=60 txns/client=50 | ok=3000 err=0 leaks=0 (of 6000 checks) | 5315 txn/s | p50=11.1ms p95=12.4ms p99=13.0ms
