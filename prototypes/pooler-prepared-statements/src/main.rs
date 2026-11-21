@@ -51,8 +51,11 @@ fn te(e: tokio_postgres::Error) -> String {
 }
 
 fn tp_connector() -> postgres_native_tls::MakeTlsConnector {
+    // Certificates are verified by default. Set PROTO_INSECURE_TLS=1 to skip verification
+    // (throwaway tests against hosts with private CAs only).
+    let insecure = std::env::var("PROTO_INSECURE_TLS").is_ok_and(|v| v == "1");
     let tls = native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(insecure)
         .build()
         .unwrap();
     postgres_native_tls::MakeTlsConnector::new(tls)

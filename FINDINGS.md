@@ -95,7 +95,7 @@ Throughput and latency, rough only (single-threaded harness, other prototypes ru
 - DigitalOcean's admin console shows `pool_mode=session` as the global default and `max_prepared_statements=100`. The pool I created was in transaction mode and behaved that way, but a differently configured cluster could differ.
 - The DigitalOcean cluster ran from 22:23:45Z to 22:35:50Z (about 12 minutes, roughly $0.022 per hour). `doctl databases list` was empty afterwards. During setup, one command printed that cluster's pool URI, with its password, into the session transcript. The cluster no longer exists and its firewall allowed only this machine's IP.
 - A first Supavisor run with the flag on was invalid: my script generated a new random vault key on restart, so the stored tenant password could not be decrypted. The rows were discarded, the script now recreates the metadata each start, and the reported rows are from the rerun.
-- The harness uses certificate verification off for TLS. That is fine for throwaway tests and wrong for gnomon.
+- The TLS runs against DigitalOcean skipped certificate verification (`PROTO_INSECURE_TLS=1`, since the cluster uses a private CA). The harness now verifies by default and skips only on that opt-in. Neither is a setting gnomon should copy; it should verify certificates.
 
 ## Reproduce
 
