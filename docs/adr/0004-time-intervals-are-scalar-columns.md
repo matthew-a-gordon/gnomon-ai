@@ -9,5 +9,5 @@ Each Version stores valid-from, valid-to, recorded-from and recorded-to as `time
 ## Consequences
 
 - Marking the range functions leakproof would restore the range plan, but that needs a superuser, which no managed host grants.
-- PG 18's `WITHOUT OVERLAPS` and `PERIOD` foreign keys are range-based and would not be adopted even when every host runs 18. Temporal referential integrity is enforced by triggers.
-- An open bound is `infinity`. An unknown bound is flagged separately; an unknown start reads as open and the read returns the flag.
+- PG 18's `WITHOUT OVERLAPS` and `PERIOD` foreign keys are range-based and would not be adopted even when every host runs 18. Temporal referential integrity is not enforced (ADR-0008).
+- An open bound is `infinity`. Each Valid-time bound carries a precision whose coarsest value is `unknown`; an unknown start reads as open and the read returns the precision (ADR-0008).

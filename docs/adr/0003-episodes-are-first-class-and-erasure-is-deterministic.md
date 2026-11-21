@@ -12,6 +12,6 @@ An Episode is an immutable record of its own, not a Node. A Version, Summary, Co
 
 ## Consequences
 
-- A Version cited by another Episode survives Erasure and loses only the Citation.
+- A Version cited by another Episode survives Erasure, but loses the Citation and every value the erased Episode alone supplied. Its values are recomputed from the Contributions that remain, in closed Versions as well as current ones (ADR-0007).
 - After an Erasure, a Summary or Community that drew on the erased Episode is missing until the Pipeline regenerates it from the remaining Episodes.
 - Erasure is not exposed over MCP unless a deployment turns it on.

@@ -56,18 +56,34 @@ _Avoid_: Invalidation, expiry, close
 The recorded finding that what a Version stated was never true. The retracted Version stays readable in As-of reads.
 _Avoid_: Invalidation, deletion, revocation
 
+**Refinement**:
+A new Version that states a bound of Valid time the earlier one left unknown and changes nothing else. The earlier Version was incomplete, not wrong.
+_Avoid_: Correction, update, enrichment
+
 ### Sources and removal
 
 **Episode**:
-An immutable source from which Versions are derived, such as a message, a document or an event.
+An immutable source from which Versions are derived, such as a message, a document, an event or a person's edit.
 _Avoid_: document, source, input
+
+**Reference time**:
+When an Episode's source was produced, such as when a message was sent or a document was dated. It is not when gnomon recorded the Episode.
+_Avoid_: timestamp, created at, event time
+
+**Contribution**:
+One Episode's statement of a value for one property of a Node or an Edge, over a Valid time. A Version's values are chosen from the Contributions that remain.
+_Avoid_: claim, assertion, observation
+
+**Authority**:
+The rank a consumer gives an Episode, used to choose between values that different Episodes state for the same property.
+_Avoid_: rank, weight, priority, trust
 
 **Citation**:
 The link from a Version, Summary or Community to an Episode it was derived from, optionally naming the property and the place in the Episode.
 _Avoid_: support, cites edge, provenance link, reference
 
 **Erasure**:
-Physical deletion of an Episode, Node, Edge or Scope, of every Version derived from it alone, and of every Summary or Community that drew on it, leaving no tombstone. The same request always removes the same rows.
+Physical deletion of an Episode, Node, Edge or Scope, of every Version derived from it alone, of every value it alone supplied to a Version that survives, and of every Summary or Community that drew on it, leaving no tombstone. The same request always removes the same rows.
 _Avoid_: delete, purge, hard delete
 
 ### Derived content
