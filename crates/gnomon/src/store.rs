@@ -14,7 +14,8 @@
 //! so a pooled server connection never carries one caller's role or claims
 //! into another caller's call. Every parameterized statement goes through
 //! `query_typed`, which sends the unnamed statement, because named statements
-//! fail on transaction-mode poolers at their default settings (prototype 2).
+//! fail on transaction-mode poolers at their default settings (the
+//! `prototype/pooler-prepared-statements` branch, ADR-0001).
 //! Named statements are never sent.
 
 use chrono::{DateTime, Utc};
@@ -27,10 +28,23 @@ use tokio_postgres::{Client, NoTls, Transaction};
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{Episode, EpisodeId, Error, NewEpisode, Scope, TenantId};
 
-/// The role an end user's calls run as.
-const USER_ROLE: &str = "authenticated";
-/// The role a worker's calls run as. It cannot bypass RLS.
-const WORKER_ROLE: &str = "gnomon_worker";
+/// The caller role a call runs as. Neither can bypass RLS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallerRole {
+    /// An end user, `authenticated`.
+    User,
+    /// A worker for one Tenant and Scope, `gnomon_worker`.
+    Worker,
+}
+
+impl CallerRole {
+    fn name(self) -> &'static str {
+        match self {
+            CallerRole::User => "authenticated",
+            CallerRole::Worker => "gnomon_worker",
+        }
+    }
+}
 
 /// A connection to a gnomon Store.
 ///
@@ -42,6 +56,10 @@ pub struct Store {
 
 impl Store {
     /// Connects without TLS and checks the schema version.
+    ///
+    /// The check runs once, here. A Store that connected before a
+    /// migration was applied keeps the version it checked until it
+    /// reconnects.
     ///
     /// `connection` is a libpq-style URL or key=value string for the login
     /// role, which must be able to `SET ROLE` to `authenticated` and
@@ -72,7 +90,7 @@ impl Store {
     pub fn as_user(&self, claims: Map<String, Value>) -> Caller<'_> {
         Caller {
             store: self,
-            role: USER_ROLE,
+            role: CallerRole::User,
             claims: Value::Object(claims).to_string(),
         }
     }
@@ -81,7 +99,7 @@ impl Store {
     /// bypass RLS.
     pub fn as_worker(&self, tenant: TenantId, scope: Scope) -> Caller<'_> {
         let claims = serde_json::json!({
-            "role": WORKER_ROLE,
+            "role": CallerRole::Worker.name(),
             "app_metadata": {
                 "tenant_id": tenant.0.to_string(),
                 "scopes": [scope.as_str()],
@@ -89,7 +107,7 @@ impl Store {
         });
         Caller {
             store: self,
-            role: WORKER_ROLE,
+            role: CallerRole::Worker,
             claims: claims.to_string(),
         }
     }
@@ -99,7 +117,7 @@ impl Store {
 /// refuses any version but the one this build expects.
 async fn check_schema(client: &mut Client) -> Result<EmbeddingDimension, Error> {
     let tx = client.transaction().await?;
-    tx.batch_execute(&format!("set local role {USER_ROLE}"))
+    tx.batch_execute(&format!("set local role {}", CallerRole::User.name()))
         .await?;
     let row = match tx
         .query_typed(
@@ -130,10 +148,7 @@ async fn check_schema(client: &mut Client) -> Result<EmbeddingDimension, Error> 
     u32::try_from(dimension)
         .ok()
         .and_then(|d| EmbeddingDimension::new(d).ok())
-        .ok_or(Error::SchemaVersion {
-            expected: SCHEMA_VERSION,
-            found,
-        })
+        .ok_or(Error::InvalidEmbeddingDimension(dimension))
 }
 
 fn is_missing_schema(e: &tokio_postgres::Error) -> bool {
@@ -148,7 +163,7 @@ fn is_missing_schema(e: &tokio_postgres::Error) -> bool {
 /// One caller's view of the Store. Every method is one transaction.
 pub struct Caller<'s> {
     store: &'s Store,
-    role: &'static str,
+    role: CallerRole,
     claims: String,
 }
 
@@ -156,8 +171,7 @@ impl Caller<'_> {
     /// Opens the call's transaction and sets its role and claims locally.
     async fn begin<'c>(&self, client: &'c mut Client) -> Result<Transaction<'c>, Error> {
         let tx = client.transaction().await?;
-        // The role is one of two constants, never caller input.
-        tx.batch_execute(&format!("set local role {}", self.role))
+        tx.batch_execute(&format!("set local role {}", self.role.name()))
             .await?;
         tx.query_typed(
             "select set_config('request.jwt.claims', $1, true)",

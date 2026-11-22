@@ -24,6 +24,7 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
 
+use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls};
 
 pub use server::Server;
@@ -124,7 +125,10 @@ impl Server {
         let _lock = self.lock();
         let server = self.admin("postgres").await;
         let exists = !server
-            .query("select 1 from pg_database where datname = $1", &[&name])
+            .query_typed(
+                "select 1 from pg_database where datname = $1",
+                &[(&name, Type::TEXT)],
+            )
             .await
             .unwrap()
             .is_empty();

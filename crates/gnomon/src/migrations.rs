@@ -111,7 +111,6 @@ pub struct UnknownTarget(String);
 /// One migration rendered for a target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportedMigration {
-    pub version: i32,
     pub file_name: String,
     pub sql: String,
 }
@@ -122,7 +121,6 @@ pub fn render(target: Target, dimension: EmbeddingDimension) -> Vec<ExportedMigr
         Target::Plain => MIGRATIONS
             .iter()
             .map(|m| ExportedMigration {
-                version: m.version,
                 file_name: format!("{}.sql", m.name),
                 sql: m
                     .template
@@ -156,7 +154,7 @@ pub fn export(
     out_dir: &Path,
 ) -> Result<Vec<PathBuf>, ExportError> {
     let rendered = render(target, dimension);
-    let io = |path: &Path| {
+    let io_error_at = |path: &Path| {
         let path = path.to_owned();
         move |source| ExportError::Io { path, source }
     };
@@ -168,15 +166,15 @@ pub fn export(
             Ok(existing) if existing != m.sql => return Err(ExportError::WouldRewrite { path }),
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io(&path)(e)),
+            Err(e) => return Err(io_error_at(&path)(e)),
         }
     }
 
-    std::fs::create_dir_all(out_dir).map_err(io(out_dir))?;
+    std::fs::create_dir_all(out_dir).map_err(io_error_at(out_dir))?;
     let mut written = Vec::with_capacity(rendered.len());
     for m in rendered {
         let path = out_dir.join(&m.file_name);
-        std::fs::write(&path, &m.sql).map_err(io(&path))?;
+        std::fs::write(&path, &m.sql).map_err(io_error_at(&path))?;
         written.push(path);
     }
     Ok(written)

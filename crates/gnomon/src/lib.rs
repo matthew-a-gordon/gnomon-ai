@@ -79,7 +79,7 @@ pub struct Episode {
     pub content: String,
     pub reference_time: DateTime<Utc>,
     pub authority: Option<i32>,
-    /// When gnomon recorded the Episode: its transaction's time.
+    /// When gnomon recorded the Episode.
     pub recorded_at: DateTime<Utc>,
 }
 
@@ -94,6 +94,10 @@ pub enum Error {
          {expected}; apply the migrations from `gnomon migrations export`"
     )]
     SchemaVersion { expected: i32, found: Option<i32> },
+    /// `gnomon.embedding_dimension()` returned a width pgvector cannot
+    /// store, so the schema was not exported by gnomon.
+    #[error("the gnomon schema reports embedding dimension {0}, which is not 1 to 16000")]
+    InvalidEmbeddingDimension(i32),
     /// Postgres refused or failed the call. RLS refusals arrive here.
     #[error(transparent)]
     Database(#[from] tokio_postgres::Error),
@@ -104,7 +108,7 @@ impl Error {
     pub fn sqlstate(&self) -> Option<&SqlState> {
         match self {
             Error::Database(e) => e.code(),
-            Error::SchemaVersion { .. } => None,
+            Error::SchemaVersion { .. } | Error::InvalidEmbeddingDimension(_) => None,
         }
     }
 }

@@ -339,7 +339,7 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
     let w = world().await;
     let client = w.db.login().await;
     let tables = client
-        .query(
+        .query_typed(
             "select c.relname, c.relrowsecurity,
                     exists (select from pg_attribute a where a.attrelid = c.oid and a.attname = 'tenant_id' and not a.attisdropped),
                     exists (select from pg_attribute a where a.attrelid = c.oid and a.attname = 'scope' and not a.attisdropped)
@@ -363,9 +363,9 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
             "gnomon.{name} lacks a tenant_id or scope column"
         );
         let policies = client
-            .query(
+            .query_typed(
                 "select qual, with_check from pg_policies where schemaname = 'gnomon' and tablename = $1",
-                &[&name],
+                &[(&name, Type::TEXT)],
             )
             .await
             .unwrap();
@@ -390,7 +390,7 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path() {
     let w = world().await;
     let client = w.db.login().await;
     let functions = client
-        .query(
+        .query_typed(
             "select p.oid::regprocedure::text, p.prosecdef, coalesce(p.proconfig, '{}')
              from pg_proc p join pg_namespace n on n.oid = p.pronamespace
              where n.nspname = 'gnomon'",
@@ -427,9 +427,9 @@ async fn the_caller_roles_cannot_bypass_rls() {
     let w = world().await;
     let client = w.db.login().await;
     let rows = client
-        .query(
-            "select rolname, rolsuper or rolbypassrls from pg_roles where rolname = any($1)",
-            &[&vec![USER, WORKER]],
+        .query_typed(
+            "select rolname::text, rolsuper or rolbypassrls from pg_roles where rolname = any($1)",
+            &[(&vec![USER, WORKER], Type::TEXT_ARRAY)],
         )
         .await
         .unwrap();

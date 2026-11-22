@@ -31,10 +31,6 @@ impl WireLog {
         self.0.lock().unwrap().clone()
     }
 
-    pub fn clear(&self) {
-        self.0.lock().unwrap().clear();
-    }
-
     fn push(&self, m: Sent) {
         self.0.lock().unwrap().push(m);
     }

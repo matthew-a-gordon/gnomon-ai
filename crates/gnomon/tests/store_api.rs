@@ -79,6 +79,25 @@ async fn the_store_refuses_a_half_applied_chain() {
     }
 }
 
+#[tokio::test]
+async fn the_store_refuses_a_schema_whose_embedding_dimension_pgvector_cannot_store() {
+    let db = TestDb::migrated().await;
+    db.admin()
+        .await
+        .batch_execute(
+            "create or replace function gnomon.embedding_dimension() returns integer
+               language sql immutable set search_path = '' as $$ select 0 $$",
+        )
+        .await
+        .unwrap();
+
+    match Store::connect_no_tls(&db.login_url()).await {
+        Err(Error::InvalidEmbeddingDimension(0)) => {}
+        Err(other) => panic!("expected an invalid embedding dimension, got {other:?}"),
+        Ok(_) => panic!("the Store accepted embedding dimension 0"),
+    }
+}
+
 // Recording and reading an Episode, and isolation through the Store API.
 
 use chrono::{TimeZone, Utc};
@@ -421,7 +440,8 @@ async fn a_refused_call_leaves_the_store_usable() {
     assert!(alice.read_episode(t, id).await.unwrap().is_some());
 }
 
-// Connection discipline (prototype 2): what reaches the server.
+// Connection discipline, from the prototype/pooler-prepared-statements
+// branch: what reaches the server.
 
 use support::wire::{self, Sent};
 
