@@ -26,7 +26,7 @@ use tokio_postgres::types::Type;
 use tokio_postgres::{Client, NoTls, Transaction};
 
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
-use crate::{Episode, EpisodeId, Error, NewEpisode, Scope, TenantId};
+use crate::{Episode, EpisodeId, Error, Kind, KindOf, NewEpisode, NewKind, Scope, TenantId};
 
 /// The caller role a call runs as. Neither can bypass RLS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,4 +227,89 @@ impl Caller<'_> {
             recorded_at: r.get::<_, DateTime<Utc>>(6),
         }))
     }
+
+    /// Registers a Kind in the Tenant's Ontology and returns it flattened
+    /// with its ancestors and with its compiled rules.
+    ///
+    /// Registering the same Kind again changes nothing and returns it. The
+    /// deployment decides who may register Kinds: without its EXECUTE grant
+    /// on `gnomon.register_kind`, the call fails with
+    /// `insufficient_privilege`.
+    pub async fn register_kind(&self, kind: &NewKind) -> Result<Kind, Error> {
+        let (sort, source, target) = match &kind.of {
+            KindOf::Node => ("node", None, None),
+            KindOf::Edge { source, target } => ("edge", Some(source), Some(target)),
+        };
+        let mut client = self.store.client.lock().await;
+        let tx = self.begin(&mut client).await?;
+        tx.query_typed(
+            "select gnomon.register_kind($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                (&kind.tenant.0, Type::UUID),
+                (&kind.name, Type::TEXT),
+                (&sort, Type::TEXT),
+                (&kind.parent, Type::TEXT),
+                (&kind.properties, Type::JSONB),
+                (&kind.search, Type::TEXT_ARRAY),
+                (&source, Type::TEXT_ARRAY),
+                (&target, Type::TEXT_ARRAY),
+            ],
+        )
+        .await
+        .map_err(Error::from_kind_registration)?;
+        let registered = read_kind(&tx, kind.tenant, &kind.name).await?;
+        tx.commit().await?;
+        Ok(registered.expect("a Kind just registered is visible to its registrant"))
+    }
+
+    /// Reads a Kind of the Tenant's Ontology, a root Kind included, or `None`
+    /// if this caller's Tenant has no such Kind.
+    pub async fn read_kind(&self, tenant: TenantId, name: &str) -> Result<Option<Kind>, Error> {
+        let mut client = self.store.client.lock().await;
+        let tx = self.begin(&mut client).await?;
+        let kind = read_kind(&tx, tenant, name).await?;
+        tx.commit().await?;
+        Ok(kind)
+    }
+}
+
+async fn read_kind(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    name: &str,
+) -> Result<Option<Kind>, Error> {
+    let rows = tx
+        .query_typed(
+            "select name, kind_of, parent, ancestors, properties, rules, search,
+                    source_kinds, target_kinds
+             from gnomon.read_kind($1, $2)",
+            &[(&tenant.0, Type::UUID), (&name, Type::TEXT)],
+        )
+        .await?;
+    Ok(rows.first().map(|r| {
+        let of = match r.get::<_, &str>(1) {
+            "edge" => KindOf::Edge {
+                source: r.get(7),
+                target: r.get(8),
+            },
+            _ => KindOf::Node,
+        };
+        let rules: Value = r.get(5);
+        Kind {
+            tenant,
+            name: r.get(0),
+            of,
+            parent: r.get(2),
+            ancestors: r.get(3),
+            properties: r.get(4),
+            rules: match rules {
+                Value::Object(m) => m
+                    .into_iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_owned())))
+                    .collect(),
+                _ => Default::default(),
+            },
+            search: r.get(6),
+        }
+    }))
 }

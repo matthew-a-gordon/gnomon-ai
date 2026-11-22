@@ -333,6 +333,11 @@ async fn a_caller_cannot_redirect_the_store_functions_through_its_search_path() 
 // The catalog, read as the caller would see it. These pin the acceptance
 // criteria for every table and function a later migration adds.
 
+/// The Ontology's tables. They carry a Tenant and no Scope, because every
+/// Scope of a Tenant shares one Ontology, and their policies check the Tenant
+/// alone.
+const ONTOLOGY_TABLES: &[&str] = &["kind", "kind_rule"];
+
 #[tokio::test]
 async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_tenant_scope_policy()
 {
@@ -350,7 +355,7 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
         )
         .await
         .unwrap();
-    assert!(tables.len() >= 2);
+    assert!(tables.len() >= 4);
     for t in &tables {
         let (name, rls, tenant, scope): (String, bool, bool, bool) =
             (t.get(0), t.get(1), t.get(2), t.get(3));
@@ -358,9 +363,11 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
         if name == "schema_version" {
             continue; // The ledger describes the schema, not a graph.
         }
-        assert!(
-            tenant && scope,
-            "gnomon.{name} lacks a tenant_id or scope column"
+        assert!(tenant, "gnomon.{name} lacks a tenant_id column");
+        let ontology = ONTOLOGY_TABLES.contains(&name.as_str());
+        assert_eq!(
+            scope, !ontology,
+            "gnomon.{name}: graph tables have a scope column and Ontology tables none"
         );
         let policies = client
             .query_typed(
@@ -370,28 +377,39 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
             .await
             .unwrap();
         assert!(!policies.is_empty(), "gnomon.{name} has no policy");
-        let expected =
-            "((tenant_id = gnomon.tenant_id()) AND (scope = ANY (gnomon.allowed_scopes())))";
+        let expected = if ontology {
+            "(tenant_id = gnomon.tenant_id())"
+        } else {
+            "((tenant_id = gnomon.tenant_id()) AND (scope = ANY (gnomon.allowed_scopes())))"
+        };
         for p in &policies {
-            assert_eq!(
-                p.get::<_, Option<String>>(0).as_deref(),
-                Some(expected),
-                "gnomon.{name} USING"
+            let (using, check): (Option<String>, Option<String>) = (p.get(0), p.get(1));
+            assert!(
+                using.is_some() || check.is_some(),
+                "gnomon.{name} has a policy that checks nothing"
             );
-            if let Some(check) = p.get::<_, Option<String>>(1) {
+            if let Some(using) = using {
+                assert_eq!(using, expected, "gnomon.{name} USING");
+            }
+            if let Some(check) = check {
                 assert_eq!(check, expected, "gnomon.{name} WITH CHECK");
             }
         }
     }
 }
 
+/// The only SECURITY DEFINER functions ADR-0009 allows. Erasure joins Kind
+/// registration in a later migration.
+const DEFINERS: &[&str] = &["gnomon.register_kind("];
+
 #[tokio::test]
-async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path() {
+async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but_the_definers() {
     let w = world().await;
     let client = w.db.login().await;
     let functions = client
         .query_typed(
-            "select p.oid::regprocedure::text, p.prosecdef, coalesce(p.proconfig, '{}')
+            "select p.oid::regprocedure::text, p.prosecdef, coalesce(p.proconfig, '{}'),
+                    p.proowner::regrole::text
              from pg_proc p join pg_namespace n on n.oid = p.pronamespace
              where n.nspname = 'gnomon'",
             &[],
@@ -404,6 +422,8 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path() {
         "gnomon.read_episode(",
         "gnomon.tenant_id()",
         "gnomon.allowed_scopes()",
+        "gnomon.register_kind(",
+        "gnomon.read_kind(",
     ] {
         assert!(
             names.iter().any(|n| n.starts_with(expected)),
@@ -411,8 +431,13 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path() {
         );
     }
     for f in &functions {
-        let (name, definer, config): (String, bool, Vec<String>) = (f.get(0), f.get(1), f.get(2));
-        assert!(!definer, "{name} is SECURITY DEFINER");
+        let (name, definer, config, owner): (String, bool, Vec<String>, String) =
+            (f.get(0), f.get(1), f.get(2), f.get(3));
+        let allowed = DEFINERS.iter().any(|d| name.starts_with(d));
+        assert_eq!(definer, allowed, "{name}: SECURITY DEFINER is {definer}");
+        if definer {
+            assert_eq!(owner, "gnomon_definer", "{name} is owned by {owner}");
+        }
         assert!(
             config
                 .iter()
@@ -420,6 +445,51 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path() {
             "{name} does not pin search_path to '': {config:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn the_definer_role_cannot_log_in_or_bypass_rls_and_belongs_to_no_role() {
+    let w = world().await;
+    let client = w.db.login().await;
+    let row = client
+        .query_typed(
+            "select rolcanlogin, rolsuper or rolbypassrls,
+                    exists (select from pg_auth_members m where m.member = r.oid)
+             from pg_roles r where rolname = 'gnomon_definer'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.len(), 1, "the definer role exists");
+    let (login, bypass, member): (bool, bool, bool) = (row[0].get(0), row[0].get(1), row[0].get(2));
+    assert!(!login, "gnomon_definer can log in");
+    assert!(!bypass, "gnomon_definer can bypass RLS");
+    assert!(!member, "gnomon_definer inherits another role's privileges");
+}
+
+#[tokio::test]
+async fn the_migrations_grant_kind_registration_to_no_role_but_its_owner() {
+    let w = world().await;
+    let client = w.db.admin().await;
+    let grantees: Vec<String> = client
+        .query_typed(
+            &format!(
+                "select coalesce(nullif(a.grantee, 0)::regrole::text, 'public')
+                 from pg_proc p, aclexplode(p.proacl) a
+                 where p.oid = '{}'::regprocedure and a.grantee <> p.proowner",
+                support::REGISTER_KIND
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert!(
+        grantees.is_empty(),
+        "Kind registration is granted to {grantees:?}"
+    );
 }
 
 #[tokio::test]
@@ -438,4 +508,216 @@ async fn the_caller_roles_cannot_bypass_rls() {
         let (name, bypass): (String, bool) = (r.get(0), r.get(1));
         assert!(!bypass, "{name} can bypass RLS");
     }
+}
+
+// Kind registration, a definer function (ADR-0009). The migrations grant it
+// to no one, so the deployment decides who may register Kinds.
+
+const REGISTER_PERSON: &str =
+    "select gnomon.register_kind($1, 'person', 'node', null, '{\"properties\": {\"role\": {\"type\": \"string\"}}}', '{}', null, null)";
+
+/// The Kinds of `tenant`, counted past RLS.
+async fn kind_rows(db: &TestDb, tenant: Uuid) -> i64 {
+    db.admin()
+        .await
+        .query_typed(
+            "select (select count(*) from gnomon.kind where tenant_id = $1)
+                  + (select count(*) from gnomon.kind_rule where tenant_id = $1)",
+            &[(&tenant, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0)
+}
+
+#[tokio::test]
+async fn a_caller_role_without_the_grant_cannot_register_a_kind() {
+    let w = world().await;
+    for role in [USER, WORKER] {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        let call = tx
+            .query_typed(REGISTER_PERSON, &[(&w.t1, Type::UUID)])
+            .await;
+        assert_refused(
+            call,
+            &format!("{role} registering a Kind without the grant"),
+        );
+    }
+    let client = w.db.login().await;
+    assert_refused(
+        client
+            .query_typed(REGISTER_PERSON, &[(&w.t1, Type::UUID)])
+            .await,
+        "the login role registering a Kind",
+    );
+    assert_eq!(
+        kind_rows(&w.db, w.t1).await,
+        0,
+        "a refused call wrote a Kind"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_with_the_grant_cannot_register_a_kind_in_another_tenant_or_with_no_tenant() {
+    let w = world().await;
+    w.db.grant_kind_registration(USER).await;
+    let no_tenant = json!({ "app_metadata": { "scopes": ["support"] } }).to_string();
+    let attempts = [
+        (claims(w.t1, &["support"]), Some(w.t2), "another Tenant"),
+        (claims(w.t1, &["support"]), None, "a null Tenant"),
+        (no_tenant, Some(w.t2), "claims with no Tenant"),
+        (String::new(), Some(w.t2), "no claims"),
+    ];
+    for (c, tenant, what) in attempts {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, USER, &c).await;
+        let call = tx
+            .query_typed(REGISTER_PERSON, &[(&tenant, Type::UUID)])
+            .await;
+        assert_refused(call, &format!("registering a Kind into {what}"));
+    }
+    assert_eq!(kind_rows(&w.db, w.t2).await, 0);
+
+    // The grant does let the caller register in its own Tenant.
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(w.t1, &["support"])).await;
+    tx.query_typed(REGISTER_PERSON, &[(&w.t1, Type::UUID)])
+        .await
+        .expect("registering in its own Tenant");
+    tx.commit().await.unwrap();
+    assert_eq!(kind_rows(&w.db, w.t1).await, 2, "one Kind and its one rule");
+}
+
+#[tokio::test]
+async fn a_caller_cannot_write_the_kind_tables_directly_even_with_the_grant() {
+    let w = world().await;
+    w.db.grant_kind_registration(USER).await;
+    w.db.grant_kind_registration(WORKER).await;
+    {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, USER, &claims(w.t1, &["support"])).await;
+        tx.query_typed(REGISTER_PERSON, &[(&w.t1, Type::UUID)])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let statements = [
+        (
+            "insert into gnomon.kind (tenant_id, name, kind_of, parent, ancestors, properties, search, definition)
+             values ($1, 'forged', 'node', 'node', '{node}', '{}', '{}', '{}')",
+            "insert a Kind",
+        ),
+        (
+            "insert into gnomon.kind_rule (tenant_id, kind, property, rule) values ($1, 'person', 'age', '1 == 1')",
+            "insert a rule",
+        ),
+        (
+            "update gnomon.kind_rule set rule = '1 == 1' where tenant_id = $1",
+            "weaken a rule",
+        ),
+        (
+            "update gnomon.kind set search = '{}' where tenant_id = $1",
+            "rewrite a Kind",
+        ),
+        ("delete from gnomon.kind_rule where tenant_id = $1", "delete a rule"),
+        ("delete from gnomon.kind where tenant_id = $1", "delete a Kind"),
+    ];
+    for role in [USER, WORKER] {
+        for (sql, what) in statements {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+            let r = tx.execute_typed(sql, &[(&w.t1, Type::UUID)]).await;
+            assert_refused(r, &format!("{role}: {what}"));
+        }
+    }
+    let rule: String = w
+        .db
+        .admin()
+        .await
+        .query_typed(
+            "select rule::text from gnomon.kind_rule where tenant_id = $1 and kind = 'person' and property = 'role'",
+            &[(&w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert!(rule.contains("\"string\""), "the rule changed: {rule}");
+}
+
+#[tokio::test]
+async fn a_caller_cannot_read_another_tenants_kinds() {
+    let w = world().await;
+    w.db.grant_kind_registration(USER).await;
+    {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, USER, &claims(w.t2, &["support"])).await;
+        tx.query_typed(REGISTER_PERSON, &[(&w.t2, Type::UUID)])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    for role in [USER, WORKER] {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        for sql in [
+            "select count(*) from gnomon.kind",
+            "select count(*) from gnomon.kind_rule",
+        ] {
+            let n: i64 = tx.query_typed(sql, &[]).await.unwrap()[0].get(0);
+            assert_eq!(n, 0, "{role}: {sql}");
+        }
+        let read = tx
+            .query_typed(
+                "select name from gnomon.read_kind($1, 'person')",
+                &[(&w.t2, Type::UUID)],
+            )
+            .await
+            .unwrap();
+        assert!(
+            read.is_empty(),
+            "{role} read Tenant two's Kind through read_kind"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_caller_cannot_redirect_kind_registration_through_its_search_path() {
+    let w = world().await;
+    w.db.grant_kind_registration(USER).await;
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(w.t1, &["support"])).await;
+    // Shadow the Kind tables and the root Kinds in the caller's temporary
+    // schema, and put that schema first.
+    tx.batch_execute(
+        "create temporary table kind (like gnomon.kind);
+         create temporary table kind_rule (tenant_id uuid, kind text, property text, rule text);
+         create function pg_temp.root_kinds() returns table (name text, kind_of text, search text[],
+           source_kinds text[], target_kinds text[])
+           language sql as $$ values ('person', 'node', '{}'::text[], null::text[], null::text[]) $$;
+         set local search_path = pg_temp, public;",
+    )
+    .await
+    .unwrap();
+    tx.query_typed(REGISTER_PERSON, &[(&w.t1, Type::UUID)])
+        .await
+        .expect("registration ignores the caller's search path");
+    let shadow: i64 = tx
+        .query_typed("select count(*) from pg_temp.kind", &[])
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(shadow, 0, "registration wrote the caller's shadow table");
+    let real = tx
+        .query_typed(
+            "select name from gnomon.read_kind($1, 'person')",
+            &[(&w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        real.len(),
+        1,
+        "registration wrote somewhere other than gnomon.kind"
+    );
 }

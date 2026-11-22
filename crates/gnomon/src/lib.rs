@@ -5,6 +5,7 @@
 //! background work in one Tenant and Scope. [`migrations`] exports the schema
 //! the Store expects into a consumer's migration chain.
 
+mod kind;
 pub mod migrations;
 mod store;
 
@@ -14,7 +15,16 @@ use chrono::{DateTime, Utc};
 use tokio_postgres::error::SqlState;
 use uuid::Uuid;
 
+pub use kind::{Kind, KindOf, NewKind, ROOT_EDGE_KIND, ROOT_NODE_KIND};
 pub use store::{Caller, Store};
+
+/// The SQLSTATE Kind registration raises for a definition outside the
+/// profile or the Ontology's rules.
+pub const INVALID_KIND: &str = "GNK01";
+
+/// The SQLSTATE Kind registration raises for a name already registered with
+/// another definition.
+pub const KIND_CONFLICT: &str = "GNK02";
 
 /// The unit of isolation: one customer's graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -98,7 +108,17 @@ pub enum Error {
     /// store, so the schema was not exported by gnomon.
     #[error("the gnomon schema reports embedding dimension {0}, which is not 1 to 16000")]
     InvalidEmbeddingDimension(i32),
-    /// Postgres refused or failed the call. RLS refusals arrive here.
+    /// Kind registration refused the definition: a keyword outside the JSON
+    /// Schema profile, an unknown parent or endpoint Kind, or another rule of
+    /// the Ontology. The message says which.
+    #[error("invalid Kind: {0}")]
+    InvalidKind(String),
+    /// The Kind's name is already registered in the Tenant with another
+    /// definition.
+    #[error("{0}")]
+    KindConflict(String),
+    /// Postgres refused or failed the call. RLS refusals and a missing grant
+    /// arrive here.
     #[error(transparent)]
     Database(#[from] tokio_postgres::Error),
 }
@@ -108,7 +128,20 @@ impl Error {
     pub fn sqlstate(&self) -> Option<&SqlState> {
         match self {
             Error::Database(e) => e.code(),
-            Error::SchemaVersion { .. } | Error::InvalidEmbeddingDimension(_) => None,
+            Error::SchemaVersion { .. }
+            | Error::InvalidEmbeddingDimension(_)
+            | Error::InvalidKind(_)
+            | Error::KindConflict(_) => None,
+        }
+    }
+
+    /// Turns the SQLSTATEs Kind registration raises into their variants.
+    pub(crate) fn from_kind_registration(e: tokio_postgres::Error) -> Error {
+        let message = e.as_db_error().map(|d| d.message().to_owned());
+        match (e.code().map(SqlState::code), message) {
+            (Some(INVALID_KIND), Some(m)) => Error::InvalidKind(m),
+            (Some(KIND_CONFLICT), Some(m)) => Error::KindConflict(m),
+            _ => Error::Database(e),
         }
     }
 }

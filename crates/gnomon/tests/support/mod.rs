@@ -34,6 +34,10 @@ pub use server::Server;
 pub const LOGIN_ROLE: &str = "gnomon_test_login";
 const LOGIN_PASSWORD: &str = "gnomon-test-login";
 
+/// Kind registration's signature, as grants and `regprocedure` name it.
+pub const REGISTER_KIND: &str =
+    "gnomon.register_kind(uuid, text, text, text, jsonb, text[], text[], text[])";
+
 /// The embedding dimension the suites export with unless a test chooses one.
 pub const DEFAULT_DIMENSION: u32 = 1536;
 
@@ -243,6 +247,19 @@ impl TestDb {
     /// steps use it.
     pub async fn admin(&self) -> Client {
         self.server.admin(&self.name).await
+    }
+
+    /// What a deployment does to let `role` register Kinds. The migrations
+    /// grant Kind registration to no one (ADR-0009).
+    pub async fn grant_kind_registration(&self, role: &str) {
+        self.admin()
+            .await
+            .batch_execute(&format!(
+                "grant execute on function {REGISTER_KIND} to {}",
+                quote_ident(role)
+            ))
+            .await
+            .expect("grant Kind registration");
     }
 
     /// A raw connection as the login role, for the SQL-boundary suite.
