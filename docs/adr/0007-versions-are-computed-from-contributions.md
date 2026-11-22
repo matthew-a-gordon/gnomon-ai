@@ -16,6 +16,7 @@ Every property value an Episode states is stored as a Contribution: the Episode,
 ## Consequences
 
 - Ranked merge is a rule a Kind turns on. Without it, the order is Reference time, then Recorded time. A child Kind may turn ranked merge on but not off.
+- With ranked merge on, Authority ranks statements as it ranks values. A Correction, End of validity or Retraction from a lower-Authority Episode loses to the values a higher-Authority Episode supplied where their Valid times overlap. It stays held, like any losing Contribution, and takes effect if the higher-Authority Episode is erased. We added this when designing the Pipeline, because the Pipeline writes statements from Episode text it does not trust. Tickets #9 and #11 need it spelled out.
 - A rule change applies to later writes only. Each Version records the rule that chose its values, and an Erasure recomputes each Version under that recorded rule, so the result does not depend on when the Erasure runs.
 - As-of reads at a past known-at instant are stable except across an Erasure, which rewrites Recorded-time history as if the erased Episode never existed.
 - Erasing the Episode behind a Retraction makes the retracted fact current again.

@@ -89,11 +89,11 @@ _Avoid_: delete, purge, hard delete
 ### Derived content
 
 **Summary**:
-Generated prose describing one Node, derived from the Episodes it cites.
+Generated prose describing one Node, derived from the Episodes it cites. It belongs to one Scope and cites only Episodes from that Scope.
 _Avoid_: description, profile, digest
 
 **Community**:
-A group of closely connected Nodes, with a generated Summary of the group.
+A group of closely connected Nodes within one Scope, with a generated Summary of the group.
 _Avoid_: cluster, group, neighborhood
 
 ### Search
@@ -102,8 +102,12 @@ _Avoid_: cluster, group, neighborhood
 Finding the Versions, Summaries and Communities that match a query, as they stood at an As-of read's valid-at and known-at instants.
 _Avoid_: retrieval, lookup, query
 
+**Context**:
+The text the Pipeline assembles for a model from Search results and As-of reads, in a chosen format and within a token budget.
+_Avoid_: prompt, payload, retrieval result
+
 **Sentence**:
-A plain-language sentence stating what one Edge Version says, written by the Pipeline and used by Search.
+A plain-language sentence stating what one Edge Version says, written by the Pipeline from the Version as committed and used by Search. It leaves out Valid time.
 _Avoid_: Fact, gloss, description
 
 **Alias**:
@@ -111,7 +115,7 @@ A name a Node is known by, used in Resolution.
 _Avoid_: synonym, label, handle
 
 **Resolution**:
-Matching a mention in an Episode to a Node the graph already has.
+Matching a mention in an Episode to a Node the graph already has. Nodes never merge: when two Nodes prove to be one thing, a `same_as` Edge says so, and a `different_from` Edge records that two are not.
 _Avoid_: entity resolution, linking, dedup
 
 ### Isolation
