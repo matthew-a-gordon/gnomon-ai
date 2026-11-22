@@ -96,6 +96,24 @@ _Avoid_: description, profile, digest
 A group of closely connected Nodes, with a generated Summary of the group.
 _Avoid_: cluster, group, neighborhood
 
+### Search
+
+**Search**:
+Finding the Versions, Summaries and Communities that match a query, as they stood at an As-of read's valid-at and known-at instants.
+_Avoid_: retrieval, lookup, query
+
+**Sentence**:
+A plain-language sentence stating what one Edge Version says, written by the Pipeline and used by Search.
+_Avoid_: Fact, gloss, description
+
+**Alias**:
+A name a Node is known by, used in Resolution.
+_Avoid_: synonym, label, handle
+
+**Resolution**:
+Matching a mention in an Episode to a Node the graph already has.
+_Avoid_: entity resolution, linking, dedup
+
 ### Isolation
 
 **Tenant**:
