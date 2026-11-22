@@ -151,20 +151,14 @@ impl Error {
         }
     }
 
-    /// Turns the SQLSTATEs Kind registration raises into their variants.
-    pub(crate) fn from_kind_registration(e: tokio_postgres::Error) -> Error {
+    /// Turns the SQLSTATEs the Store's functions raise, for a refused Kind
+    /// or a refused write, into their variants.
+    pub(crate) fn from_store(e: tokio_postgres::Error) -> Error {
         let message = e.as_db_error().map(|d| d.message().to_owned());
         match (e.code().map(SqlState::code), message) {
             (Some(INVALID_KIND), Some(m)) => Error::InvalidKind(m),
             (Some(KIND_CONFLICT), Some(m)) => Error::KindConflict(m),
-            _ => Error::Database(e),
-        }
-    }
-
-    /// Turns the SQLSTATE a refused write raises into its variant.
-    pub(crate) fn from_write(e: tokio_postgres::Error) -> Error {
-        match (e.code().map(SqlState::code), e.as_db_error()) {
-            (Some(INVALID_WRITE), Some(d)) => Error::InvalidWrite(d.message().to_owned()),
+            (Some(INVALID_WRITE), Some(m)) => Error::InvalidWrite(m),
             _ => Error::Database(e),
         }
     }

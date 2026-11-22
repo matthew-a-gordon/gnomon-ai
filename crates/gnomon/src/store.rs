@@ -265,7 +265,7 @@ impl Caller<'_> {
             ],
         )
         .await
-        .map_err(Error::from_kind_registration)?;
+        .map_err(Error::from_store)?;
         let registered = read_kind(&tx, kind.tenant, &kind.name).await?;
         tx.commit().await?;
         Ok(registered.expect("a Kind just registered is visible to its registrant"))
@@ -370,7 +370,7 @@ impl Caller<'_> {
                             ],
                         )
                         .await
-                        .map_err(Error::from_write)?;
+                        .map_err(Error::from_store)?;
                     (new.tenant, NodeId(rows[0].get(0)))
                 }
             };
@@ -464,7 +464,7 @@ async fn write_patch(
     node: NodeId,
     patch: &Patch,
 ) -> Result<WriteOutcome, Error> {
-    let (from, to) = patch.valid_time.sql();
+    let (from, to) = patch.valid_time.instants();
     let values = Value::Object(patch.values.clone());
     let places = (!patch.places.is_empty()).then(|| {
         Value::Object(
@@ -489,7 +489,7 @@ async fn write_patch(
             ],
         )
         .await
-        .map_err(Error::from_write)?;
+        .map_err(Error::from_store)?;
     let r = &rows[0];
     let status = match r.get::<_, &str>(0) {
         "written" => WriteStatus::Written,

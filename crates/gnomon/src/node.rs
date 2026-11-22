@@ -86,7 +86,9 @@ impl ValidTime {
         }
     }
 
-    pub(crate) fn sql(self) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+    /// The bounds as the Store's SQL takes them: an instant, or `None` for an
+    /// unknown bound.
+    pub(crate) fn instants(self) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
         (self.from.instant(), self.to.instant())
     }
 }
@@ -145,7 +147,8 @@ pub enum WriteStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteOutcome {
     pub status: WriteStatus,
-    /// The write's Recorded time: its transaction time.
+    /// The write's Recorded time: when its transaction started. Every write
+    /// in one transaction shares it.
     pub recorded_at: DateTime<Utc>,
     /// The Versions the write opened.
     pub opened: Vec<VersionId>,

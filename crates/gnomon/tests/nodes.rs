@@ -987,9 +987,12 @@ async fn futures_join_all<F: std::future::Future>(
 
 /// A smoke check, not the performance suite (#21): a bounded patch to a Node
 /// with 100 Contributions, through the Store API, each call its own
-/// transaction with its commit. Prototype 4 measured about 3 ms at p50.
+/// transaction with its commit. The `prototype/recompute-cost` branch
+/// measured about 3 ms at p50 with fsync off. The bound asserted is loose on
+/// purpose, because the suite shares one server across parallel tests: the
+/// test prints the p50 to quote.
 #[tokio::test]
-async fn a_bounded_patch_on_a_node_with_100_contributions_takes_single_digit_ms_at_p50() {
+async fn a_bounded_patch_on_a_node_with_100_contributions_stays_under_a_loose_p50_bound() {
     let w = World::new().await;
     let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
     let days = |d: i64| start + chrono::Duration::days(d);

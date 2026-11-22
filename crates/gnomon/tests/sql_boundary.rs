@@ -1004,7 +1004,7 @@ async fn a_caller_cannot_rewrite_the_history_of_a_version() {
         }
     }
 
-    // Closing an open Version at the transaction time is the one change a
+    // Closing an open Version when the transaction started is the one change a
     // caller may make, and it may not then rewrite what it just closed.
     let mut client = n.w.db.login().await;
     let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
@@ -1014,7 +1014,7 @@ async fn a_caller_cannot_rewrite_the_history_of_a_version() {
             &[(&n.open, Type::UUID)],
         )
         .await
-        .expect("closing an open Version at the transaction time");
+        .expect("closing an open Version when its transaction started");
     assert_eq!(closed, 1);
     let r = tx
         .execute_typed(
@@ -1457,4 +1457,125 @@ async fn a_caller_cannot_redirect_the_write_through_its_search_path() {
     .await
     .expect_err("the write used the caller's shadow rule check");
     assert_eq!(err.code().map(|c| c.code()), Some(gnomon::INVALID_WRITE));
+}
+
+#[tokio::test]
+async fn a_caller_inserting_directly_cannot_skip_the_kinds_rules() {
+    let n = nodes().await;
+    n.w.db.grant_kind_registration(USER).await;
+    let person: Uuid = {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+        tx.query_typed(
+            "select gnomon.register_kind($1, 'person', 'node', null,
+               '{\"properties\": {\"age\": {\"type\": \"integer\"}}, \"required\": [\"age\"]}', '{}', null, null)",
+            &[(&n.w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap();
+        let id = tx
+            .query_typed(
+                "select gnomon.create_node($1, 'support', 'person')",
+                &[(&n.w.t1, Type::UUID)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        tx.commit().await.unwrap();
+        id
+    };
+    let contribution =
+        "insert into gnomon.contribution (tenant_id, scope, node_id, episode_id, property,
+           value, valid_from, valid_from_precision, valid_to, valid_to_precision)
+         values ($1, 'support', $2, $3, $4, $5, '-infinity', 'unknown', 'infinity', 'unknown')";
+    let version = "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
+           valid_from_precision, valid_to, valid_to_precision, merge_rule)
+         select $1, 'support', $2, $5, '2030-01-01', 'instant', '2030-01-02', 'instant', 'recency'
+         where $3::uuid is not null and $4::text is not null";
+    let attempts = [
+        (contribution, n.n1, "age", json!(1), "Kind \"node\" has no property \"age\""),
+        (contribution, n.n1, "name", json!(7), "the value 7 of property \"name\" does not satisfy Kind \"node\""),
+        (contribution, person, "age", json!("forty"), "the value \"forty\" of property \"age\" does not satisfy Kind \"person\""),
+        (version, n.n1, "-", json!({ "age": 1 }), "Kind \"node\" has no property \"age\""),
+        (version, person, "-", json!({ "age": 1.5 }), "the value 1.5 of property \"age\" does not satisfy Kind \"person\""),
+        (version, person, "-", json!({ "name": "Ada" }), "the write leaves required property \"age\" of Kind \"person\" without a value over [2030-01-01 00:00:00+00, 2030-01-02 00:00:00+00)"),
+    ];
+    for role in [USER, WORKER] {
+        for (sql, node, property, value, message) in &attempts {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+            tx.batch_execute("set local timezone = 'UTC'")
+                .await
+                .unwrap();
+            let err = tx
+                .execute_typed(
+                    sql,
+                    &[
+                        (&n.w.t1, Type::UUID),
+                        (node, Type::UUID),
+                        (&n.w.t1_support, Type::UUID),
+                        (property, Type::TEXT),
+                        (value, Type::JSONB),
+                    ],
+                )
+                .await
+                .expect_err(message);
+            assert_eq!(
+                err.code().map(|c| c.code()),
+                Some(gnomon::INVALID_WRITE),
+                "{role}: {err:?}"
+            );
+            assert_eq!(err.as_db_error().unwrap().message(), *message, "{role}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_caller_cannot_add_a_citation_to_closed_history() {
+    let n = nodes().await;
+    let before = version_rows(&n.w.db, n.n1).await;
+    let cite = "insert into gnomon.citation (tenant_id, scope, version_id, episode_id, property)
+                values ($1, 'support', $2, $3, 'name')";
+    for role in [USER, WORKER] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+        let r = tx
+            .execute_typed(
+                cite,
+                &[
+                    (&n.w.t1, Type::UUID),
+                    (&n.closed, Type::UUID),
+                    (&n.w.t1_support, Type::UUID),
+                ],
+            )
+            .await;
+        assert_refused(r, &format!("{role} citing a closed Version"));
+    }
+    assert_eq!(version_rows(&n.w.db, n.n1).await, before);
+}
+
+#[tokio::test]
+async fn a_caller_cannot_recompute_another_tenants_node() {
+    let n = nodes().await;
+    let before = version_rows(&n.w.db, n.n2).await;
+    for (tenant, what) in [
+        (n.w.t2, "naming Tenant two"),
+        (n.w.t1, "naming its own Tenant"),
+    ] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+        let err = tx
+            .query_typed(
+                "select * from gnomon.recompute_node($1, $2, '-infinity', 'infinity')",
+                &[(&tenant, Type::UUID), (&n.n2, Type::UUID)],
+            )
+            .await
+            .expect_err(what);
+        let code = err.code().map(|c| c.code().to_owned());
+        assert!(
+            code.as_deref() == Some("42501") || code.as_deref() == Some(gnomon::INVALID_WRITE),
+            "{what}: {err:?}"
+        );
+    }
+    assert_eq!(version_rows(&n.w.db, n.n2).await, before);
 }
