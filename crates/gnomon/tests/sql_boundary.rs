@@ -411,7 +411,17 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
             "select p.oid::regprocedure::text, p.prosecdef, coalesce(p.proconfig, '{}'),
                     p.proowner::regrole::text
              from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-             where n.nspname = 'gnomon'",
+             where n.nspname = 'gnomon'
+               -- The constructors Postgres creates with gnomon.uuid_range
+               -- and its multirange are internal functions, which take no
+               -- search path and run no SQL.
+               and not (
+                 p.prolang = (select oid from pg_language where lanname = 'internal')
+                 and exists (
+                   select from pg_range r
+                   where r.rngtypid = p.prorettype or r.rngmultitypid = p.prorettype
+                 )
+               )",
             &[],
         )
         .await
@@ -424,6 +434,10 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
         "gnomon.allowed_scopes()",
         "gnomon.register_kind(",
         "gnomon.read_kind(",
+        "gnomon.create_node(",
+        "gnomon.write_node(",
+        "gnomon.read_node(",
+        "gnomon.list_citations(",
     ] {
         assert!(
             names.iter().any(|n| n.starts_with(expected)),
@@ -750,4 +764,697 @@ async fn a_caller_calling_register_kind_directly_cannot_give_a_node_kind_endpoin
             .contains("only an Edge Kind names the Node Kinds"),
         "{err:?}"
     );
+}
+
+// Nodes, Contributions, Versions and Citations (ADR-0007, ADR-0008,
+// ADR-0009). Callers write them as the invoker, so the grants, the guard
+// triggers and RLS are the barrier.
+
+/// Two Tenants with Episodes as in `world`, and in each Tenant's `support`
+/// Scope a Node written twice: once to open a Version and once to close it
+/// and open another. All of it is committed.
+struct Nodes {
+    w: World,
+    n1: Uuid,
+    /// Tenant one's closed Version and its open one.
+    closed: Uuid,
+    open: Uuid,
+    n2: Uuid,
+    n2_open: Uuid,
+}
+
+async fn nodes() -> Nodes {
+    let w = world().await;
+    let store = Store::connect_no_tls(&w.db.login_url()).await.unwrap();
+    let mut made = Vec::new();
+    for (t, ep) in [(w.t1, w.t1_support), (w.t2, w.t2_support)] {
+        let caller = store.as_worker(TenantId(t), Scope::new("support"));
+        let patch = |n: &str| {
+            gnomon::Patch::new(
+                EpisodeId(ep),
+                gnomon::ValidTime::UNKNOWN,
+                match json!({ "name": n }) {
+                    serde_json::Value::Object(m) => m,
+                    _ => unreachable!(),
+                },
+            )
+        };
+        let (node, first) = caller
+            .create_node(
+                &gnomon::NewNode {
+                    tenant: TenantId(t),
+                    scope: Scope::new("support"),
+                    kind: gnomon::ROOT_NODE_KIND.into(),
+                },
+                &patch("first"),
+            )
+            .await
+            .unwrap();
+        let second = caller
+            .write_node(TenantId(t), node, &patch("second"))
+            .await
+            .unwrap();
+        made.push((node.0, first.opened[0].0, second.opened[0].0));
+    }
+    Nodes {
+        w,
+        n1: made[0].0,
+        closed: made[0].1,
+        open: made[0].2,
+        n2: made[1].0,
+        n2_open: made[1].2,
+    }
+}
+
+const WRITE_NODE: &str = "select status from gnomon.write_node($1, $2, $3, null, null, $4, null)";
+
+async fn write_node(
+    tx: &Transaction<'_>,
+    tenant: Uuid,
+    node: Uuid,
+    episode: Option<Uuid>,
+    values: serde_json::Value,
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    tx.query_typed(
+        WRITE_NODE,
+        &[
+            (&tenant, Type::UUID),
+            (&node, Type::UUID),
+            (&episode, Type::UUID),
+            (&values, Type::JSONB),
+        ],
+    )
+    .await
+}
+
+/// The Version rows of a Node and its Citations, counted past RLS.
+async fn version_rows(db: &TestDb, node: Uuid) -> (i64, i64) {
+    let row = db
+        .admin()
+        .await
+        .query_typed(
+            "select (select count(*) from gnomon.version where node_id = $1),
+                    (select count(*) from gnomon.citation c join gnomon.version v on v.id = c.version_id
+                     where v.node_id = $1)",
+            &[(&node, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    (row[0].get(0), row[0].get(1))
+}
+
+#[tokio::test]
+async fn a_caller_cannot_delete_a_committed_version_or_citation() {
+    let n = nodes().await;
+    let before = version_rows(&n.w.db, n.n1).await;
+    let statements = [
+        (
+            "delete from gnomon.version where id = $1",
+            n.open,
+            "the open Version",
+        ),
+        (
+            "delete from gnomon.version where id = $1",
+            n.closed,
+            "a closed Version",
+        ),
+        (
+            "delete from gnomon.citation where version_id = $1",
+            n.open,
+            "the open Version's Citations",
+        ),
+        (
+            "delete from gnomon.citation where version_id = $1",
+            n.closed,
+            "a closed Version's Citations",
+        ),
+        (
+            "delete from gnomon.version where node_id = $1",
+            n.n1,
+            "every Version of the Node",
+        ),
+    ];
+    for role in [USER, WORKER] {
+        for (sql, target, what) in statements {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+            let r = tx.execute_typed(sql, &[(&target, Type::UUID)]).await;
+            assert_refused(r, &format!("{role} deleting {what}"));
+        }
+    }
+    assert_eq!(
+        version_rows(&n.w.db, n.n1).await,
+        before,
+        "nothing was deleted"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_may_delete_only_the_versions_and_citations_its_own_transaction_wrote() {
+    let n = nodes().await;
+    let before = version_rows(&n.w.db, n.n1).await;
+    for role in [USER, WORKER] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+        write_node(
+            &tx,
+            n.w.t1,
+            n.n1,
+            Some(n.w.t1_support),
+            json!({ "name": "third" }),
+        )
+        .await
+        .unwrap();
+        let fresh: Uuid = tx
+            .query_typed(
+                "select id from gnomon.version where node_id = $1 and recorded_to = 'infinity'",
+                &[(&n.n1, Type::UUID)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        let cites = tx
+            .execute_typed(
+                "delete from gnomon.citation where version_id = $1",
+                &[(&fresh, Type::UUID)],
+            )
+            .await
+            .expect("deleting the transaction's own Citations");
+        assert_eq!(cites, 1);
+        let versions = tx
+            .execute_typed(
+                "delete from gnomon.version where id = $1",
+                &[(&fresh, Type::UUID)],
+            )
+            .await
+            .expect("deleting the transaction's own Version");
+        assert_eq!(versions, 1);
+        // The committed Versions stay out of reach in the same transaction.
+        let r = tx
+            .execute_typed(
+                "delete from gnomon.version where id = $1",
+                &[(&n.open, Type::UUID)],
+            )
+            .await;
+        assert_refused(
+            r,
+            &format!("{role} deleting a committed Version after its own"),
+        );
+    }
+    assert_eq!(version_rows(&n.w.db, n.n1).await, before);
+}
+
+#[tokio::test]
+async fn a_caller_cannot_rewrite_the_history_of_a_version() {
+    let n = nodes().await;
+    let statements = [
+        ("update gnomon.version set recorded_to = now() where id = $1", n.closed, "move a closed end to now"),
+        ("update gnomon.version set recorded_to = 'infinity' where id = $1", n.closed, "reopen a closed Version"),
+        (
+            "update gnomon.version set recorded_to = recorded_to + interval '1 second' where id = $1",
+            n.closed,
+            "move a closed end later",
+        ),
+        (
+            "update gnomon.version set recorded_to = now() - interval '1 second' where id = $1",
+            n.open,
+            "close an open Version in the past",
+        ),
+        (
+            "update gnomon.version set recorded_to = now() + interval '1 day' where id = $1",
+            n.open,
+            "close an open Version in the future",
+        ),
+        ("update gnomon.version set props = '{\"name\": \"forged\"}' where id = $1", n.open, "rewrite the values"),
+        ("update gnomon.version set recorded_from = '2000-01-01' where id = $1", n.open, "move the start of Recorded time"),
+        ("update gnomon.version set valid_from = '2000-01-01' where id = $1", n.open, "move Valid time"),
+        ("update gnomon.version set closed_in = null where id = $1", n.closed, "clear the closing mark"),
+        ("update gnomon.contribution set value = '\"forged\"' where node_id = $1", n.n1, "rewrite a Contribution"),
+        ("delete from gnomon.contribution where node_id = $1", n.n1, "delete a Contribution"),
+        ("update gnomon.citation set place = 'forged' where version_id = $1", n.open, "rewrite a Citation"),
+        ("update gnomon.node set kind = 'other' where id = $1", n.n1, "change a Node's Kind"),
+        ("delete from gnomon.node where id = $1", n.n1, "delete a Node"),
+    ];
+    for role in [USER, WORKER] {
+        for (sql, target, what) in statements {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+            let r = tx.execute_typed(sql, &[(&target, Type::UUID)]).await;
+            assert_refused(r, &format!("{role}: {what}"));
+        }
+    }
+
+    // Closing an open Version at the transaction time is the one change a
+    // caller may make, and it may not then rewrite what it just closed.
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    let closed = tx
+        .execute_typed(
+            "update gnomon.version set recorded_to = transaction_timestamp() where id = $1",
+            &[(&n.open, Type::UUID)],
+        )
+        .await
+        .expect("closing an open Version at the transaction time");
+    assert_eq!(closed, 1);
+    let r = tx
+        .execute_typed(
+            "update gnomon.version set recorded_to = now() + interval '1 day' where id = $1",
+            &[(&n.open, Type::UUID)],
+        )
+        .await;
+    assert_refused(r, "moving the end it just closed");
+}
+
+#[tokio::test]
+async fn a_caller_cannot_forge_the_mark_that_makes_a_committed_row_look_new() {
+    let n = nodes().await;
+    let before = version_rows(&n.w.db, n.n1).await;
+    let statements = [
+        (
+            "update gnomon.version set written_in = pg_current_xact_id() where id = $1",
+            "mark a committed Version as written now",
+        ),
+        (
+            "update gnomon.citation set written_in = pg_current_xact_id() where version_id = $1",
+            "mark a committed Citation as written now",
+        ),
+        (
+            "update gnomon.version set closed_in = pg_current_xact_id() where id = $1",
+            "mark a committed Version as closed now",
+        ),
+    ];
+    for role in [USER, WORKER] {
+        for (sql, what) in statements {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+            let r = tx.execute_typed(sql, &[(&n.open, Type::UUID)]).await;
+            assert_refused(r, &format!("{role}: {what}"));
+        }
+        // Nor can a row be inserted with a mark of the caller's choosing.
+        for (sql, what) in [
+            (
+                "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
+                   valid_from_precision, valid_to, valid_to_precision, merge_rule, written_in)
+                 values ($1, 'support', $2, '{}', '2030-01-01', 'instant', '2030-01-02', 'instant',
+                   'recency', pg_current_xact_id())",
+                "insert a Version with a mark",
+            ),
+            (
+                "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
+                   valid_from_precision, valid_to, valid_to_precision, merge_rule, written_in)
+                 values ($1, 'support', $2, '{}', '2030-01-01', 'instant', '2030-01-02', 'instant',
+                   'recency', '1')",
+                "insert a Version with an old mark",
+            ),
+        ] {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+            let r = tx
+                .execute_typed(sql, &[(&n.w.t1, Type::UUID), (&n.n1, Type::UUID)])
+                .await;
+            assert_refused(r, &format!("{role}: {what}"));
+        }
+    }
+    // And a committed Version is still out of reach of a delete.
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    let r = tx
+        .execute_typed(
+            "delete from gnomon.version where id = $1",
+            &[(&n.open, Type::UUID)],
+        )
+        .await;
+    assert_refused(r, "deleting after the forgeries");
+    assert_eq!(version_rows(&n.w.db, n.n1).await, before);
+}
+
+#[tokio::test]
+async fn recorded_time_is_assigned_only_by_gnomon() {
+    let n = nodes().await;
+    let statements = [
+        (
+            "insert into gnomon.contribution (tenant_id, scope, node_id, episode_id, property, value,
+               valid_from, valid_from_precision, valid_to, valid_to_precision, recorded_at)
+             values ($1, 'support', $2, $3, 'name', '\"x\"', '-infinity', 'unknown', 'infinity',
+               'unknown', '2000-01-01')",
+            "a Contribution's Recorded time",
+        ),
+        (
+            "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
+               valid_from_precision, valid_to, valid_to_precision, merge_rule, recorded_from)
+             values ($1, 'support', $2, '{}', '2030-01-01', 'instant', '2030-01-02', 'instant',
+               'recency', '2000-01-01')",
+            "a Version's Recorded time",
+        ),
+        (
+            "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
+               valid_from_precision, valid_to, valid_to_precision, merge_rule, recorded_to)
+             values ($1, 'support', $2, '{}', '2030-01-01', 'instant', '2030-01-02', 'instant',
+               'recency', '2100-01-01')",
+            "a Version's Recorded-time end",
+        ),
+        (
+            "insert into gnomon.citation (tenant_id, scope, version_id, episode_id, property, recorded_at)
+             select $1, 'support', $2, $3, 'name', '2000-01-01'",
+            "a Citation's Recorded time",
+        ),
+    ];
+    for role in [USER, WORKER] {
+        for (sql, what) in statements {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+            let second = if what.starts_with("a Citation") {
+                n.open
+            } else {
+                n.n1
+            };
+            let params: Vec<(&(dyn tokio_postgres::types::ToSql + Sync), Type)> =
+                if sql.contains("$3") {
+                    vec![
+                        (&n.w.t1, Type::UUID),
+                        (&second, Type::UUID),
+                        (&n.w.t1_support, Type::UUID),
+                    ]
+                } else {
+                    vec![(&n.w.t1, Type::UUID), (&second, Type::UUID)]
+                };
+            let r = tx.execute_typed(sql, &params).await;
+            assert_refused(r, &format!("{role} choosing {what}"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_write_with_no_episode_fails() {
+    let n = nodes().await;
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    let err = write_node(&tx, n.w.t1, n.n1, None, json!({ "name": "anonymous" }))
+        .await
+        .expect_err("a write with no Episode was accepted");
+    assert_eq!(err.code().map(|c| c.code()), Some(gnomon::INVALID_WRITE));
+    assert_eq!(
+        err.as_db_error().unwrap().message(),
+        "every write cites an Episode"
+    );
+    drop(tx);
+
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    let err = tx
+        .execute_typed(
+            "insert into gnomon.contribution (tenant_id, scope, node_id, episode_id, property, value,
+               valid_from, valid_from_precision, valid_to, valid_to_precision)
+             values ($1, 'support', $2, null, 'name', '\"x\"', '-infinity', 'unknown', 'infinity', 'unknown')",
+            &[(&n.w.t1, Type::UUID), (&n.n1, Type::UUID)],
+        )
+        .await
+        .expect_err("a Contribution with no Episode was inserted");
+    assert_eq!(err.code(), Some(&SqlState::NOT_NULL_VIOLATION));
+}
+
+#[tokio::test]
+async fn empty_intervals_are_refused_by_the_tables_as_well_as_the_write() {
+    let n = nodes().await;
+    let attempts = [
+        (
+            "insert into gnomon.contribution (tenant_id, scope, node_id, episode_id, property, value,
+               valid_from, valid_from_precision, valid_to, valid_to_precision)
+             values ($1, 'support', $2, $3, 'name', '\"x\"', '2030-01-01', 'instant', '2030-01-01', 'instant')",
+            "an empty Contribution",
+        ),
+        (
+            "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
+               valid_from_precision, valid_to, valid_to_precision, merge_rule)
+             select $1, 'support', $2, '{}', '2030-01-01', 'instant', '2030-01-01', 'instant', 'recency'
+             where $3::uuid is not null",
+            "an empty Version",
+        ),
+    ];
+    for (sql, what) in attempts {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+        let err = tx
+            .execute_typed(
+                sql,
+                &[
+                    (&n.w.t1, Type::UUID),
+                    (&n.n1, Type::UUID),
+                    (&n.w.t1_support, Type::UUID),
+                ],
+            )
+            .await
+            .expect_err(what);
+        assert_eq!(
+            err.code(),
+            Some(&SqlState::CHECK_VIOLATION),
+            "{what}: {err:?}"
+        );
+    }
+    // And a Version may not be closed at its own start, which would leave
+    // its Recorded time empty.
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    write_node(
+        &tx,
+        n.w.t1,
+        n.n1,
+        Some(n.w.t1_support),
+        json!({ "name": "third" }),
+    )
+    .await
+    .unwrap();
+    let r = tx
+        .execute_typed(
+            "update gnomon.version set recorded_to = transaction_timestamp()
+             where node_id = $1 and recorded_to = 'infinity'",
+            &[(&n.n1, Type::UUID)],
+        )
+        .await;
+    assert_refused(r, "closing a Version at its own start");
+}
+
+#[tokio::test]
+async fn a_node_cannot_hold_two_versions_at_once_even_when_inserted_directly() {
+    let n = nodes().await;
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    let err = tx
+        .execute_typed(
+            "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
+               valid_from_precision, valid_to, valid_to_precision, merge_rule)
+             values ($1, 'support', $2, '{\"name\": \"overlap\"}', '2030-01-01', 'instant',
+               '2030-02-01', 'instant', 'recency')",
+            &[(&n.w.t1, Type::UUID), (&n.n1, Type::UUID)],
+        )
+        .await
+        .expect_err("an overlapping Version was inserted");
+    assert_eq!(err.code(), Some(&SqlState::EXCLUSION_VIOLATION), "{err:?}");
+    drop(tx);
+
+    // The same times on another Node, of this Tenant or another, are fine.
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    let other: Uuid = tx
+        .query_typed(
+            "select gnomon.create_node($1, 'support', 'node')",
+            &[(&n.w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    write_node(
+        &tx,
+        n.w.t1,
+        other,
+        Some(n.w.t1_support),
+        json!({ "name": "other" }),
+    )
+    .await
+    .expect("the same Valid and Recorded time on another Node");
+}
+
+#[tokio::test]
+async fn a_caller_cannot_read_or_write_another_tenants_or_scopes_nodes() {
+    let n = nodes().await;
+    for role in [USER, WORKER] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+        for table in ["node", "contribution", "version", "citation"] {
+            let n_other: i64 = tx
+                .query_typed(
+                    &format!("select count(*) from gnomon.{table} where tenant_id <> $1"),
+                    &[(&n.w.t1, Type::UUID)],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+            assert_eq!(n_other, 0, "{role} saw another Tenant's {table} rows");
+        }
+        let read = tx
+            .query_typed(
+                "select id from gnomon.read_node($1, $2, now(), null)",
+                &[(&n.w.t2, Type::UUID), (&n.n2, Type::UUID)],
+            )
+            .await
+            .unwrap();
+        assert!(read.is_empty(), "{role} read Tenant two's Node");
+        let cites = tx
+            .query_typed(
+                "select episode_id from gnomon.list_citations($1, $2)",
+                &[(&n.w.t2, Type::UUID), (&n.n2_open, Type::UUID)],
+            )
+            .await
+            .unwrap();
+        assert!(cites.is_empty(), "{role} listed Tenant two's Citations");
+    }
+
+    // Writes into another Tenant fail at the Tenant check, and writes that
+    // name this Tenant but another's Node or Episode find nothing to write.
+    let attempts = [
+        (
+            n.w.t2,
+            n.n2,
+            n.w.t2_support,
+            "another Tenant's Node",
+            Some(SqlState::INSUFFICIENT_PRIVILEGE),
+        ),
+        (
+            n.w.t1,
+            n.n2,
+            n.w.t1_support,
+            "another Tenant's Node named in this Tenant",
+            None,
+        ),
+        (
+            n.w.t1,
+            n.n1,
+            n.w.t2_support,
+            "citing another Tenant's Episode",
+            None,
+        ),
+        (
+            n.w.t1,
+            n.n1,
+            n.w.t1_billing,
+            "citing another Scope's Episode",
+            None,
+        ),
+    ];
+    for (tenant, node, episode, what, code) in attempts {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(n.w.t1, &["support"])).await;
+        let err = write_node(
+            &tx,
+            tenant,
+            node,
+            Some(episode),
+            json!({ "name": "forged" }),
+        )
+        .await
+        .expect_err(what);
+        match code {
+            Some(c) => assert_eq!(err.code(), Some(&c), "{what}: {err:?}"),
+            None => assert_eq!(
+                err.code().map(|c| c.code()),
+                Some(gnomon::INVALID_WRITE),
+                "{what}: {err:?}"
+            ),
+        }
+    }
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    let r = tx
+        .query_typed(
+            "select gnomon.create_node($1, 'billing', 'node')",
+            &[(&n.w.t1, Type::UUID)],
+        )
+        .await;
+    assert_refused(r, "creating a Node in another Scope");
+    assert_eq!(
+        version_rows(&n.w.db, n.n2).await.0,
+        2,
+        "Tenant two's Node is untouched"
+    );
+}
+
+#[tokio::test]
+async fn a_write_that_started_before_a_committed_write_to_the_node_fails_and_can_be_retried() {
+    let n = nodes().await;
+    let mut early = n.w.db.login().await;
+    let tx = as_caller(&mut early, USER, &claims(n.w.t1, &["support"])).await;
+    // The early transaction's time is fixed when it starts. A write to the
+    // Node then commits.
+    let store = Store::connect_no_tls(&n.w.db.login_url()).await.unwrap();
+    store
+        .as_worker(TenantId(n.w.t1), Scope::new("support"))
+        .write_node(
+            TenantId(n.w.t1),
+            gnomon::NodeId(n.n1),
+            &gnomon::Patch::new(
+                EpisodeId(n.w.t1_support),
+                gnomon::ValidTime::UNKNOWN,
+                match json!({ "name": "later" }) {
+                    serde_json::Value::Object(m) => m,
+                    _ => unreachable!(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let err = write_node(
+        &tx,
+        n.w.t1,
+        n.n1,
+        Some(n.w.t1_support),
+        json!({ "name": "earlier" }),
+    )
+    .await
+    .expect_err("a write recorded before a committed one");
+    assert_eq!(
+        err.code(),
+        Some(&SqlState::T_R_SERIALIZATION_FAILURE),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_cannot_redirect_the_write_through_its_search_path() {
+    let n = nodes().await;
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    tx.batch_execute(
+        "create temporary table version (like gnomon.version);
+         create temporary table contribution (like gnomon.contribution);
+         create function pg_temp.jsonb_path_match(jsonb, jsonpath) returns boolean
+           language sql as $$ select true $$;
+         set local search_path = pg_temp, public;",
+    )
+    .await
+    .unwrap();
+    write_node(
+        &tx,
+        n.w.t1,
+        n.n1,
+        Some(n.w.t1_support),
+        json!({ "name": "real" }),
+    )
+    .await
+    .unwrap();
+    let shadow: i64 = tx
+        .query_typed("select (select count(*) from pg_temp.version) + (select count(*) from pg_temp.contribution)", &[])
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(shadow, 0, "the write wrote the caller's shadow tables");
+    let err = write_node(
+        &tx,
+        n.w.t1,
+        n.n1,
+        Some(n.w.t1_support),
+        json!({ "name": 7 }),
+    )
+    .await
+    .expect_err("the write used the caller's shadow rule check");
+    assert_eq!(err.code().map(|c| c.code()), Some(gnomon::INVALID_WRITE));
 }

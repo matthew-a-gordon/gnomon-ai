@@ -7,6 +7,7 @@
 
 mod kind;
 pub mod migrations;
+mod node;
 mod store;
 
 use std::fmt;
@@ -16,6 +17,10 @@ use tokio_postgres::error::SqlState;
 use uuid::Uuid;
 
 pub use kind::{Kind, KindOf, NewKind, ROOT_EDGE_KIND, ROOT_NODE_KIND};
+pub use node::{
+    AsOf, Bound, Citation, NewNode, NodeId, NodeVersion, Patch, ValidTime, VersionId, WriteOutcome,
+    WriteStatus,
+};
 pub use store::{Caller, Store};
 
 /// The SQLSTATE Kind registration raises for a definition outside the
@@ -25,6 +30,11 @@ pub const INVALID_KIND: &str = "GNK01";
 /// The SQLSTATE Kind registration raises for a name already registered with
 /// another definition.
 pub const KIND_CONFLICT: &str = "GNK02";
+
+/// The SQLSTATE a write raises when it breaks a rule of the Store: no
+/// Episode, an empty Valid time, a value its Kind refuses, or a Node or
+/// Episode the caller cannot see.
+pub const INVALID_WRITE: &str = "GNW01";
 
 /// The unit of isolation: one customer's graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -117,6 +127,11 @@ pub enum Error {
     /// definition.
     #[error("Kind conflict: {0}")]
     KindConflict(String),
+    /// The Store refused a write: it cites no Episode, its Valid time is
+    /// empty, a value does not satisfy the Node's Kind, or the Node or the
+    /// Episode is not visible to the caller. The message says which.
+    #[error("invalid write: {0}")]
+    InvalidWrite(String),
     /// Postgres refused or failed the call. RLS refusals and a missing grant
     /// arrive here.
     #[error(transparent)]
@@ -131,7 +146,8 @@ impl Error {
             Error::SchemaVersion { .. }
             | Error::InvalidEmbeddingDimension(_)
             | Error::InvalidKind(_)
-            | Error::KindConflict(_) => None,
+            | Error::KindConflict(_)
+            | Error::InvalidWrite(_) => None,
         }
     }
 
@@ -141,6 +157,14 @@ impl Error {
         match (e.code().map(SqlState::code), message) {
             (Some(INVALID_KIND), Some(m)) => Error::InvalidKind(m),
             (Some(KIND_CONFLICT), Some(m)) => Error::KindConflict(m),
+            _ => Error::Database(e),
+        }
+    }
+
+    /// Turns the SQLSTATE a refused write raises into its variant.
+    pub(crate) fn from_write(e: tokio_postgres::Error) -> Error {
+        match (e.code().map(SqlState::code), e.as_db_error()) {
+            (Some(INVALID_WRITE), Some(d)) => Error::InvalidWrite(d.message().to_owned()),
             _ => Error::Database(e),
         }
     }

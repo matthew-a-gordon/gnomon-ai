@@ -26,7 +26,15 @@ use tokio_postgres::types::Type;
 use tokio_postgres::{Client, NoTls, Transaction};
 
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
-use crate::{Episode, EpisodeId, Error, Kind, KindOf, NewEpisode, NewKind, Scope, TenantId};
+use crate::{
+    AsOf, Bound, Citation, Episode, EpisodeId, Error, Kind, KindOf, NewEpisode, NewKind, NewNode,
+    NodeId, NodeVersion, Patch, Scope, TenantId, ValidTime, VersionId, WriteOutcome, WriteStatus,
+};
+
+/// How many times a write is retried when Postgres fails it with a
+/// serialization failure or a deadlock, which a write to a Node that a
+/// concurrent transaction wrote first can raise.
+const WRITE_RETRIES: usize = 8;
 
 /// The caller role a call runs as. Neither can bypass RLS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +279,243 @@ impl Caller<'_> {
         let kind = read_kind(&tx, tenant, name).await?;
         tx.commit().await?;
         Ok(kind)
+    }
+}
+
+/// One write of a batch: to a new Node, or to an existing one.
+enum Target<'a> {
+    New(&'a NewNode),
+    Existing(TenantId, NodeId),
+}
+
+impl Caller<'_> {
+    /// Creates a Node and writes its first patch, in one transaction.
+    pub async fn create_node(
+        &self,
+        node: &NewNode,
+        patch: &Patch,
+    ) -> Result<(NodeId, WriteOutcome), Error> {
+        let mut done = self.run_writes(&[(Target::New(node), patch)]).await?;
+        Ok(done.remove(0))
+    }
+
+    /// Writes a patch of property values for a Node, citing the patch's
+    /// Episode, and recomputes the Node's Versions over its Valid time.
+    pub async fn write_node(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        patch: &Patch,
+    ) -> Result<WriteOutcome, Error> {
+        let mut done = self
+            .run_writes(&[(Target::Existing(tenant, node), patch)])
+            .await?;
+        Ok(done.remove(0).1)
+    }
+
+    /// Writes several patches in one transaction, in order. A second write
+    /// to the same Node replaces the Versions the first opened, in place, so
+    /// the batch leaves no Version that no read could have seen (ADR-0008).
+    pub async fn write_nodes(
+        &self,
+        tenant: TenantId,
+        writes: &[(NodeId, Patch)],
+    ) -> Result<Vec<WriteOutcome>, Error> {
+        let targets: Vec<_> = writes
+            .iter()
+            .map(|(node, patch)| (Target::Existing(tenant, *node), patch))
+            .collect();
+        Ok(self
+            .run_writes(&targets)
+            .await?
+            .into_iter()
+            .map(|(_, outcome)| outcome)
+            .collect())
+    }
+
+    /// Runs a batch of writes in one transaction, retrying the whole
+    /// transaction when Postgres asks for a retry.
+    async fn run_writes(
+        &self,
+        writes: &[(Target<'_>, &Patch)],
+    ) -> Result<Vec<(NodeId, WriteOutcome)>, Error> {
+        let mut client = self.store.client.lock().await;
+        let mut attempt = 0;
+        loop {
+            match self.try_writes(&mut client, writes).await {
+                Err(e) if attempt < WRITE_RETRIES && is_retryable(&e) => attempt += 1,
+                done => return done,
+            }
+        }
+    }
+
+    async fn try_writes(
+        &self,
+        client: &mut Client,
+        writes: &[(Target<'_>, &Patch)],
+    ) -> Result<Vec<(NodeId, WriteOutcome)>, Error> {
+        let tx = self.begin(client).await?;
+        let mut done = Vec::with_capacity(writes.len());
+        for (target, patch) in writes {
+            let (tenant, node) = match target {
+                Target::Existing(tenant, node) => (*tenant, *node),
+                Target::New(new) => {
+                    let rows = tx
+                        .query_typed(
+                            "select gnomon.create_node($1, $2, $3)",
+                            &[
+                                (&new.tenant.0, Type::UUID),
+                                (&new.scope.as_str(), Type::TEXT),
+                                (&new.kind, Type::TEXT),
+                            ],
+                        )
+                        .await
+                        .map_err(Error::from_write)?;
+                    (new.tenant, NodeId(rows[0].get(0)))
+                }
+            };
+            done.push((node, write_patch(&tx, tenant, node, patch).await?));
+        }
+        tx.commit().await?;
+        Ok(done)
+    }
+
+    /// Reads a Node As-of a valid-at and a known-at instant: the Version
+    /// that held then, or `None` if none did or the caller cannot see the
+    /// Node.
+    pub async fn read_node(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        as_of: AsOf,
+    ) -> Result<Option<NodeVersion>, Error> {
+        let mut client = self.store.client.lock().await;
+        let tx = self.begin(&mut client).await?;
+        let rows = tx
+            .query_typed(
+                "select id, node_id, scope, kind, props,
+                        nullif(valid_from, '-infinity'), valid_from_precision::text,
+                        nullif(valid_to, 'infinity'), valid_to_precision::text,
+                        recorded_from, nullif(recorded_to, 'infinity')
+                 from gnomon.read_node($1, $2, $3, $4)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&node.0, Type::UUID),
+                    (&as_of.valid_at, Type::TIMESTAMPTZ),
+                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(rows.first().map(|r| {
+            let values = match r.get::<_, Value>(4) {
+                Value::Object(m) => m,
+                other => panic!("gnomon.read_node returned values {other}"),
+            };
+            NodeVersion {
+                id: VersionId(r.get(0)),
+                node: NodeId(r.get(1)),
+                scope: Scope::new(r.get::<_, String>(2)),
+                kind: r.get(3),
+                values,
+                valid_time: ValidTime {
+                    from: bound(r.get(5), r.get(6)),
+                    to: bound(r.get(7), r.get(8)),
+                },
+                recorded_from: r.get(9),
+                recorded_to: r.get(10),
+            }
+        }))
+    }
+
+    /// Lists the Citations of a Version: each Episode it was derived from,
+    /// with the property and the place they name.
+    pub async fn list_citations(
+        &self,
+        tenant: TenantId,
+        version: VersionId,
+    ) -> Result<Vec<Citation>, Error> {
+        let mut client = self.store.client.lock().await;
+        let tx = self.begin(&mut client).await?;
+        let rows = tx
+            .query_typed(
+                "select episode_id, property, place, recorded_at, episode_recorded_at
+                 from gnomon.list_citations($1, $2)",
+                &[(&tenant.0, Type::UUID), (&version.0, Type::UUID)],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|r| Citation {
+                episode: EpisodeId(r.get(0)),
+                property: r.get(1),
+                place: r.get(2),
+                recorded_at: r.get(3),
+                episode_recorded_at: r.get(4),
+            })
+            .collect())
+    }
+}
+
+async fn write_patch(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    node: NodeId,
+    patch: &Patch,
+) -> Result<WriteOutcome, Error> {
+    let (from, to) = patch.valid_time.sql();
+    let values = Value::Object(patch.values.clone());
+    let places = (!patch.places.is_empty()).then(|| {
+        Value::Object(
+            patch
+                .places
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                .collect(),
+        )
+    });
+    let rows = tx
+        .query_typed(
+            "select status, recorded_at, versions from gnomon.write_node($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                (&tenant.0, Type::UUID),
+                (&node.0, Type::UUID),
+                (&patch.episode.0, Type::UUID),
+                (&from, Type::TIMESTAMPTZ),
+                (&to, Type::TIMESTAMPTZ),
+                (&values, Type::JSONB),
+                (&places, Type::JSONB),
+            ],
+        )
+        .await
+        .map_err(Error::from_write)?;
+    let r = &rows[0];
+    let status = match r.get::<_, &str>(0) {
+        "written" => WriteStatus::Written,
+        "unchanged" => WriteStatus::Unchanged,
+        other => panic!("gnomon.write_node returned status {other:?}"),
+    };
+    let opened: Vec<uuid::Uuid> = r.get(2);
+    Ok(WriteOutcome {
+        status,
+        recorded_at: r.get(1),
+        opened: opened.into_iter().map(VersionId).collect(),
+    })
+}
+
+fn is_retryable(e: &Error) -> bool {
+    matches!(
+        e.sqlstate(),
+        Some(c) if *c == SqlState::T_R_SERIALIZATION_FAILURE || *c == SqlState::T_R_DEADLOCK_DETECTED
+    )
+}
+
+/// A Valid-time bound as the Store returns it: unknown, or an instant.
+fn bound(at: Option<DateTime<Utc>>, precision: &str) -> Bound {
+    match (precision, at) {
+        ("unknown", _) | (_, None) => Bound::Unknown,
+        (_, Some(t)) => Bound::At(t),
     }
 }
 

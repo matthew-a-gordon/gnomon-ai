@@ -7,9 +7,11 @@ The suite runs with plain `cargo test` or with `cargo nextest run`, and every te
 - `crates/gnomon/tests/export.rs` drives `gnomon migrations export` through the binary. It needs no database.
 - `crates/gnomon/tests/store_api.rs` is seam 1: the Rust core's Store API against real Postgres.
 - `crates/gnomon/tests/kinds.rs` is seam 1 for Kind registration: registering and reading Kinds, and evaluating their compiled rules with `jsonb_path_match`.
-- `crates/gnomon/tests/sql_boundary.rs` is seam 2: adversarial tests that connect as a caller role with claims set, bypassing the Rust core.
+- `crates/gnomon/tests/nodes.rs` is seam 1 for Nodes: writing a patch of property values citing an Episode, the merge order, same-transaction replacement, As-of reads and Citations. It ends with a smoke check that prints the p50 of a bounded patch on a Node with 100 Contributions and asserts a loose bound. The performance suite proper is a later ticket.
+- `crates/gnomon/tests/node_oracle.rs` is the oracle test (ADR-0020). An oracle picks each property's winner straight from the Contributions, and `proptest` compares it with As-of reads after random sequences of writes, some batched in one transaction. A failing sequence shrinks to a short one.
+- `crates/gnomon/tests/sql_boundary.rs` is seam 2: adversarial tests that connect as a caller role with claims set, bypassing the Rust core. For Versions they show that a caller cannot delete committed history, rewrite a closed Recorded time, choose a Recorded time, or forge the mark that lets a transaction delete the rows it wrote.
 
-The three database suites share the harness in `crates/gnomon/tests/support`. Each test gets a fresh database, created with `CREATE DATABASE ... TEMPLATE` from a template that holds the exported migrations. The harness builds that template once per server and migration set.
+The database suites share the harness in `crates/gnomon/tests/support`. Each test gets a fresh database, created with `CREATE DATABASE ... TEMPLATE` from a template that holds the exported migrations. The harness builds that template once per server and migration set.
 
 ## Running the database suites
 
