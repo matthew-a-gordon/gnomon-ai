@@ -157,7 +157,7 @@ async fn check(store: &Store, tenant: TenantId, sequence: &[Vec<Write>]) -> (Vec
         for w in tx {
             let ep: EpisodeId = caller
                 .record_episode(&NewEpisode {
-                    tenant,
+                    tenant: Some(tenant),
                     scope: Scope::new(SCOPE),
                     content: format!("{w:?}"),
                     reference_time: at(f64::from(w.reference_day)),
@@ -176,7 +176,7 @@ async fn check(store: &Store, tenant: TenantId, sequence: &[Vec<Write>]) -> (Vec
         let outcomes = match node {
             None => {
                 let new = NewNode {
-                    tenant,
+                    tenant: Some(tenant),
                     scope: Scope::new(SCOPE),
                     kind: ROOT_NODE_KIND.into(),
                 };

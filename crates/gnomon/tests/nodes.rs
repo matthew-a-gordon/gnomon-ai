@@ -53,7 +53,7 @@ impl World {
     async fn episode(&self, reference_time: DateTime<Utc>) -> EpisodeId {
         self.caller()
             .record_episode(&NewEpisode {
-                tenant: self.tenant,
+                tenant: Some(self.tenant),
                 scope: Scope::new(SCOPE),
                 content: format!("an Episode from {reference_time}"),
                 reference_time,
@@ -65,7 +65,7 @@ impl World {
 
     fn new_node(&self, kind: &str) -> NewNode {
         NewNode {
-            tenant: self.tenant,
+            tenant: Some(self.tenant),
             scope: Scope::new(SCOPE),
             kind: kind.to_owned(),
         }
@@ -142,7 +142,7 @@ impl World {
     async fn register_node_kind(&self, name: &str, properties: Value) {
         self.caller()
             .register_kind(&gnomon::NewKind {
-                tenant: self.tenant,
+                tenant: Some(self.tenant),
                 name: name.to_owned(),
                 of: gnomon::KindOf::Node,
                 parent: None,
@@ -631,7 +631,7 @@ async fn a_write_must_cite_an_episode_the_caller_can_see_in_the_nodes_scope() {
         .store
         .as_worker(w.tenant, Scope::new("billing"))
         .record_episode(&NewEpisode {
-            tenant: w.tenant,
+            tenant: Some(w.tenant),
             scope: Scope::new("billing"),
             content: "billing".into(),
             reference_time: day(2),

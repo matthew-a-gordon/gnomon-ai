@@ -46,7 +46,8 @@ impl KindOf {
 /// A Kind to register in one Tenant's Ontology.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewKind {
-    pub tenant: TenantId,
+    /// `None` names no Tenant: the default Tenant in single-tenant mode.
+    pub tenant: Option<TenantId>,
     /// A letter followed by at most 62 letters, digits or underscores. `node`
     /// and `edge` are the root Kinds and cannot be registered.
     pub name: String,

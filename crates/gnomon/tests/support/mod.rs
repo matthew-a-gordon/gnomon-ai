@@ -101,7 +101,7 @@ pub fn export_plain(dimension: u32, out: &Path) {
 }
 
 /// The exported files, in the order a chain applies them.
-fn exported(dimension: u32) -> Vec<(String, String)> {
+pub fn exported(dimension: u32) -> Vec<(String, String)> {
     let out = tempfile::tempdir().unwrap();
     export_plain(dimension, out.path());
     let mut files: Vec<_> = std::fs::read_dir(out.path())
@@ -281,6 +281,41 @@ impl TestDb {
             ))
             .await
             .expect("grant Kind registration");
+    }
+
+    /// The deployment's operator: the role that applied the migrations and
+    /// owns their objects, connected to this database. It switches the
+    /// tenancy mode, which no caller role may do.
+    pub async fn operator(&self) -> Client {
+        let client = self.admin().await;
+        if let Some(role) = &self.server.migration_role {
+            client
+                .batch_execute(&format!("set role {}", quote_ident(role)))
+                .await
+                .expect("switch to the migration role");
+        }
+        client
+    }
+
+    /// The default Tenant the migrations created. In multi-tenant mode it
+    /// is the deployment's first Tenant.
+    pub async fn default_tenant(&self) -> gnomon::TenantId {
+        let row = self
+            .operator()
+            .await
+            .query_typed("select default_tenant_id from gnomon.tenancy", &[])
+            .await
+            .expect("read the tenancy row");
+        gnomon::TenantId(row[0].get(0))
+    }
+
+    /// What an operator does once to make the deployment multi-tenant.
+    pub async fn switch_to_multi_tenant(&self) {
+        self.operator()
+            .await
+            .batch_execute("select gnomon.switch_to_multi_tenant()")
+            .await
+            .expect("switch to multi-tenant mode");
     }
 
     /// A raw connection as the login role, for the SQL-boundary suite.

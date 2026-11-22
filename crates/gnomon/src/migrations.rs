@@ -43,6 +43,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0004_nodes_and_versions",
         template: include_str!("../migrations/0004_nodes_and_versions.sql"),
     },
+    Migration {
+        version: 5,
+        name: "0005_tenancy_modes",
+        template: include_str!("../migrations/0005_tenancy_modes.sql"),
+    },
 ];
 
 /// The schema version this build of the Store expects: the last migration's.

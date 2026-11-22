@@ -36,7 +36,20 @@ pub const KIND_CONFLICT: &str = "GNK02";
 /// Episode the caller cannot see.
 pub const INVALID_WRITE: &str = "GNW01";
 
+/// The SQLSTATE a Store call raises when it names no Tenant in a
+/// multi-tenant deployment.
+pub const TENANT_REQUIRED: &str = "GNT01";
+
+/// The SQLSTATE a Store call raises when the Tenant it names is not the
+/// Tenant the caller's claims bind.
+pub const TENANT_MISMATCH: &str = "GNT02";
+
 /// The unit of isolation: one customer's graph.
+///
+/// Every Store call takes an `Option<TenantId>`, and a `TenantId` converts
+/// into one. A call that passes `None` uses the default Tenant in a
+/// single-tenant deployment and fails with [`Error::TenantRequired`] in a
+/// multi-tenant one (ADR-0005).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TenantId(pub Uuid);
 
@@ -81,7 +94,8 @@ impl fmt::Display for EpisodeId {
 /// document, that Versions will be derived from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewEpisode {
-    pub tenant: TenantId,
+    /// `None` names no Tenant: the default Tenant in single-tenant mode.
+    pub tenant: Option<TenantId>,
     pub scope: Scope,
     pub content: String,
     /// When the source was produced, not when gnomon recorded it.
@@ -132,6 +146,14 @@ pub enum Error {
     /// Episode is not visible to the caller. The message says which.
     #[error("invalid write: {0}")]
     InvalidWrite(String),
+    /// The call named no Tenant, and the deployment is multi-tenant, so it
+    /// does not fall back to the default Tenant.
+    #[error("Tenant required: {0}")]
+    TenantRequired(String),
+    /// The Tenant the call named is not the Tenant the caller's claims
+    /// bind, or the claims bind none. The message names both.
+    #[error("Tenant mismatch: {0}")]
+    TenantMismatch(String),
     /// Postgres refused or failed the call. RLS refusals and a missing grant
     /// arrive here.
     #[error(transparent)]
@@ -147,18 +169,22 @@ impl Error {
             | Error::InvalidEmbeddingDimension(_)
             | Error::InvalidKind(_)
             | Error::KindConflict(_)
-            | Error::InvalidWrite(_) => None,
+            | Error::InvalidWrite(_)
+            | Error::TenantRequired(_)
+            | Error::TenantMismatch(_) => None,
         }
     }
 
-    /// Turns the SQLSTATEs the Store's functions raise, for a refused Kind
-    /// or a refused write, into their variants.
+    /// Turns the SQLSTATEs the Store's functions raise, for a refused Kind,
+    /// a refused write or a refused Tenant, into their variants.
     pub(crate) fn from_store(e: tokio_postgres::Error) -> Error {
         let message = e.as_db_error().map(|d| d.message().to_owned());
         match (e.code().map(SqlState::code), message) {
             (Some(INVALID_KIND), Some(m)) => Error::InvalidKind(m),
             (Some(KIND_CONFLICT), Some(m)) => Error::KindConflict(m),
             (Some(INVALID_WRITE), Some(m)) => Error::InvalidWrite(m),
+            (Some(TENANT_REQUIRED), Some(m)) => Error::TenantRequired(m),
+            (Some(TENANT_MISMATCH), Some(m)) => Error::TenantMismatch(m),
             _ => Error::Database(e),
         }
     }

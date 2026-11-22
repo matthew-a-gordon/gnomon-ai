@@ -71,7 +71,7 @@ async fn world() -> World {
             let EpisodeId(id) = store
                 .as_worker(TenantId(t), Scope::new(scope.clone()))
                 .record_episode(&NewEpisode {
-                    tenant: TenantId(t),
+                    tenant: Some(TenantId(t)),
                     scope: Scope::new(scope.clone()),
                     content: format!("{t} {scope}"),
                     reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
@@ -360,8 +360,10 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
         let (name, rls, tenant, scope): (String, bool, bool, bool) =
             (t.get(0), t.get(1), t.get(2), t.get(3));
         assert!(rls, "gnomon.{name} has no RLS");
-        if name == "schema_version" {
-            continue; // The ledger describes the schema, not a graph.
+        if name == "schema_version" || name == "tenancy" {
+            // The ledger describes the schema and the tenancy row the
+            // deployment, not a graph.
+            continue;
         }
         assert!(tenant, "gnomon.{name} lacks a tenant_id column");
         let ontology = ONTOLOGY_TABLES.contains(&name.as_str());
@@ -438,6 +440,9 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
         "gnomon.write_node(",
         "gnomon.read_node(",
         "gnomon.list_citations(",
+        "gnomon.default_tenant()",
+        "gnomon.call_tenant(",
+        "gnomon.switch_to_multi_tenant()",
     ] {
         assert!(
             names.iter().any(|n| n.starts_with(expected)),
@@ -802,7 +807,7 @@ async fn nodes() -> Nodes {
         let (node, first) = caller
             .create_node(
                 &gnomon::NewNode {
-                    tenant: TenantId(t),
+                    tenant: Some(TenantId(t)),
                     scope: Scope::new("support"),
                     kind: gnomon::ROOT_NODE_KIND.into(),
                 },
@@ -1581,4 +1586,184 @@ async fn a_caller_cannot_recompute_another_tenants_node() {
         );
     }
     assert_eq!(version_rows(&n.w.db, n.n2).await, before);
+}
+
+// Tenancy modes (ADR-0005). The mode is one row that no caller role may
+// write, and multi-tenant mode never falls back to the default Tenant, not
+// even for a caller that bypasses the Rust core.
+
+#[tokio::test]
+async fn a_caller_cannot_switch_the_tenancy_mode_or_write_the_tenancy_row() {
+    let w = world().await;
+    for multi in [false, true] {
+        if multi {
+            w.db.switch_to_multi_tenant().await;
+        }
+        for role in [USER, WORKER] {
+            for sql in [
+                "select gnomon.switch_to_multi_tenant()",
+                "update gnomon.tenancy set mode = 'single'",
+                "update gnomon.tenancy set mode = 'multi'",
+                "update gnomon.tenancy set default_tenant_id = gen_random_uuid()",
+                "insert into gnomon.tenancy (singleton, mode, default_tenant_id) values (false, 'single', gen_random_uuid())",
+                "delete from gnomon.tenancy",
+                "truncate gnomon.tenancy",
+            ] {
+                let mut client = w.db.login().await;
+                let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+                assert_refused(tx.batch_execute(sql).await, &format!("{role}: {sql}"));
+            }
+        }
+    }
+    let mode: String =
+        w.db.operator()
+            .await
+            .query_typed("select mode from gnomon.tenancy", &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+    assert_eq!(mode, "multi", "only the operator's switch took effect");
+}
+
+/// Every gnomon table with a Tenant, from the catalog.
+async fn tenant_tables(client: &Client) -> Vec<String> {
+    client
+        .query_typed(
+            "select c.relname::text
+             from pg_class c join pg_namespace n on n.oid = c.relnamespace
+             where n.nspname = 'gnomon' and c.relkind in ('r', 'p')
+               and exists (select from pg_attribute a
+                           where a.attrelid = c.oid and a.attname = 'tenant_id'
+                             and not a.attisdropped)
+             order by 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+#[tokio::test]
+async fn in_multi_tenant_mode_claims_that_bind_no_tenant_reach_no_row_of_the_former_default_tenant()
+{
+    let db = TestDb::migrated().await;
+    db.grant_kind_registration("authenticated").await;
+    let first = db.default_tenant().await.0;
+    // A single-tenant deployment writes through the Store, naming no Tenant.
+    let store = Store::connect_no_tls(&db.login_url()).await.unwrap();
+    let single = store.as_worker(None, Scope::new("support"));
+    let episode = single
+        .record_episode(&NewEpisode {
+            tenant: None,
+            scope: Scope::new("support"),
+            content: "the default Tenant's".into(),
+            reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            authority: None,
+        })
+        .await
+        .unwrap();
+    single
+        .create_node(
+            &gnomon::NewNode {
+                tenant: None,
+                scope: Scope::new("support"),
+                kind: gnomon::ROOT_NODE_KIND.into(),
+            },
+            &gnomon::Patch::new(
+                episode,
+                gnomon::ValidTime::UNKNOWN,
+                serde_json::from_value(json!({ "name": "Ada" })).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    let no_tenant =
+        json!({ "role": "authenticated", "app_metadata": { "scopes": ["support"] } }).to_string();
+
+    // Before the switch, such claims act in the default Tenant.
+    let mut client = db.login().await;
+    let tables = tenant_tables(&client).await;
+    {
+        let tx = as_caller(&mut client, USER, &no_tenant).await;
+        let tenant: Option<Uuid> = tx
+            .query_typed("select gnomon.tenant_id()", &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(tenant, Some(first));
+        let n: i64 = tx
+            .query_typed("select count(*) from gnomon.node", &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(n, 1);
+    }
+
+    db.switch_to_multi_tenant().await;
+
+    let tx = as_caller(&mut client, USER, &no_tenant).await;
+    let tenant: Option<Uuid> = tx
+        .query_typed("select gnomon.tenant_id()", &[])
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(
+        tenant, None,
+        "multi-tenant mode fell back to the default Tenant"
+    );
+    for t in &tables {
+        let n: i64 = tx
+            .query_typed(&format!("select count(*) from gnomon.{t}"), &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(n, 0, "claims with no Tenant see {n} rows of gnomon.{t}");
+    }
+    let read = visible_ids(
+        &tx,
+        "select id from gnomon.read_episode($1, $2)",
+        &[(&first, Type::UUID), (&episode.0, Type::UUID)],
+    )
+    .await;
+    assert!(read.is_empty(), "read_episode returned {read:?}");
+    tx.rollback().await.unwrap();
+
+    let tx = as_caller(&mut client, USER, &no_tenant).await;
+    assert_refused(
+        tx.query_typed(
+            "select gnomon.record_episode($1, 'support', 'into the first Tenant', now(), null)",
+            &[(&first, Type::UUID)],
+        )
+        .await,
+        "recording into the first Tenant with claims that bind no Tenant",
+    );
+}
+
+#[tokio::test]
+async fn in_single_tenant_mode_claims_that_bind_no_tenant_reach_only_the_default_tenant() {
+    let w = world().await;
+    let no_tenant =
+        json!({ "role": "authenticated", "app_metadata": { "scopes": ["support", "billing"] } })
+            .to_string();
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, USER, &no_tenant).await;
+    let ids = visible_ids(&tx, "select id from gnomon.episode", &[]).await;
+    assert!(ids.is_empty(), "the default Tenant saw {ids:?}");
+    let read = visible_ids(
+        &tx,
+        "select id from gnomon.read_episode($1, $2)",
+        &[(&w.t1, Type::UUID), (&w.t1_support, Type::UUID)],
+    )
+    .await;
+    assert!(read.is_empty(), "read_episode returned {read:?}");
+    assert_refused(
+        tx.query_typed(
+            "select gnomon.record_episode($1, 'support', 'into t1', now(), null)",
+            &[(&w.t1, Type::UUID)],
+        )
+        .await,
+        "recording into another Tenant with claims that bind no Tenant",
+    );
 }

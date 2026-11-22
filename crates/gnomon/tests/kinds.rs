@@ -27,7 +27,7 @@ async fn store(db: &TestDb) -> Store {
 
 fn node_kind(tenant: TenantId, name: &str, properties: Value) -> NewKind {
     NewKind {
-        tenant,
+        tenant: Some(tenant),
         name: name.to_owned(),
         of: KindOf::Node,
         parent: None,
@@ -38,7 +38,7 @@ fn node_kind(tenant: TenantId, name: &str, properties: Value) -> NewKind {
 
 fn edge_kind(tenant: TenantId, name: &str, source: &[&str], target: &[&str]) -> NewKind {
     NewKind {
-        tenant,
+        tenant: Some(tenant),
         name: name.to_owned(),
         of: KindOf::Edge {
             source: strings(source),
@@ -112,9 +112,13 @@ async fn a_caller_reads_no_kind_of_another_tenant_not_even_a_root_kind() {
     let store = store(&db).await;
     let (mine, theirs) = (tenant(), tenant());
     let caller = store.as_user(claims(mine, &["support"]));
-    assert_eq!(
-        caller.read_kind(theirs, ROOT_NODE_KIND).await.unwrap(),
-        None
+    // Naming another Tenant is refused outright (ADR-0005).
+    assert!(
+        matches!(
+            caller.read_kind(theirs, ROOT_NODE_KIND).await,
+            Err(Error::TenantMismatch(_))
+        ),
+        "a caller named another Tenant's Ontology"
     );
     assert_eq!(caller.read_kind(mine, "no_such_kind").await.unwrap(), None);
 }
@@ -1102,7 +1106,10 @@ async fn each_tenant_has_its_own_ontology_which_every_scope_of_the_tenant_shares
     );
 
     let other = store.as_user(claims(b, &["support"]));
-    assert_eq!(other.read_kind(a, "person").await.unwrap(), None);
+    assert!(matches!(
+        other.read_kind(a, "person").await,
+        Err(Error::TenantMismatch(_))
+    ));
     assert_eq!(other.read_kind(b, "person").await.unwrap(), None);
     let theirs = other
         .register_kind(&node_kind(
@@ -1144,12 +1151,11 @@ async fn a_caller_with_the_grant_registers_only_in_its_own_tenant() {
         .register_kind(&node_kind(theirs, "person", json!({})))
         .await
     {
-        Err(e) => assert_eq!(
-            e.sqlstate(),
-            Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
-            "{e:?}"
+        Err(Error::TenantMismatch(m)) => assert_eq!(
+            m,
+            format!("the call names Tenant {theirs}, but the caller's claims bind Tenant {mine}")
         ),
-        Ok(k) => panic!("registered into another Tenant: {k:?}"),
+        other => panic!("registered into another Tenant: {other:?}"),
     }
 }
 

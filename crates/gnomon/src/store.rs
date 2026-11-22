@@ -6,13 +6,16 @@
 //! ```sql
 //! begin;
 //! set local role <authenticated | gnomon_worker>;
-//! select set_config('request.jwt.claims', $1, true);
+//! <set request.jwt.claims locally, then gnomon.call_tenant(<the Tenant or null>)>;
 //! <the call>;
 //! commit;
 //! ```
 //!
 //! so a pooled server connection never carries one caller's role or claims
-//! into another caller's call. Every parameterized statement goes through
+//! into another caller's call. `gnomon.call_tenant` checks the call's Tenant
+//! against the claims, or picks the default Tenant for a call that names
+//! none in single-tenant mode, and the call goes on with the Tenant it
+//! returns (ADR-0005). Every parameterized statement goes through
 //! `query_typed`, which sends the unnamed statement, because named statements
 //! fail on transaction-mode poolers at their default settings (the
 //! `prototype/pooler-prepared-statements` branch, ADR-0001).
@@ -104,14 +107,23 @@ impl Store {
     }
 
     /// Acts as a worker for one Tenant and Scope, under a role that cannot
-    /// bypass RLS.
-    pub fn as_worker(&self, tenant: TenantId, scope: Scope) -> Caller<'_> {
+    /// bypass RLS. A worker in a single-tenant deployment may pass `None`
+    /// for the default Tenant; its claims then bind no Tenant, and the
+    /// reference `gnomon.tenant_id()` returns the default one.
+    ///
+    /// The claims are
+    /// `{"role": "gnomon_worker", "app_metadata": {"tenant_id": <tenant>, "scopes": [<scope>]}}`,
+    /// without `"tenant_id"` for `None`. A deployment that replaces
+    /// `gnomon.tenant_id()` and `gnomon.allowed_scopes()` must resolve them.
+    pub fn as_worker(&self, tenant: impl Into<Option<TenantId>>, scope: Scope) -> Caller<'_> {
+        let mut app_metadata = Map::new();
+        if let Some(tenant) = tenant.into() {
+            app_metadata.insert("tenant_id".into(), Value::String(tenant.0.to_string()));
+        }
+        app_metadata.insert("scopes".into(), serde_json::json!([scope.as_str()]));
         let claims = serde_json::json!({
             "role": CallerRole::Worker.name(),
-            "app_metadata": {
-                "tenant_id": tenant.0.to_string(),
-                "scopes": [scope.as_str()],
-            },
+            "app_metadata": app_metadata,
         });
         Caller {
             store: self,
@@ -176,28 +188,43 @@ pub struct Caller<'s> {
 }
 
 impl Caller<'_> {
-    /// Opens the call's transaction and sets its role and claims locally.
-    async fn begin<'c>(&self, client: &'c mut Client) -> Result<Transaction<'c>, Error> {
+    /// Opens the call's transaction, sets its role and claims locally, and
+    /// returns the call's Tenant as `gnomon.call_tenant` checked it.
+    ///
+    /// The claims and the check share one statement, so a call costs no
+    /// more round trips than it did before tenancy modes. The materialized
+    /// CTE sets the claims before the outer select reads them.
+    async fn begin<'c>(
+        &self,
+        client: &'c mut Client,
+        tenant: Option<TenantId>,
+    ) -> Result<(Transaction<'c>, TenantId), Error> {
         let tx = client.transaction().await?;
         tx.batch_execute(&format!("set local role {}", self.role.name()))
             .await?;
-        tx.query_typed(
-            "select set_config('request.jwt.claims', $1, true)",
-            &[(&self.claims, Type::TEXT)],
-        )
-        .await?;
-        Ok(tx)
+        let rows = tx
+            .query_typed(
+                "with claims as materialized (select set_config('request.jwt.claims', $1, true)) \
+                 select gnomon.call_tenant($2) from claims",
+                &[
+                    (&self.claims, Type::TEXT),
+                    (&tenant.map(|t| t.0), Type::UUID),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        Ok((tx, TenantId(rows[0].get(0))))
     }
 
     /// Records an Episode and returns its new ID, a UUID v7.
     pub async fn record_episode(&self, episode: &NewEpisode) -> Result<EpisodeId, Error> {
         let mut client = self.store.client.lock().await;
-        let tx = self.begin(&mut client).await?;
+        let (tx, tenant) = self.begin(&mut client, episode.tenant).await?;
         let rows = tx
             .query_typed(
                 "select gnomon.record_episode($1, $2, $3, $4, $5)",
                 &[
-                    (&episode.tenant.0, Type::UUID),
+                    (&tenant.0, Type::UUID),
                     (&episode.scope.as_str(), Type::TEXT),
                     (&episode.content, Type::TEXT),
                     (&episode.reference_time, Type::TIMESTAMPTZ),
@@ -212,11 +239,11 @@ impl Caller<'_> {
     /// Reads an Episode, or `None` if this caller cannot see it.
     pub async fn read_episode(
         &self,
-        tenant: TenantId,
+        tenant: impl Into<Option<TenantId>>,
         id: EpisodeId,
     ) -> Result<Option<Episode>, Error> {
         let mut client = self.store.client.lock().await;
-        let tx = self.begin(&mut client).await?;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
         let rows = tx
             .query_typed(
                 "select tenant_id, scope, id, content, reference_time, authority, recorded_at
@@ -250,11 +277,11 @@ impl Caller<'_> {
         };
         let kind_of = kind.of.sql_name();
         let mut client = self.store.client.lock().await;
-        let tx = self.begin(&mut client).await?;
+        let (tx, tenant) = self.begin(&mut client, kind.tenant).await?;
         tx.query_typed(
             "select gnomon.register_kind($1, $2, $3, $4, $5, $6, $7, $8)",
             &[
-                (&kind.tenant.0, Type::UUID),
+                (&tenant.0, Type::UUID),
                 (&kind.name, Type::TEXT),
                 (&kind_of, Type::TEXT),
                 (&kind.parent, Type::TEXT),
@@ -266,26 +293,31 @@ impl Caller<'_> {
         )
         .await
         .map_err(Error::from_store)?;
-        let registered = read_kind(&tx, kind.tenant, &kind.name).await?;
+        let registered = read_kind(&tx, tenant, &kind.name).await?;
         tx.commit().await?;
         Ok(registered.expect("a Kind just registered is visible to its registrant"))
     }
 
     /// Reads a Kind of the Tenant's Ontology, a root Kind included, or `None`
     /// if this caller's Tenant has no such Kind.
-    pub async fn read_kind(&self, tenant: TenantId, name: &str) -> Result<Option<Kind>, Error> {
+    pub async fn read_kind(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        name: &str,
+    ) -> Result<Option<Kind>, Error> {
         let mut client = self.store.client.lock().await;
-        let tx = self.begin(&mut client).await?;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
         let kind = read_kind(&tx, tenant, name).await?;
         tx.commit().await?;
         Ok(kind)
     }
 }
 
-/// One write of a batch: to a new Node, or to an existing one.
+/// One write of a batch: to a new Node, or to an existing one. Every write
+/// of a batch is in the batch's one Tenant.
 enum Target<'a> {
     New(&'a NewNode),
-    Existing(TenantId, NodeId),
+    Existing(NodeId),
 }
 
 impl Caller<'_> {
@@ -295,7 +327,9 @@ impl Caller<'_> {
         node: &NewNode,
         patch: &Patch,
     ) -> Result<(NodeId, WriteOutcome), Error> {
-        let mut done = self.run_writes(&[(Target::New(node), patch)]).await?;
+        let mut done = self
+            .run_writes(node.tenant, &[(Target::New(node), patch)])
+            .await?;
         Ok(done.remove(0))
     }
 
@@ -303,12 +337,12 @@ impl Caller<'_> {
     /// Episode, and recomputes the Node's Versions over its Valid time.
     pub async fn write_node(
         &self,
-        tenant: TenantId,
+        tenant: impl Into<Option<TenantId>>,
         node: NodeId,
         patch: &Patch,
     ) -> Result<WriteOutcome, Error> {
         let mut done = self
-            .run_writes(&[(Target::Existing(tenant, node), patch)])
+            .run_writes(tenant.into(), &[(Target::Existing(node), patch)])
             .await?;
         Ok(done.remove(0).1)
     }
@@ -318,15 +352,15 @@ impl Caller<'_> {
     /// the batch leaves no Version that no read could have seen (ADR-0008).
     pub async fn write_nodes(
         &self,
-        tenant: TenantId,
+        tenant: impl Into<Option<TenantId>>,
         writes: &[(NodeId, Patch)],
     ) -> Result<Vec<WriteOutcome>, Error> {
         let targets: Vec<_> = writes
             .iter()
-            .map(|(node, patch)| (Target::Existing(tenant, *node), patch))
+            .map(|(node, patch)| (Target::Existing(*node), patch))
             .collect();
         Ok(self
-            .run_writes(&targets)
+            .run_writes(tenant.into(), &targets)
             .await?
             .into_iter()
             .map(|(_, outcome)| outcome)
@@ -337,12 +371,13 @@ impl Caller<'_> {
     /// transaction when Postgres asks for a retry.
     async fn run_writes(
         &self,
+        tenant: Option<TenantId>,
         writes: &[(Target<'_>, &Patch)],
     ) -> Result<Vec<(NodeId, WriteOutcome)>, Error> {
         let mut client = self.store.client.lock().await;
         let mut attempt = 0;
         loop {
-            match self.try_writes(&mut client, writes).await {
+            match self.try_writes(&mut client, tenant, writes).await {
                 Err(e) if attempt < WRITE_RETRIES && is_retryable(&e) => attempt += 1,
                 done => return done,
             }
@@ -352,26 +387,27 @@ impl Caller<'_> {
     async fn try_writes(
         &self,
         client: &mut Client,
+        tenant: Option<TenantId>,
         writes: &[(Target<'_>, &Patch)],
     ) -> Result<Vec<(NodeId, WriteOutcome)>, Error> {
-        let tx = self.begin(client).await?;
+        let (tx, tenant) = self.begin(client, tenant).await?;
         let mut done = Vec::with_capacity(writes.len());
         for (target, patch) in writes {
-            let (tenant, node) = match target {
-                Target::Existing(tenant, node) => (*tenant, *node),
+            let node = match target {
+                Target::Existing(node) => *node,
                 Target::New(new) => {
                     let rows = tx
                         .query_typed(
                             "select gnomon.create_node($1, $2, $3)",
                             &[
-                                (&new.tenant.0, Type::UUID),
+                                (&tenant.0, Type::UUID),
                                 (&new.scope.as_str(), Type::TEXT),
                                 (&new.kind, Type::TEXT),
                             ],
                         )
                         .await
                         .map_err(Error::from_store)?;
-                    (new.tenant, NodeId(rows[0].get(0)))
+                    NodeId(rows[0].get(0))
                 }
             };
             done.push((node, write_patch(&tx, tenant, node, patch).await?));
@@ -385,12 +421,12 @@ impl Caller<'_> {
     /// Node.
     pub async fn read_node(
         &self,
-        tenant: TenantId,
+        tenant: impl Into<Option<TenantId>>,
         node: NodeId,
         as_of: AsOf,
     ) -> Result<Option<NodeVersion>, Error> {
         let mut client = self.store.client.lock().await;
-        let tx = self.begin(&mut client).await?;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
         let rows = tx
             .query_typed(
                 "select id, node_id, scope, kind, props,
@@ -432,11 +468,11 @@ impl Caller<'_> {
     /// with the property and the place they name.
     pub async fn list_citations(
         &self,
-        tenant: TenantId,
+        tenant: impl Into<Option<TenantId>>,
         version: VersionId,
     ) -> Result<Vec<Citation>, Error> {
         let mut client = self.store.client.lock().await;
-        let tx = self.begin(&mut client).await?;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
         let rows = tx
             .query_typed(
                 "select episode_id, property, place, recorded_at, episode_recorded_at

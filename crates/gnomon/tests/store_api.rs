@@ -109,7 +109,7 @@ use support::{tenant, user};
 
 fn episode(tenant: TenantId, scope: &str, content: &str) -> NewEpisode {
     NewEpisode {
-        tenant,
+        tenant: Some(tenant),
         scope: Scope::new(scope),
         content: content.to_owned(),
         reference_time: Utc.with_ymd_and_hms(2024, 3, 14, 9, 30, 0).unwrap(),
@@ -119,6 +119,15 @@ fn episode(tenant: TenantId, scope: &str, content: &str) -> NewEpisode {
 
 async fn store(db: &TestDb) -> Store {
     Store::connect_no_tls(&db.login_url()).await.unwrap()
+}
+
+/// A call that names a Tenant its claims do not bind fails before it
+/// reaches the Store function (ADR-0005).
+fn assert_mismatch<T: std::fmt::Debug>(result: Result<T, Error>) {
+    match result {
+        Err(Error::TenantMismatch(_)) => {}
+        other => panic!("expected a Tenant mismatch, got {other:?}"),
+    }
 }
 
 fn assert_denied(result: Result<EpisodeId, Error>) {
@@ -270,7 +279,7 @@ async fn an_end_user_cannot_read_an_episode_in_another_tenant() {
         .unwrap();
 
     let mallory = store.as_user(user(t2, &["support"]));
-    assert_eq!(mallory.read_episode(t1, id).await.unwrap(), None);
+    assert_mismatch(mallory.read_episode(t1, id).await);
     assert_eq!(mallory.read_episode(t2, id).await.unwrap(), None);
 }
 
@@ -296,7 +305,7 @@ async fn an_end_user_cannot_record_an_episode_into_another_tenant_or_scope() {
     let (t1, t2) = (tenant(), tenant());
     let alice = store.as_user(user(t1, &["support"]));
 
-    assert_denied(
+    assert_mismatch(
         alice
             .record_episode(&episode(t2, "support", "Into tenant two."))
             .await,
@@ -326,13 +335,13 @@ async fn a_worker_is_confined_to_its_tenant_and_scope() {
 
     let worker = store.as_worker(t1, Scope::new("ingest"));
     assert_eq!(worker.read_episode(t1, other_scope).await.unwrap(), None);
-    assert_eq!(worker.read_episode(t2, other_tenant).await.unwrap(), None);
+    assert_mismatch(worker.read_episode(t2, other_tenant).await);
     assert_denied(
         worker
             .record_episode(&episode(t1, "billing", "Wrong Scope."))
             .await,
     );
-    assert_denied(
+    assert_mismatch(
         worker
             .record_episode(&episode(t2, "ingest", "Wrong Tenant."))
             .await,
@@ -350,11 +359,24 @@ async fn a_caller_without_tenant_claims_sees_nothing_and_writes_nothing() {
         .await
         .unwrap();
 
+    // With no claims the caller acts in the default Tenant, so naming
+    // another Tenant fails, and the default Tenant holds nothing of t's.
     let anonymous = store.as_user(Map::new());
-    assert_eq!(anonymous.read_episode(t, id).await.unwrap(), None);
-    assert_denied(
+    assert_mismatch(anonymous.read_episode(t, id).await);
+    assert_eq!(anonymous.read_episode(None, id).await.unwrap(), None);
+    assert_mismatch(
         anonymous
             .record_episode(&episode(t, "support", "No claims."))
+            .await,
+    );
+    // Its Scope set is empty, so it writes nothing in the default Tenant
+    // either.
+    assert_denied(
+        anonymous
+            .record_episode(&NewEpisode {
+                tenant: None,
+                ..episode(t, "support", "No Scope.")
+            })
             .await,
     );
 }
@@ -372,26 +394,24 @@ async fn no_call_carries_its_claims_into_the_next_call_on_the_same_connection() 
             .record_episode(&episode(t1, "support", &format!("round {round}")))
             .await
             .unwrap();
-        assert_eq!(
+        // Had t1's claims carried over, each of these would succeed.
+        assert_mismatch(
             store
                 .as_user(user(t2, &["support"]))
                 .read_episode(t1, id)
-                .await
-                .unwrap(),
-            None
+                .await,
         );
-        assert_eq!(
-            store
-                .as_user(Map::new())
-                .read_episode(t1, id)
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
+        assert_mismatch(store.as_user(Map::new()).read_episode(t1, id).await);
+        assert_mismatch(
             store
                 .as_worker(t2, Scope::new("support"))
                 .read_episode(t1, id)
+                .await,
+        );
+        assert_eq!(
+            store
+                .as_user(user(t2, &["support"]))
+                .read_episode(t2, id)
                 .await
                 .unwrap(),
             None
@@ -511,7 +531,9 @@ async fn every_call_sends_only_unnamed_statements_inside_one_transaction_that_se
     for (tx, role) in txs[1..].iter().zip(expected_roles) {
         assert_eq!(tx[0], format!("set local role {role}"), "{tx:#?}");
         assert_eq!(
-            tx[1], "select set_config('request.jwt.claims', $1, true)",
+            tx[1],
+            "with claims as materialized (select set_config('request.jwt.claims', $1, true)) \
+             select gnomon.call_tenant($2) from claims",
             "{tx:#?}"
         );
         assert_eq!(tx.len(), 3, "each call is one Store function call: {tx:#?}");

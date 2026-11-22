@@ -96,7 +96,8 @@ impl ValidTime {
 /// A Node to create: a stable identity of a Kind, in one Scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewNode {
-    pub tenant: TenantId,
+    /// `None` names no Tenant: the default Tenant in single-tenant mode.
+    pub tenant: Option<TenantId>,
     pub scope: Scope,
     /// The root Kind [`ROOT_NODE_KIND`](crate::ROOT_NODE_KIND) or a Node Kind
     /// the Tenant registered.

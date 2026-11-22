@@ -9,7 +9,8 @@ The suite runs with plain `cargo test` or with `cargo nextest run`, and every te
 - `crates/gnomon/tests/kinds.rs` is seam 1 for Kind registration: registering and reading Kinds, and evaluating their compiled rules with `jsonb_path_match`.
 - `crates/gnomon/tests/nodes.rs` is seam 1 for Nodes: writing a patch of property values citing an Episode, the merge order, same-transaction replacement, As-of reads and Citations. It ends with a smoke check that prints the p50 of a bounded patch on a Node with 100 Contributions and asserts a loose bound. The performance suite proper is a later ticket.
 - `crates/gnomon/tests/node_oracle.rs` is the oracle test (ADR-0020). An oracle picks each property's winner straight from the Contributions, and `proptest` compares it with As-of reads after random sequences of writes, some batched in one transaction. A failing sequence shrinks to a short one.
-- `crates/gnomon/tests/sql_boundary.rs` is seam 2: adversarial tests that connect as a caller role with claims set, bypassing the Rust core. For Versions they show that a caller cannot delete committed history, rewrite a closed Recorded time, choose a Recorded time, or forge the mark that lets a transaction delete the rows it wrote.
+- `crates/gnomon/tests/tenancy.rs` is seam 1 for tenancy modes (ADR-0005): calls that name no Tenant in single-tenant and multi-tenant mode, a Tenant that differs from the claims, the switch to multi-tenant mode keeping every row of every table readable under the former default Tenant, and the refused switch back.
+- `crates/gnomon/tests/sql_boundary.rs` is seam 2: adversarial tests that connect as a caller role with claims set, bypassing the Rust core. For Versions they show that a caller cannot delete committed history, rewrite a closed Recorded time, choose a Recorded time, or forge the mark that lets a transaction delete the rows it wrote. For tenancy they show that no caller role can switch the mode or write the tenancy row, and that in multi-tenant mode claims that bind no Tenant reach no row of the former default Tenant.
 
 The database suites share the harness in `crates/gnomon/tests/support`. Each test gets a fresh database, created with `CREATE DATABASE ... TEMPLATE` from a template that holds the exported migrations. The harness builds that template once per server and migration set.
 
@@ -47,6 +48,8 @@ cargo nextest run
 The harness creates a login role, `gnomon_test_login`, and grants it `authenticated` and `gnomon_worker`. The Store connects as that role, as a deployment's own login role would.
 
 The migrations grant Kind registration to no role, because each deployment decides who may register Kinds (ADR-0009). A test that registers Kinds first calls `TestDb::grant_kind_registration(role)`, which grants EXECUTE on `gnomon.register_kind` in that test's database only. Every other test runs without the grant, as a fresh deployment does.
+
+The migrations install single-tenant mode, with a default Tenant. Most tests name a Tenant of their own, which single-tenant mode allows when the claims bind it. A test that needs multi-tenant mode calls `TestDb::switch_to_multi_tenant()`, which runs `gnomon.switch_to_multi_tenant()` as `TestDb::operator()`, the role that applied the migrations, as a deployment's operator would. `TestDb::default_tenant()` reads the default Tenant the same way.
 
 The migrations also create `gnomon_definer`, the NOLOGIN role that owns the definer functions. The role that applies them needs CREATEROLE, as `postgres` has on supabase/postgres.
 
