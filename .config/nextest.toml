@@ -1,0 +1,9 @@
+# cargo nextest runs each test in its own process. The database suites share
+# one Postgres server across those processes; see crates/gnomon/tests/support
+# and ADR-0020.
+
+[profile.default]
+# A test that waits on the shared server's lock, or on a container's first
+# start, can take a while; anything past this is a hang.
+slow-timeout = { period = "60s", terminate-after = 3 }
+fail-fast = false

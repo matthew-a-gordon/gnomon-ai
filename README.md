@@ -16,3 +16,7 @@ The name fits on both counts. A gnomon tells the time by the shadow it casts, an
 ## Status
 
 Early design. The data model, packaging and client languages are still being decided, and there is nothing to install yet.
+
+## Development
+
+`docs/testing.md` explains how to run the test suites. They need Docker and start their own Postgres containers.
