@@ -22,4 +22,11 @@ Every property value an Episode states is stored as a Contribution: the Episode,
 - Erasing the Episode behind a Retraction makes the retracted fact current again.
 - A Node left with no Versions stays as a bare identity while any Edge joins it, and is erased with its last Edge.
 - A no-op write creates no Version but adds the new Episode's Citation, so a repeated statement corroborates the Version it matches.
-- Write and Erasure cost under recompute is unmeasured. A prototype measures both before the schema is fixed.
+- A write and an Erasure serialise on each Node with a per-Node advisory lock (`pg_advisory_xact_lock`). Without it, a write could compute a Version from Contributions that an Erasure is about to delete, and that Version would carry the erased value. Both paths take the lock. An Erasure takes the locks of every Node it touches up front, in a fixed order, so two Erasures cannot deadlock. A write to an affected Node waits until the Erasure commits. Reads never wait.
+- Recompute cost was measured in the `prototype/recompute-cost` branch (`FINDINGS.md`), on 24,620 Nodes and 1.9 million Version rows, as a non-owner role under RLS. The data were synthetic and the numbers come from a scratch server with fsync off.
+  - A patch write to a Node with 10, 100 or 500 Contributions took about 1, 3 and 10 ms at p50. Its p95 was about 2.5, 6 and 30 ms. Ranked merge added no measurable cost.
+  - A write with an open-ended Valid time recomputes from its start to the end of time. At 500 Contributions it took 200 to 270 ms at p50 and about 540 ms at p95. Bounding such writes is an open design choice.
+  - Erasure of one Episode cited by 2,086 Versions across 500 Nodes took 24 to 35 seconds in one transaction, and it matched an oracle on every as-of read checked. Cost grows with each affected Node's history, at about 2 ms per replay step.
+  - Truncate-and-replay rewrote about 22 times more Version rows than changed. Replaying only from the earliest recorded time the erased Episode touched cut the time by 6% when the Episode was early in the history, 31% in the middle and 73% when it was late.
+  - As-of reads were unaffected during an Erasure (p50 about 4 ms against 5 ms with 8 readers). After an Erasure they ran about 50% slower until vacuum and about 20% slower afterwards, so an Erasure is followed by a vacuum.
+  - The 500 advisory locks of one Erasure needed `max_locks_per_transaction` raised to 1024. A larger Erasure needs a larger lock table or a different lock design.
