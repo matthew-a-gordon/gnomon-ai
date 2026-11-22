@@ -1179,8 +1179,11 @@ async fn empty_intervals_are_refused_by_the_tables_as_well_as_the_write() {
     let attempts = [
         (
             "insert into gnomon.contribution (tenant_id, scope, node_id, episode_id, property, value,
-               valid_from, valid_from_precision, valid_to, valid_to_precision)
-             values ($1, 'support', $2, $3, 'name', '\"x\"', '2030-01-01', 'instant', '2030-01-01', 'instant')",
+               valid_from, valid_from_precision, valid_to, valid_to_precision,
+               episode_reference_time, episode_recorded_at)
+             select $1, 'support', $2, e.id, 'name', '\"x\"', '2030-01-01', 'instant', '2030-01-01',
+               'instant', e.reference_time, e.recorded_at
+             from gnomon.episode e where e.id = $3",
             "an empty Contribution",
         ),
         (

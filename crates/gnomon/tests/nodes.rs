@@ -1046,6 +1046,19 @@ async fn a_bounded_patch_on_a_node_with_100_contributions_stays_under_a_loose_p5
             times.push(t0.elapsed());
         }
     }
+    // The overhead of a call: an As-of read, four round trips and an index
+    // probe.
+    let mut reads = Vec::new();
+    for node in nodes.iter().cycle().take(50) {
+        let t0 = std::time::Instant::now();
+        w.read(*node, AsOf::current(days(100))).await;
+        reads.push(t0.elapsed());
+    }
+    reads.sort();
+    println!(
+        "As-of read of the same Nodes: p50 {:?}",
+        reads[reads.len() / 2]
+    );
     times.sort();
     let p50 = times[times.len() / 2];
     let p95 = times[times.len() * 95 / 100];

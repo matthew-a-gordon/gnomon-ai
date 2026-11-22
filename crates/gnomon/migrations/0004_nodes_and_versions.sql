@@ -51,9 +51,13 @@ create type gnomon.merge_rule as enum ('recency');
 -- the constructor functions of both, which are internal functions.
 create type gnomon.uuid_range as range (subtype = uuid);
 
--- An Episode is cited only from its own Scope, so later foreign keys name the
--- Scope with the Tenant and the ID.
-alter table gnomon.episode add constraint episode_tenant_scope_id unique (tenant_id, scope, id);
+-- An Episode is cited only from its own Scope, so the foreign keys to it name
+-- the Scope with the Tenant and the ID. They also name its Reference time
+-- and Recorded time, which Contributions and Citations carry so that the
+-- merge and its Citations read no Episode: the foreign key checks each copy,
+-- and Episodes never change.
+alter table gnomon.episode add constraint episode_cited
+  unique (tenant_id, scope, id, reference_time, recorded_at);
 
 -- A Node: a stable identity of a Kind, in one Scope. What is known about it
 -- is held in its Versions.
@@ -90,17 +94,22 @@ create table gnomon.contribution (
   valid_to timestamptz not null,
   valid_to_precision gnomon.time_precision not null,
   recorded_at timestamptz not null default transaction_timestamp(),
+  -- The Episode's Reference time and Recorded time.
+  episode_reference_time timestamptz not null,
+  episode_recorded_at timestamptz not null,
   primary key (tenant_id, id),
   foreign key (tenant_id, scope, node_id) references gnomon.node (tenant_id, scope, id),
-  foreign key (tenant_id, scope, episode_id) references gnomon.episode (tenant_id, scope, id),
+  foreign key (tenant_id, scope, episode_id, episode_reference_time, episode_recorded_at)
+    references gnomon.episode (tenant_id, scope, id, reference_time, recorded_at),
   check (valid_from < valid_to),
   check ((valid_from = '-infinity') = (valid_from_precision = 'unknown')),
   check ((valid_to = 'infinity') = (valid_to_precision = 'unknown'))
 );
-create index contribution_node on gnomon.contribution (tenant_id, node_id, valid_from);
+-- Every index a read or a write scans leads with (tenant_id, scope), so the
+-- policy's conditions are index conditions, evaluated once per scan and not
+-- once per row (ADR-0005).
+create index contribution_node on gnomon.contribution (tenant_id, scope, node_id, valid_from);
 create index contribution_episode on gnomon.contribution (tenant_id, episode_id);
--- Serves the policy's (tenant_id, scope) conditions (ADR-0005).
-create index contribution_tenant_scope on gnomon.contribution (tenant_id, scope, node_id);
 
 -- A Version: one state of a Node, its values over a Valid time, held as the
 -- current belief over a Recorded time.
@@ -143,11 +152,10 @@ create table gnomon.version (
 );
 -- As-of reads: the Node, then the four time columns (ADR-0004).
 create index version_as_of on gnomon.version
-  (tenant_id, node_id, valid_from, recorded_from) include (valid_to, recorded_to);
+  (tenant_id, scope, node_id, valid_from, recorded_from) include (valid_to, recorded_to);
 -- The write path reads only the open Versions.
-create index version_open on gnomon.version (tenant_id, node_id, valid_from)
+create index version_open on gnomon.version (tenant_id, scope, node_id, valid_from)
   where recorded_to = 'infinity';
-create index version_tenant_scope on gnomon.version (tenant_id, scope, node_id);
 
 -- A Citation: the link from a Version to an Episode it was derived from,
 -- naming the property and, if the write gave one, the place.
@@ -158,13 +166,15 @@ create table gnomon.citation (
   episode_id uuid not null,
   property text not null,
   place text,
-  -- When the Citation was recorded, the start of its write's transaction,
-  -- and the Episode's own Recorded time, which the insert trigger copies.
+  -- When the Citation was recorded, the start of its write's transaction.
   recorded_at timestamptz not null default transaction_timestamp(),
+  -- The Episode's Reference time and Recorded time.
+  episode_reference_time timestamptz not null,
   episode_recorded_at timestamptz not null,
   written_in xid8 not null default pg_current_xact_id(),
   foreign key (tenant_id, scope, version_id) references gnomon.version (tenant_id, scope, id),
-  foreign key (tenant_id, scope, episode_id) references gnomon.episode (tenant_id, scope, id),
+  foreign key (tenant_id, scope, episode_id, episode_reference_time, episode_recorded_at)
+    references gnomon.episode (tenant_id, scope, id, reference_time, recorded_at),
   constraint citation_once unique nulls not distinct
     (tenant_id, version_id, episode_id, property, place)
 );
@@ -289,7 +299,8 @@ create function gnomon.contribution_check_insert() returns trigger
     if found then
       perform gnomon.check_node_value(new.tenant_id, v_kind, new.property, new.value);
     end if;
-    -- A Node the caller cannot see fails the foreign key or the policy.
+    -- A Node or Episode the caller cannot see fails a foreign key or the
+    -- policy.
     return new;
   end
   $$;
@@ -415,8 +426,8 @@ create trigger citation_guard_delete before delete on gnomon.citation
   for each row execute function gnomon.guard_delete('Citation');
 
 -- A Citation is added only to a current Version, so closed history keeps
--- the Citations it had. It is recorded when its write's transaction
--- started, and carries its Episode's Recorded time, copied here.
+-- the Citations it had, and it is recorded when its write's transaction
+-- started.
 create function gnomon.citation_check_insert() returns trigger
   language plpgsql security invoker set search_path = ''
   as $$
@@ -435,9 +446,6 @@ create function gnomon.citation_check_insert() returns trigger
       raise exception using errcode = 'insufficient_privilege',
         message = 'a Citation may be added only to a current Version';
     end if;
-    select e.recorded_at into new.episode_recorded_at
-      from gnomon.episode e
-      where e.tenant_id = new.tenant_id and e.scope = new.scope and e.id = new.episode_id;
     return new;
   end
   $$;
@@ -453,17 +461,11 @@ create function gnomon.node_lock_key(p_tenant_id uuid, p_node_id uuid)
 
 -- Opens a write to a Node: checks the Tenant against the caller's, takes
 -- the Node's lock, and returns the Node's Scope and Kind.
---
--- A transaction that started before another wrote this Node, but took the
--- lock after that one committed, would record a Version earlier than one
--- already recorded. It fails with a serialization failure, and the caller
--- retries the transaction. Each statement of a READ COMMITTED transaction,
--- as the Store runs, sees what committed before the lock was granted.
 create function gnomon.lock_node_for_write(
   p_tenant_id uuid,
   p_node_id uuid,
-  out scope text,
-  out kind text
+  out node_scope text,
+  out node_kind text
 )
   language plpgsql volatile security invoker set search_path = ''
   as $$
@@ -473,23 +475,11 @@ create function gnomon.lock_node_for_write(
         message = 'a write may write only in the caller''s own Tenant';
     end if;
     perform pg_catalog.pg_advisory_xact_lock(gnomon.node_lock_key(p_tenant_id, p_node_id));
-    select n.scope, n.kind into scope, kind
+    select n.scope, n.kind into node_scope, node_kind
       from gnomon.node n where n.tenant_id = p_tenant_id and n.id = p_node_id;
     if not found then
       raise exception using errcode = 'GNW01',
         message = format('Node %s is not visible to the caller', p_node_id);
-    end if;
-    if exists (
-      select from gnomon.contribution c
-      where c.tenant_id = p_tenant_id and c.node_id = p_node_id
-        and c.recorded_at > transaction_timestamp()
-    ) or exists (
-      select from gnomon.version x
-      where x.tenant_id = p_tenant_id and x.node_id = p_node_id
-        and x.recorded_from = transaction_timestamp() and x.written_in <> pg_current_xact_id()
-    ) then
-      raise exception using errcode = 'serialization_failure',
-        message = format('a later transaction wrote Node %s first; retry the write', p_node_id);
     end if;
   end
   $$;
@@ -514,7 +504,9 @@ create function gnomon.lock_node_for_write(
 --   5. Each new Version that a Version this transaction closed matches is
 --      reopened, and every other is inserted.
 --   6. Every Contribution that overlaps a new Version and states the value
---      it holds is cited from it, once.
+--      it holds is cited from it, once. A Version the step keeps already
+--      cites every earlier Contribution that supports it, so it gains only
+--      the Citations of this transaction's Contributions.
 --
 -- Returns whether any Version changed, and the IDs of the Versions the step
 -- opened.
@@ -537,12 +529,31 @@ create function gnomon.recompute_node(
     candidates jsonb;
     stale uuid[];
   begin
-    select l.scope into v_scope from gnomon.lock_node_for_write(p_tenant_id, p_node_id) l;
+    select l.node_scope into v_scope from gnomon.lock_node_for_write(p_tenant_id, p_node_id) l;
+
+    -- A transaction that started before another wrote this Node, but took
+    -- the lock after that one committed, would record a Version earlier
+    -- than one already recorded. It fails with a serialization failure, and
+    -- the caller retries the transaction. Each statement of a READ
+    -- COMMITTED transaction, as the Store runs, sees what committed before
+    -- the lock was granted.
+    if exists (
+      select from gnomon.contribution c
+      where c.tenant_id = p_tenant_id and c.scope = v_scope and c.node_id = p_node_id
+        and c.recorded_at > t
+    ) or exists (
+      select from gnomon.version x
+      where x.tenant_id = p_tenant_id and x.scope = v_scope and x.node_id = p_node_id
+        and x.recorded_from = t and x.written_in <> me
+    ) then
+      raise exception using errcode = 'serialization_failure',
+        message = format('a later transaction wrote Node %s first; retry the write', p_node_id);
+    end if;
 
     -- 1. The window.
     select least(p_from, min(v.valid_from)), greatest(p_to, max(v.valid_to)) into w0, w1
       from gnomon.version v
-      where v.tenant_id = p_tenant_id and v.node_id = p_node_id
+      where v.tenant_id = p_tenant_id and v.scope = v_scope and v.node_id = p_node_id
         and v.recorded_to = 'infinity'
         and v.valid_from <= p_to and v.valid_to >= p_from;
 
@@ -550,11 +561,10 @@ create function gnomon.recompute_node(
     with contributions as (
       select c.id, c.episode_id, c.property, c.value, c.place,
              greatest(c.valid_from, w0) as vf, least(c.valid_to, w1) as vt,
-             e.reference_time as ref, c.recorded_at as rec
+             c.episode_reference_time as ref, c.episode_recorded_at as episode_rec,
+             c.recorded_at as rec
       from gnomon.contribution c
-      join gnomon.episode e
-        on e.tenant_id = c.tenant_id and e.scope = c.scope and e.id = c.episode_id
-      where c.tenant_id = p_tenant_id and c.node_id = p_node_id
+      where c.tenant_id = p_tenant_id and c.scope = v_scope and c.node_id = p_node_id
         and c.valid_from < w1 and c.valid_to > w0
     ), bounds as (
       select vf as at from contributions
@@ -569,13 +579,15 @@ create function gnomon.recompute_node(
       where s.st is not null
       order by s.sf, c.property, c.ref desc, c.rec desc, c.id desc
     ), supporters as (
-      -- Every Contribution in a segment that states its winning value.
-      select w.sf, w.property, c.episode_id, c.place
+      -- Every Contribution in a segment that states its winning value, and
+      -- whether this transaction recorded it.
+      select w.sf, w.property, c.episode_id, c.place, c.ref, c.episode_rec,
+             bool_or(c.rec = t) as fresh
       from winners w
       join contributions c
         on c.property = w.property and c.value = w.value and c.vf <= w.sf and c.vt >= w.st
       where w.value <> 'null'::jsonb
-      group by w.sf, w.property, c.episode_id, c.place
+      group by w.sf, w.property, c.episode_id, c.place, c.ref, c.episode_rec
     ), segment_values as (
       select sf, max(st) as st,
              jsonb_object_agg(property, value) filter (where value <> 'null'::jsonb) as props
@@ -595,7 +607,8 @@ create function gnomon.recompute_node(
       from islands group by island
     ), island_citations as (
       select i.island,
-             jsonb_agg(distinct jsonb_build_array(s.property, s.episode_id, s.place)) as cites
+             jsonb_agg(distinct jsonb_build_array(
+               s.property, s.episode_id, s.place, s.fresh, s.ref, s.episode_rec)) as cites
       from islands i join supporters s on s.sf = i.sf
       group by i.island
     )
@@ -608,7 +621,7 @@ create function gnomon.recompute_node(
     -- 4. The stale Versions.
     select coalesce(array_agg(v.id), '{}') into stale
       from gnomon.version v
-      where v.tenant_id = p_tenant_id and v.node_id = p_node_id
+      where v.tenant_id = p_tenant_id and v.scope = v_scope and v.node_id = p_node_id
         and v.recorded_to = 'infinity'
         and v.valid_from >= w0 and v.valid_to <= w1
         and not exists (
@@ -628,7 +641,7 @@ create function gnomon.recompute_node(
     with reopened as (
       update gnomon.version v set recorded_to = 'infinity'
         from jsonb_to_recordset(candidates) cand(vf timestamptz, vt timestamptz, props jsonb)
-        where v.tenant_id = p_tenant_id and v.node_id = p_node_id
+        where v.tenant_id = p_tenant_id and v.scope = v_scope and v.node_id = p_node_id
           and v.closed_in = me and v.recorded_to = t
           and v.valid_from = cand.vf and v.valid_to = cand.vt and v.props = cand.props
         returning v.id
@@ -644,7 +657,7 @@ create function gnomon.recompute_node(
       from jsonb_to_recordset(candidates) cand(vf timestamptz, vt timestamptz, props jsonb)
       where not exists (
         select from gnomon.version v
-        where v.tenant_id = p_tenant_id and v.node_id = p_node_id
+        where v.tenant_id = p_tenant_id and v.scope = v_scope and v.node_id = p_node_id
           and v.valid_from = cand.vf and v.valid_to = cand.vt and v.props = cand.props
           and (v.recorded_to = 'infinity' or (v.closed_in = me and v.recorded_to = t))
       )
@@ -655,13 +668,18 @@ create function gnomon.recompute_node(
     changed := changed or cardinality(opened) > 0;
 
     -- 6. The Citations.
-    insert into gnomon.citation (tenant_id, scope, version_id, episode_id, property, place)
-      select p_tenant_id, v_scope, v.id, (cc ->> 1)::uuid, cc ->> 0, cc ->> 2
+    insert into gnomon.citation (
+      tenant_id, scope, version_id, episode_id, property, place,
+      episode_reference_time, episode_recorded_at
+    )
+      select p_tenant_id, v_scope, v.id, (cc ->> 1)::uuid, cc ->> 0, cc ->> 2,
+             (cc ->> 4)::timestamptz, (cc ->> 5)::timestamptz
       from jsonb_to_recordset(candidates) cand(vf timestamptz, vt timestamptz, cites jsonb)
       join gnomon.version v
-        on v.tenant_id = p_tenant_id and v.node_id = p_node_id and v.recorded_to = 'infinity'
+        on v.tenant_id = p_tenant_id and v.scope = v_scope and v.node_id = p_node_id and v.recorded_to = 'infinity'
        and v.valid_from = cand.vf and v.valid_to = cand.vt
       cross join lateral jsonb_array_elements(cand.cites) cc
+      where v.id = any(opened) or (cc ->> 3)::boolean
       on conflict do nothing;
   end
   $$;
@@ -709,6 +727,8 @@ create function gnomon.write_node(
     vf timestamptz := coalesce(p_valid_from, '-infinity');
     vt timestamptz := coalesce(p_valid_to, 'infinity');
     v_scope text;
+    v_reference_time timestamptz;
+    v_recorded_at timestamptz;
     step record;
   begin
     if p_episode_id is null then
@@ -738,11 +758,11 @@ create function gnomon.write_node(
         message = 'places are {property: place}, a string for a property the write states';
     end if;
 
-    select l.scope into v_scope from gnomon.lock_node_for_write(p_tenant_id, p_node_id) l;
-    if not exists (
-      select from gnomon.episode e
-      where e.tenant_id = p_tenant_id and e.scope = v_scope and e.id = p_episode_id
-    ) then
+    select l.node_scope into v_scope from gnomon.lock_node_for_write(p_tenant_id, p_node_id) l;
+    select e.reference_time, e.recorded_at into v_reference_time, v_recorded_at
+      from gnomon.episode e
+      where e.tenant_id = p_tenant_id and e.scope = v_scope and e.id = p_episode_id;
+    if not found then
       raise exception using errcode = 'GNW01',
         message = format('Episode %s is not visible in the Node''s Scope', p_episode_id);
     end if;
@@ -751,10 +771,12 @@ create function gnomon.write_node(
     -- host.
     insert into gnomon.contribution (
       tenant_id, scope, node_id, episode_id, property, value, place,
-      valid_from, valid_from_precision, valid_to, valid_to_precision
+      valid_from, valid_from_precision, valid_to, valid_to_precision,
+      episode_reference_time, episode_recorded_at
     )
     select p_tenant_id, v_scope, p_node_id, p_episode_id, e.key, e.value, p_places ->> e.key,
-           vf, gnomon.instant_or_unknown(vf), vt, gnomon.instant_or_unknown(vt)
+           vf, gnomon.instant_or_unknown(vf), vt, gnomon.instant_or_unknown(vt),
+           v_reference_time, v_recorded_at
     from jsonb_each(p_values) e
     order by e.key;
 
@@ -901,15 +923,18 @@ grant select on gnomon.node, gnomon.contribution, gnomon.version, gnomon.citatio
 grant insert (tenant_id, scope, id, kind) on gnomon.node to authenticated, gnomon_worker;
 grant insert (
   tenant_id, scope, node_id, episode_id, property, value, place,
-  valid_from, valid_from_precision, valid_to, valid_to_precision
+  valid_from, valid_from_precision, valid_to, valid_to_precision,
+  episode_reference_time, episode_recorded_at
 ) on gnomon.contribution to authenticated, gnomon_worker;
 grant insert (
   tenant_id, scope, id, node_id, props, valid_from, valid_from_precision,
   valid_to, valid_to_precision, merge_rule
 ) on gnomon.version to authenticated, gnomon_worker;
 grant update (recorded_to) on gnomon.version to authenticated, gnomon_worker;
-grant insert (tenant_id, scope, version_id, episode_id, property, place)
-  on gnomon.citation to authenticated, gnomon_worker;
+grant insert (
+  tenant_id, scope, version_id, episode_id, property, place,
+  episode_reference_time, episode_recorded_at
+) on gnomon.citation to authenticated, gnomon_worker;
 grant delete on gnomon.version, gnomon.citation to authenticated, gnomon_worker;
 
 -- Inserting a Version evaluates the exclusion constraint's index
