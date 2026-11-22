@@ -1,0 +1,86 @@
+[
+ {
+  "size": "50k",
+  "variant": "no As-of conditions (bit, rerank 200)",
+  "p50": 23.2,
+  "p95": 24.54,
+  "mean": 23.29,
+  "max": 26.9,
+  "n": 40
+ },
+ {
+  "size": "50k",
+  "variant": "As-of now, hash join",
+  "recall10": 0.992,
+  "results": 100.0,
+  "p50": 2388.27,
+  "p95": 2603.3,
+  "mean": 2133.7,
+  "max": 2681.73,
+  "n": 40
+ },
+ {
+  "size": "50k",
+  "variant": "As-of now, per-Version bit rows",
+  "recall10": 0.992,
+  "results": 100.0,
+  "p50": 33.93,
+  "p95": 35.34,
+  "mean": 34.03,
+  "max": 37.24,
+  "n": 40
+ },
+ {
+  "size": "50k",
+  "variant": "As-of past known-at, hash join",
+  "recall10": 1.0,
+  "results": 100.0,
+  "p50": 2335.44,
+  "p95": 2527.71,
+  "mean": 2076.39,
+  "max": 2546.65,
+  "n": 40
+ },
+ {
+  "size": "50k",
+  "variant": "As-of past known-at, per-Version bit rows",
+  "recall10": 1.0,
+  "results": 100.0,
+  "p50": 31.43,
+  "p95": 31.93,
+  "mean": 31.44,
+  "max": 32.29,
+  "n": 40
+ },
+ {
+  "size": "200k",
+  "variant": "no As-of conditions (bit, rerank 200)",
+  "p50": 76.94,
+  "p95": 78.74,
+  "mean": 77.01,
+  "max": 80.7,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "As-of now, per-Version bit rows",
+  "recall10": 0.975,
+  "results": 100.0,
+  "p50": 111.51,
+  "p95": 112.84,
+  "mean": 111.42,
+  "max": 113.19,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "As-of past known-at, per-Version bit rows",
+  "recall10": 0.992,
+  "results": 100.0,
+  "p50": 104.92,
+  "p95": 108.37,
+  "mean": 105.21,
+  "max": 108.86,
+  "n": 30
+ }
+]

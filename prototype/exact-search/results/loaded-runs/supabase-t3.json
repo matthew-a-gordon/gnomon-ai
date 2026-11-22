@@ -1,0 +1,60 @@
+[
+ {
+  "size": "50k",
+  "variant": "tsvector scan",
+  "p50": 57.96,
+  "p95": 61.72,
+  "mean": 58.27,
+  "max": 62.04,
+  "n": 40
+ },
+ {
+  "size": "50k",
+  "variant": "token table BM25",
+  "top10_overlap_with_scan": 0.84,
+  "p50": 3.28,
+  "p95": 4.3,
+  "mean": 3.58,
+  "max": 15.18,
+  "n": 40
+ },
+ {
+  "size": "50k",
+  "variant": "token table BM25, As-of on top 4x only",
+  "top10_overlap_with_exact_asof": 1.0,
+  "p50": 3.14,
+  "p95": 3.43,
+  "mean": 3.14,
+  "max": 5.64,
+  "n": 40
+ },
+ {
+  "size": "200k",
+  "variant": "tsvector scan",
+  "p50": 264.23,
+  "p95": 276.02,
+  "mean": 264.2,
+  "max": 284.28,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "token table BM25",
+  "top10_overlap_with_scan": 0.8,
+  "p50": 4.78,
+  "p95": 5.98,
+  "mean": 4.76,
+  "max": 6.4,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "token table BM25, As-of on top 4x only",
+  "top10_overlap_with_exact_asof": 1.0,
+  "p50": 3.56,
+  "p95": 3.85,
+  "mean": 3.54,
+  "max": 3.97,
+  "n": 30
+ }
+]

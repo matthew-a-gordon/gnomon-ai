@@ -1,0 +1,260 @@
+{
+ "rels": [
+  {
+   "rel": "emb",
+   "kind": "r",
+   "size_mb": 14017.2,
+   "total_mb": 14137.2
+  },
+  {
+   "rel": "name_item",
+   "kind": "r",
+   "size_mb": 8420.8,
+   "total_mb": 8459.7
+  },
+  {
+   "rel": "emb_half",
+   "kind": "r",
+   "size_mb": 7008.6,
+   "total_mb": 7126.7
+  },
+  {
+   "rel": "tok",
+   "kind": "r",
+   "size_mb": 2865.0,
+   "total_mb": 5420.6
+  },
+  {
+   "rel": "tok_pkey",
+   "kind": "i",
+   "size_mb": 2554.8,
+   "total_mb": 2554.8
+  },
+  {
+   "rel": "ver",
+   "kind": "r",
+   "size_mb": 1186.1,
+   "total_mb": 1907.5
+  },
+  {
+   "rel": "vbit_cov",
+   "kind": "i",
+   "size_mb": 799.8,
+   "total_mb": 799.8
+  },
+  {
+   "rel": "vbit",
+   "kind": "r",
+   "size_mb": 729.5,
+   "total_mb": 1529.5
+  },
+  {
+   "rel": "emb_bit_cov",
+   "kind": "i",
+   "size_mb": 506.0,
+   "total_mb": 506.0
+  },
+  {
+   "rel": "emb_bit",
+   "kind": "r",
+   "size_mb": 483.4,
+   "total_mb": 1105.6
+  },
+  {
+   "rel": "name_bit",
+   "kind": "r",
+   "size_mb": 290.4,
+   "total_mb": 327.1
+  },
+  {
+   "rel": "citation2",
+   "kind": "r",
+   "size_mb": 289.0,
+   "total_mb": 521.1
+  },
+  {
+   "rel": "ver_hash",
+   "kind": "i",
+   "size_mb": 275.0,
+   "total_mb": 275.0
+  },
+  {
+   "rel": "ver_ent",
+   "kind": "i",
+   "size_mb": 262.6,
+   "total_mb": 262.6
+  },
+  {
+   "rel": "citation",
+   "kind": "r",
+   "size_mb": 262.1,
+   "total_mb": 494.2
+  },
+  {
+   "rel": "adj",
+   "kind": "r",
+   "size_mb": 260.5,
+   "total_mb": 512.6
+  },
+  {
+   "rel": "adj_node",
+   "kind": "i",
+   "size_mb": 252.0,
+   "total_mb": 252.0
+  },
+  {
+   "rel": "cit2_ent",
+   "kind": "i",
+   "size_mb": 232.0,
+   "total_mb": 232.0
+  },
+  {
+   "rel": "cit_ent",
+   "kind": "i",
+   "size_mb": 232.0,
+   "total_mb": 232.0
+  },
+  {
+   "rel": "tok_df",
+   "kind": "r",
+   "size_mb": 221.1,
+   "total_mb": 364.2
+  },
+  {
+   "rel": "tok_df_pkey",
+   "kind": "i",
+   "size_mb": 143.0,
+   "total_mb": 143.0
+  },
+  {
+   "rel": "ver_scan",
+   "kind": "i",
+   "size_mb": 132.9,
+   "total_mb": 132.9
+  },
+  {
+   "rel": "emb_pkey",
+   "kind": "i",
+   "size_mb": 116.1,
+   "total_mb": 116.1
+  },
+  {
+   "rel": "emb_bit_pkey",
+   "kind": "i",
+   "size_mb": 116.1,
+   "total_mb": 116.1
+  },
+  {
+   "rel": "emb_half_pkey",
+   "kind": "i",
+   "size_mb": 116.1,
+   "total_mb": 116.1
+  },
+  {
+   "rel": "roll_ment",
+   "kind": "r",
+   "size_mb": 87.5,
+   "total_mb": 154.9
+  },
+  {
+   "rel": "roll_ment_pkey",
+   "kind": "i",
+   "size_mb": 67.4,
+   "total_mb": 67.4
+  },
+  {
+   "rel": "ver_pkey",
+   "kind": "i",
+   "size_mb": 50.5,
+   "total_mb": 50.5
+  },
+  {
+   "rel": "episode",
+   "kind": "r",
+   "size_mb": 29.6,
+   "total_mb": 52.1
+  },
+  {
+   "rel": "roll_now",
+   "kind": "r",
+   "size_mb": 29.5,
+   "total_mb": 52.2
+  },
+  {
+   "rel": "name_bit_pkey",
+   "kind": "i",
+   "size_mb": 23.1,
+   "total_mb": 23.1
+  },
+  {
+   "rel": "name_item_pkey",
+   "kind": "i",
+   "size_mb": 23.1,
+   "total_mb": 23.1
+  },
+  {
+   "rel": "roll_now_pkey",
+   "kind": "i",
+   "size_mb": 22.6,
+   "total_mb": 22.6
+  },
+  {
+   "rel": "episode_pkey",
+   "kind": "i",
+   "size_mb": 22.5,
+   "total_mb": 22.5
+  },
+  {
+   "rel": "name_bit_all",
+   "kind": "i",
+   "size_mb": 7.5,
+   "total_mb": 7.5
+  },
+  {
+   "rel": "name_item_all",
+   "kind": "i",
+   "size_mb": 7.5,
+   "total_mb": 7.5
+  },
+  {
+   "rel": "name_item_cur",
+   "kind": "i",
+   "size_mb": 6.0,
+   "total_mb": 6.0
+  },
+  {
+   "rel": "name_bit_cur",
+   "kind": "i",
+   "size_mb": 6.0,
+   "total_mb": 6.0
+  },
+  {
+   "rel": "tenant_stats",
+   "kind": "r",
+   "size_mb": 1.3,
+   "total_mb": 1.4
+  },
+  {
+   "rel": "tenant_stats_pkey",
+   "kind": "i",
+   "size_mb": 0.0,
+   "total_mb": 0.0
+  }
+ ],
+ "counts": {
+  "emb": 1794190,
+  "emb_half": 1794190,
+  "emb_bit": 1794190,
+  "ver": 2332988,
+  "tok": 38033689,
+  "tok_df": 3435414,
+  "episode": 398521,
+  "citation": 3585648,
+  "name_item": 1077812,
+  "name_bit": 1077812
+ },
+ "ver": [
+  "PostgreSQL 17.11 (Debian 17.11-1.pgdg12+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "0.8.6"
+ ]
+}

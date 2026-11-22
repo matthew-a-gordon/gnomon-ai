@@ -1,0 +1,97 @@
+[
+ {
+  "policy": "any",
+  "visible": "1k",
+  "p50": 2.52,
+  "p95": 2.64,
+  "mean": 2.53,
+  "max": 2.67,
+  "n": 60,
+  "plan": [
+   "One-Time Filter: (gnomon.tenant_id() = $1)",
+   "Index Cond: ((tenant_id = $1) AND (scope = ANY (gnomon.allowed_scopes())))",
+   "One-Time Filter: (gnomon.tenant_id() = $1)",
+   "Index Cond: ((tenant_id = $1) AND (scope = c.scope) AND (scope = ANY (gnomon.allowed_scopes())) AND (text_hash = c.text_hash))"
+  ]
+ },
+ {
+  "policy": "any",
+  "visible": "200k",
+  "p50": 180.68,
+  "p95": 194.84,
+  "mean": 183.97,
+  "max": 197.54,
+  "n": 30,
+  "plan": [
+   "One-Time Filter: (gnomon.tenant_id() = $1)",
+   "Index Cond: ((tenant_id = $1) AND (scope = ANY (gnomon.allowed_scopes())))",
+   "One-Time Filter: (gnomon.tenant_id() = $1)",
+   "Index Cond: ((tenant_id = $1) AND (scope = ANY (gnomon.allowed_scopes())))"
+  ]
+ },
+ {
+  "policy": "func",
+  "visible": "1k",
+  "p50": 568.72,
+  "p95": 574.55,
+  "mean": 568.2,
+  "max": 582.12,
+  "n": 60,
+  "plan": [
+   "One-Time Filter: (gnomon.tenant_id() = $1)",
+   "Index Cond: (tenant_id = $1)",
+   "Filter: gnomon.scope_allowed(scope)",
+   "Rows Removed by Filter: 199000",
+   "One-Time Filter: (gnomon.tenant_id() = $1)",
+   "Index Cond: ((tenant_id = $1) AND (scope = c.scope) AND (text_hash = c.text_hash))",
+   "Filter: gnomon.scope_allowed(scope)"
+  ]
+ },
+ {
+  "policy": "func",
+  "visible": "200k",
+  "p50": 660.71,
+  "p95": 668.16,
+  "mean": 661.91,
+  "max": 683.6,
+  "n": 30,
+  "plan": [
+   "One-Time Filter: (gnomon.tenant_id() = $1)",
+   "Index Cond: (tenant_id = $1)",
+   "Filter: gnomon.scope_allowed(scope)",
+   "One-Time Filter: (gnomon.tenant_id() = $1)",
+   "Index Cond: ((tenant_id = $1) AND (scope = c.scope) AND (text_hash = c.text_hash))",
+   "Filter: gnomon.scope_allowed(scope)"
+  ]
+ },
+ {
+  "policy": "inline",
+  "visible": "1k",
+  "p50": 2.13,
+  "p95": 2.2,
+  "mean": 2.14,
+  "max": 2.23,
+  "n": 60,
+  "plan": [
+   "One-Time Filter: (gnomon.tenant_id() = $1)",
+   "Index Cond: ((tenant_id = $1) AND (scope = ANY (string_to_array(current_setting('gnomon.scopes'::text, true), ','::text))))",
+   "One-Time Filter: (gnomon.tenant_id() = $1)",
+   "Index Cond: ((tenant_id = $1) AND (scope = c.scope) AND (scope = ANY (string_to_array(current_setting('gnomon.scopes'::text, true), ','::text))) AND (text_hash = c.text_hash))"
+  ]
+ },
+ {
+  "policy": "inline",
+  "visible": "200k",
+  "p50": 180.55,
+  "p95": 191.81,
+  "mean": 182.24,
+  "max": 194.47,
+  "n": 30,
+  "plan": [
+   "One-Time Filter: (gnomon.tenant_id() = $1)",
+   "Index Cond: ((tenant_id = $1) AND (scope = ANY (string_to_array(current_setting('gnomon.scopes'::text, true), ','::text))))",
+   "One-Time Filter: (gnomon.tenant_id() = $1)",
+   "Index Cond: ((tenant_id = $1) AND (scope = ANY (string_to_array(current_setting('gnomon.scopes'::text, true), ','::text))))"
+  ]
+ }
+]

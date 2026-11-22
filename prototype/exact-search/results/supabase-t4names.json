@@ -1,0 +1,119 @@
+[
+ {
+  "size": "50k",
+  "variant": "names, current-only partial index, full vectors",
+  "recall10": 1.0,
+  "p50": 27.77,
+  "p95": 28.84,
+  "mean": 27.73,
+  "max": 29.05,
+  "n": 40
+ },
+ {
+  "size": "50k",
+  "variant": "names, current-only partial index, bit + rerank 100",
+  "recall10": 0.828,
+  "p50": 17.22,
+  "p95": 18.24,
+  "mean": 17.34,
+  "max": 19.63,
+  "n": 40
+ },
+ {
+  "size": "50k",
+  "variant": "names, current-only partial index, bit + rerank 200",
+  "recall10": 0.97,
+  "p50": 16.63,
+  "p95": 17.9,
+  "mean": 16.85,
+  "max": 18.43,
+  "n": 40
+ },
+ {
+  "size": "50k",
+  "variant": "names at a past known-at (all rows, bit + rerank 200)",
+  "p50": 109.24,
+  "p95": 115.18,
+  "mean": 110.05,
+  "max": 115.73,
+  "n": 40
+ },
+ {
+  "size": "200k",
+  "variant": "names, current-only partial index, full vectors",
+  "recall10": 1.0,
+  "p50": 105.53,
+  "p95": 107.26,
+  "mean": 105.65,
+  "max": 109.08,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "names, current-only partial index, bit + rerank 100",
+  "recall10": 0.813,
+  "p50": 54.85,
+  "p95": 60.75,
+  "mean": 55.89,
+  "max": 60.78,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "names, current-only partial index, bit + rerank 200",
+  "recall10": 0.947,
+  "p50": 56.57,
+  "p95": 59.44,
+  "mean": 56.92,
+  "max": 60.46,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "names at a past known-at (all rows, bit + rerank 200)",
+  "p50": 436.25,
+  "p95": 446.61,
+  "mean": 436.9,
+  "max": 448.7,
+  "n": 30
+ },
+ {
+  "size": "1M",
+  "variant": "names, current-only partial index, full vectors",
+  "recall10": 1.0,
+  "p50": 521.43,
+  "p95": 527.5,
+  "mean": 521.8,
+  "max": 530.0,
+  "n": 12
+ },
+ {
+  "size": "1M",
+  "variant": "names, current-only partial index, bit + rerank 100",
+  "recall10": 0.592,
+  "p50": 171.62,
+  "p95": 175.44,
+  "mean": 171.79,
+  "max": 175.57,
+  "n": 12
+ },
+ {
+  "size": "1M",
+  "variant": "names, current-only partial index, bit + rerank 200",
+  "recall10": 0.775,
+  "p50": 172.31,
+  "p95": 174.07,
+  "mean": 172.35,
+  "max": 174.79,
+  "n": 12
+ },
+ {
+  "size": "1M",
+  "variant": "names at a past known-at (all rows, bit + rerank 200)",
+  "p50": 2118.01,
+  "p95": 2145.68,
+  "mean": 2118.82,
+  "max": 2154.55,
+  "n": 12
+ }
+]

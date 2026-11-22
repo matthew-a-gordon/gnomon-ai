@@ -1,0 +1,112 @@
+[
+ {
+  "size": "200k",
+  "variant": "full",
+  "rerank": "",
+  "recall10": 1.0,
+  "p50": 692.58,
+  "p95": 875.79,
+  "mean": 725.2,
+  "max": 911.51,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "half",
+  "rerank": 100,
+  "recall10": 1.0,
+  "p50": 681.08,
+  "p95": 722.59,
+  "mean": 684.15,
+  "max": 729.5,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "half",
+  "rerank": 200,
+  "recall10": 1.0,
+  "p50": 697.64,
+  "p95": 857.46,
+  "mean": 725.21,
+  "max": 887.15,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "half",
+  "rerank": 400,
+  "recall10": 1.0,
+  "p50": 679.53,
+  "p95": 694.47,
+  "mean": 681.76,
+  "max": 697.85,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "bit (heap fetch)",
+  "rerank": 100,
+  "recall10": 0.637,
+  "p50": 169.85,
+  "p95": 204.66,
+  "mean": 175.19,
+  "max": 212.31,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "bit (heap fetch)",
+  "rerank": 200,
+  "recall10": 0.83,
+  "p50": 168.32,
+  "p95": 189.1,
+  "mean": 173.39,
+  "max": 197.48,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "bit (heap fetch)",
+  "rerank": 400,
+  "recall10": 0.99,
+  "p50": 166.19,
+  "p95": 169.88,
+  "mean": 166.08,
+  "max": 170.99,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "bit (covering index)",
+  "rerank": 100,
+  "recall10": 0.637,
+  "p50": 74.65,
+  "p95": 78.64,
+  "mean": 75.08,
+  "max": 79.34,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "bit (covering index)",
+  "rerank": 200,
+  "recall10": 0.83,
+  "p50": 77.46,
+  "p95": 82.4,
+  "mean": 78.12,
+  "max": 90.7,
+  "n": 30
+ },
+ {
+  "size": "200k",
+  "variant": "bit (covering index)",
+  "rerank": 400,
+  "recall10": 0.99,
+  "p50": 78.19,
+  "p95": 81.45,
+  "mean": 78.45,
+  "max": 82.71,
+  "n": 30
+ }
+]

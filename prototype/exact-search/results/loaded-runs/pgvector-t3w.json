@@ -1,0 +1,82 @@
+[
+ {
+  "variant": "no trigger",
+  "shape": "single-row inserts",
+  "us_per_version_p50": 215.8,
+  "runs": [
+   229.2,
+   213.8,
+   215.8
+  ]
+ },
+ {
+  "variant": "no trigger",
+  "shape": "batch of 1000",
+  "us_per_version_p50": 75.4,
+  "runs": [
+   75.4,
+   71.3,
+   76.2
+  ]
+ },
+ {
+  "variant": "row trigger, token table only",
+  "shape": "single-row inserts",
+  "us_per_version_p50": 660.7,
+  "runs": [
+   868.8,
+   660.7,
+   485.4
+  ]
+ },
+ {
+  "variant": "row trigger, token table only",
+  "shape": "batch of 1000",
+  "us_per_version_p50": 366.1,
+  "runs": [
+   371.0,
+   366.1,
+   325.1
+  ]
+ },
+ {
+  "variant": "row trigger, token table + df + stats",
+  "shape": "single-row inserts",
+  "us_per_version_p50": 1826.8,
+  "runs": [
+   1172.2,
+   1826.8,
+   1931.4
+  ]
+ },
+ {
+  "variant": "row trigger, token table + df + stats",
+  "shape": "batch of 1000",
+  "us_per_version_p50": 2857.8,
+  "runs": [
+   2248.3,
+   2857.8,
+   3400.0
+  ]
+ },
+ {
+  "variant": "statement trigger (transition table), all three",
+  "shape": "single-row inserts",
+  "us_per_version_p50": 2585.7,
+  "runs": [
+   2580.5,
+   2585.7,
+   2718.3
+  ]
+ },
+ {
+  "variant": "statement trigger (transition table), all three",
+  "shape": "batch of 1000",
+  "us_per_version_p50": 351.6,
+  "runs": [
+   367.3,
+   350.5,
+   351.6
+  ]
+ }
+]

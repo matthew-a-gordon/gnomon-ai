@@ -1,0 +1,49 @@
+{
+ "settings": [
+  "1GB",
+  "16MB",
+  "3GB"
+ ],
+ "rows": [
+  {
+   "variant": "bit rerank 200 (no As-of)",
+   "cold_first10_p50": 103.22,
+   "cold_first10_max": 192.99,
+   "p50": 96.36,
+   "p95": 102.03,
+   "mean": 92.45,
+   "max": 102.88,
+   "n": 40
+  },
+  {
+   "variant": "full vectors",
+   "cold_first10_p50": 664.0,
+   "cold_first10_max": 9752.91,
+   "p50": 677.01,
+   "p95": 695.47,
+   "mean": 679.42,
+   "max": 716.28,
+   "n": 40
+  },
+  {
+   "variant": "c_vec As-of now",
+   "cold_first10_p50": 7537.59,
+   "cold_first10_max": 14262.13,
+   "p50": 7708.36,
+   "p95": 9815.73,
+   "mean": 6931.92,
+   "max": 10508.42,
+   "n": 40
+  },
+  {
+   "variant": "search total, depth 1",
+   "cold_first10_p50": 227.76,
+   "cold_first10_max": 469.9,
+   "p50": 199.58,
+   "p95": 207.38,
+   "mean": 195.51,
+   "max": 209.94,
+   "n": 40
+  }
+ ]
+}

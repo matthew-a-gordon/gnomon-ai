@@ -1,0 +1,322 @@
+[
+ {
+  "size": "50k",
+  "asof": "now",
+  "part": "search total, depth 1",
+  "p50": 69.95,
+  "p95": 70.82,
+  "mean": 70.01,
+  "max": 70.82,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "now",
+  "part": "search total, depth 2",
+  "p50": 73.18,
+  "p95": 75.34,
+  "mean": 73.49,
+  "max": 75.85,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "now",
+  "part": "c_vec2",
+  "p50": 34.16,
+  "p95": 35.33,
+  "mean": 34.09,
+  "max": 35.52,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "now",
+  "part": "c_fts",
+  "p50": 3.21,
+  "p95": 3.77,
+  "mean": 3.15,
+  "max": 3.78,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "now",
+  "part": "signals (mentions + connectedness) for 100 candidates",
+  "p50": 18.83,
+  "p95": 19.21,
+  "mean": 18.8,
+  "max": 19.34,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "now",
+  "part": "signals from the per-Scope rollup (now only)",
+  "p50": 17.91,
+  "p95": 18.51,
+  "mean": 17.96,
+  "max": 19.12,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "now",
+  "part": "neighbourhood depth 1 from 10 seeds",
+  "p50": 18.28,
+  "p95": 18.93,
+  "mean": 18.39,
+  "max": 19.38,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "now",
+  "part": "neighbourhood depth 2 from 10 seeds",
+  "p50": 19.51,
+  "p95": 20.54,
+  "mean": 19.59,
+  "max": 21.01,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "past known-at",
+  "part": "search total, depth 1",
+  "p50": 66.87,
+  "p95": 68.41,
+  "mean": 67.12,
+  "max": 68.46,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "past known-at",
+  "part": "search total, depth 2",
+  "p50": 68.04,
+  "p95": 69.6,
+  "mean": 67.99,
+  "max": 69.62,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "past known-at",
+  "part": "c_vec2",
+  "p50": 29.53,
+  "p95": 29.75,
+  "mean": 29.52,
+  "max": 29.76,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "past known-at",
+  "part": "c_fts",
+  "p50": 2.94,
+  "p95": 3.67,
+  "mean": 2.99,
+  "max": 3.74,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "past known-at",
+  "part": "signals (mentions + connectedness) for 100 candidates",
+  "p50": 18.36,
+  "p95": 19.01,
+  "mean": 18.43,
+  "max": 19.12,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "past known-at",
+  "part": "signals from the per-Scope rollup (now only)",
+  "p50": 17.41,
+  "p95": 17.73,
+  "mean": 17.44,
+  "max": 17.73,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "past known-at",
+  "part": "neighbourhood depth 1 from 10 seeds",
+  "p50": 17.12,
+  "p95": 18.04,
+  "mean": 17.2,
+  "max": 18.09,
+  "n": 13
+ },
+ {
+  "size": "50k",
+  "asof": "past known-at",
+  "part": "neighbourhood depth 2 from 10 seeds",
+  "p50": 17.87,
+  "p95": 18.72,
+  "mean": 17.87,
+  "max": 19.05,
+  "n": 13
+ },
+ {
+  "size": "200k",
+  "asof": "now",
+  "part": "search total, depth 1",
+  "p50": 183.87,
+  "p95": 186.6,
+  "mean": 184.05,
+  "max": 187.43,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "now",
+  "part": "search total, depth 2",
+  "p50": 184.84,
+  "p95": 189.2,
+  "mean": 185.39,
+  "max": 189.55,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "now",
+  "part": "c_vec2",
+  "p50": 108.38,
+  "p95": 110.52,
+  "mean": 108.71,
+  "max": 110.94,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "now",
+  "part": "c_fts",
+  "p50": 4.3,
+  "p95": 5.62,
+  "mean": 4.45,
+  "max": 5.94,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "now",
+  "part": "signals (mentions + connectedness) for 100 candidates",
+  "p50": 6.56,
+  "p95": 7.04,
+  "mean": 6.36,
+  "max": 7.2,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "now",
+  "part": "signals from the per-Scope rollup (now only)",
+  "p50": 4.97,
+  "p95": 5.43,
+  "mean": 4.88,
+  "max": 5.53,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "now",
+  "part": "neighbourhood depth 1 from 10 seeds",
+  "p50": 66.15,
+  "p95": 67.78,
+  "mean": 66.55,
+  "max": 67.84,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "now",
+  "part": "neighbourhood depth 2 from 10 seeds",
+  "p50": 67.79,
+  "p95": 69.45,
+  "mean": 67.94,
+  "max": 69.87,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "past known-at",
+  "part": "search total, depth 1",
+  "p50": 176.82,
+  "p95": 179.75,
+  "mean": 176.91,
+  "max": 180.43,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "past known-at",
+  "part": "search total, depth 2",
+  "p50": 175.58,
+  "p95": 184.47,
+  "mean": 177.0,
+  "max": 188.27,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "past known-at",
+  "part": "c_vec2",
+  "p50": 104.41,
+  "p95": 106.69,
+  "mean": 104.57,
+  "max": 107.96,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "past known-at",
+  "part": "c_fts",
+  "p50": 4.06,
+  "p95": 5.23,
+  "mean": 4.23,
+  "max": 5.59,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "past known-at",
+  "part": "signals (mentions + connectedness) for 100 candidates",
+  "p50": 5.58,
+  "p95": 6.1,
+  "mean": 5.67,
+  "max": 6.17,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "past known-at",
+  "part": "signals from the per-Scope rollup (now only)",
+  "p50": 4.4,
+  "p95": 4.56,
+  "mean": 4.38,
+  "max": 4.64,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "past known-at",
+  "part": "neighbourhood depth 1 from 10 seeds",
+  "p50": 63.84,
+  "p95": 65.44,
+  "mean": 64.07,
+  "max": 65.67,
+  "n": 10
+ },
+ {
+  "size": "200k",
+  "asof": "past known-at",
+  "part": "neighbourhood depth 2 from 10 seeds",
+  "p50": 64.33,
+  "p95": 66.6,
+  "mean": 64.69,
+  "max": 66.78,
+  "n": 10
+ }
+]
