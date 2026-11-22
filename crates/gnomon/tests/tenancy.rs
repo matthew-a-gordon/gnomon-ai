@@ -62,7 +62,8 @@ async fn in_single_tenant_mode_an_end_user_who_names_no_tenant_uses_the_default_
     assert_eq!(read.tenant, default);
     assert_eq!(read.content, "No Tenant named.");
 
-    // Naming the default Tenant explicitly reaches the same Episode.
+    // A caller need not name the default Tenant, but naming it reaches the
+    // same Episode.
     assert_eq!(
         alice.read_episode(default, id).await.unwrap().map(|e| e.id),
         Some(id)
@@ -111,7 +112,8 @@ fn tenant_mismatch<T: std::fmt::Debug>(result: Result<T, Error>) -> String {
     }
 }
 
-const REQUIRED: &str = "this deployment is multi-tenant, so every call names its Tenant";
+const TENANT_REQUIRED_MESSAGE: &str =
+    "this deployment is multi-tenant, so every call names its Tenant";
 
 #[tokio::test]
 async fn in_multi_tenant_mode_every_call_that_names_no_tenant_fails_and_never_uses_the_default() {
@@ -148,38 +150,41 @@ async fn in_multi_tenant_mode_every_call_that_names_no_tenant_fails_and_never_us
     let now = AsOf::current(Utc::now());
     for caller in [&bound, &unbound, &worker] {
         let new = episode(None, "support", "No Tenant named.");
-        assert_eq!(tenant_required(caller.record_episode(&new).await), REQUIRED);
+        assert_eq!(
+            tenant_required(caller.record_episode(&new).await),
+            TENANT_REQUIRED_MESSAGE
+        );
         assert_eq!(
             tenant_required(caller.read_episode(None, episode_id).await),
-            REQUIRED
+            TENANT_REQUIRED_MESSAGE
         );
         assert_eq!(
             tenant_required(caller.register_kind(&new_kind).await),
-            REQUIRED
+            TENANT_REQUIRED_MESSAGE
         );
         assert_eq!(
             tenant_required(caller.read_kind(None, "node").await),
-            REQUIRED
+            TENANT_REQUIRED_MESSAGE
         );
         assert_eq!(
             tenant_required(caller.create_node(&new_node, &patch).await),
-            REQUIRED
+            TENANT_REQUIRED_MESSAGE
         );
         assert_eq!(
             tenant_required(caller.write_node(None, node, &patch).await),
-            REQUIRED
+            TENANT_REQUIRED_MESSAGE
         );
         assert_eq!(
             tenant_required(caller.write_nodes(None, &[(node, patch.clone())]).await),
-            REQUIRED
+            TENANT_REQUIRED_MESSAGE
         );
         assert_eq!(
             tenant_required(caller.read_node(None, node, now).await),
-            REQUIRED
+            TENANT_REQUIRED_MESSAGE
         );
         assert_eq!(
             tenant_required(caller.list_citations(None, version).await),
-            REQUIRED
+            TENANT_REQUIRED_MESSAGE
         );
     }
 
@@ -380,128 +385,6 @@ async fn switching_to_multi_tenant_mode_keeps_every_row_readable_under_the_forme
     );
 }
 
-/// Every gnomon table with a Tenant, from the catalog, so a table added by a
-/// later migration is covered without changing the test.
-async fn tenant_tables(client: &tokio_postgres::Client) -> Vec<String> {
-    client
-        .query_typed(
-            "select c.relname::text
-             from pg_class c join pg_namespace n on n.oid = c.relnamespace
-             where n.nspname = 'gnomon' and c.relkind in ('r', 'p')
-               and exists (select from pg_attribute a
-                           where a.attrelid = c.oid and a.attname = 'tenant_id'
-                             and not a.attisdropped)
-             order by 1",
-            &[],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get(0))
-        .collect()
-}
-
-#[tokio::test]
-async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_of_every_table() {
-    let db = TestDb::migrated().await;
-    db.grant_kind_registration("authenticated").await;
-    let store = store(&db).await;
-    let first = db.default_tenant().await;
-    let single = store.as_user(user_without_tenant(&["support"]));
-    single
-        .register_kind(&NewKind {
-            tenant: None,
-            name: "person".into(),
-            of: KindOf::Node,
-            parent: None,
-            properties: json!({ "properties": { "age": { "type": "integer" } } }),
-            search: vec![],
-        })
-        .await
-        .unwrap();
-    let ep = single
-        .record_episode(&episode(None, "support", "Ada, 36."))
-        .await
-        .unwrap();
-    single
-        .create_node(
-            &NewNode {
-                tenant: None,
-                scope: Scope::new("support"),
-                kind: "person".into(),
-            },
-            &Patch::new(
-                ep,
-                ValidTime::UNKNOWN,
-                values(json!({ "name": "Ada", "age": 36 })),
-            ),
-        )
-        .await
-        .unwrap();
-
-    let operator = db.operator().await;
-    let tables = tenant_tables(&operator).await;
-    for expected in [
-        "citation",
-        "contribution",
-        "episode",
-        "kind",
-        "kind_rule",
-        "node",
-        "version",
-    ] {
-        assert!(
-            tables.iter().any(|t| t == expected),
-            "{expected} is not in {tables:?}"
-        );
-    }
-    let mut before = Vec::new();
-    for t in &tables {
-        let n: i64 = operator
-            .query_typed(&format!("select count(*) from gnomon.{t}"), &[])
-            .await
-            .unwrap()[0]
-            .get(0);
-        assert!(
-            n > 0,
-            "the single-tenant deployment wrote no row into gnomon.{t}"
-        );
-        before.push(n);
-    }
-
-    db.switch_to_multi_tenant().await;
-
-    let mut client = db.login().await;
-    let tx = client.transaction().await.unwrap();
-    tx.batch_execute("set local role authenticated")
-        .await
-        .unwrap();
-    let claims = Value::Object(support::user(first, &["support"])).to_string();
-    tx.query_typed(
-        "select set_config('request.jwt.claims', $1, true)",
-        &[(&claims, tokio_postgres::types::Type::TEXT)],
-    )
-    .await
-    .unwrap();
-    for (t, n) in tables.iter().zip(before) {
-        let seen: i64 = tx
-            .query_typed(
-                &format!("select count(*) from gnomon.{t} where tenant_id = $1"),
-                &[(&first.0, tokio_postgres::types::Type::UUID)],
-            )
-            .await
-            .unwrap()[0]
-            .get(0);
-        assert_eq!(
-            seen, n,
-            "gnomon.{t}: the first Tenant sees {seen} of {n} rows"
-        );
-    }
-}
-
-/// The SQLSTATE the tenancy row raises for a change it refuses.
-const TENANCY_ONE_WAY: &str = "GNT03";
-
 #[tokio::test]
 async fn switching_back_to_single_tenant_mode_is_refused_even_to_the_operator() {
     let db = TestDb::migrated().await;
@@ -519,7 +402,7 @@ async fn switching_back_to_single_tenant_mode_is_refused_even_to_the_operator() 
         match operator.batch_execute(sql).await {
             Err(e) => assert_eq!(
                 e.code().map(|c| c.code()),
-                Some(TENANCY_ONE_WAY),
+                Some(gnomon::TENANCY_ONE_WAY),
                 "{sql}: {e:?}"
             ),
             Ok(()) => panic!("{sql} was allowed"),
@@ -549,7 +432,7 @@ async fn switching_back_to_single_tenant_mode_is_refused_even_to_the_operator() 
                 .read_episode(None, EpisodeId(uuid::Uuid::new_v4()))
                 .await
         ),
-        REQUIRED
+        TENANT_REQUIRED_MESSAGE
     );
 }
 
@@ -565,7 +448,7 @@ async fn in_single_tenant_mode_the_operator_cannot_change_the_default_tenant_or_
         match operator.batch_execute(sql).await {
             Err(e) => assert_eq!(
                 e.code().map(|c| c.code()),
-                Some(TENANCY_ONE_WAY),
+                Some(gnomon::TENANCY_ONE_WAY),
                 "{sql}: {e:?}"
             ),
             Ok(()) => panic!("{sql} was allowed"),
@@ -575,7 +458,7 @@ async fn in_single_tenant_mode_the_operator_cannot_change_the_default_tenant_or_
 
 #[tokio::test]
 async fn a_deployment_that_replaced_tenant_id_before_this_migration_keeps_its_own() {
-    // A chain at migration 0004, whose deployment resolves the Tenant from
+    // A chain at migration 0004, whose deployment reads the Tenant from
     // its own claim.
     let db = TestDb::empty_with_login().await;
     let operator = db.operator().await;
@@ -605,7 +488,7 @@ async fn a_deployment_that_replaced_tenant_id_before_this_migration_keeps_its_ow
     tx.batch_execute("set local role authenticated")
         .await
         .unwrap();
-    let resolve = |claims: Value| {
+    let tenant_of = |claims: Value| {
         let tx = &tx;
         async move {
             tx.query_typed(
@@ -621,10 +504,75 @@ async fn a_deployment_that_replaced_tenant_id_before_this_migration_keeps_its_ow
         }
     };
     assert_eq!(
-        resolve(json!({ "org": org.to_string() })).await,
+        tenant_of(json!({ "org": org.to_string() })).await,
         Some(org.0)
     );
     // The deployment's own function has no fallback, so claims without its
     // claim reach no Tenant, not even the default one.
-    assert_eq!(resolve(json!({ "app_metadata": {} })).await, None);
+    assert_eq!(tenant_of(json!({ "app_metadata": {} })).await, None);
+}
+
+async fn tenancy_mode(db: &TestDb) -> String {
+    db.operator()
+        .await
+        .query_typed("select mode from gnomon.tenancy", &[])
+        .await
+        .unwrap()[0]
+        .get(0)
+}
+
+#[tokio::test]
+async fn a_role_the_deployment_grants_the_switch_can_switch_and_one_without_update_cannot() {
+    let db = TestDb::migrated().await;
+    let first = db.default_tenant().await;
+    // Granted in this test's database only, the way a deployment would
+    // grant its own operations role.
+    db.admin()
+        .await
+        .batch_execute("grant execute on function gnomon.switch_to_multi_tenant() to gnomon_worker")
+        .await
+        .unwrap();
+
+    // EXECUTE without UPDATE: a clear refusal, and the mode stays single.
+    let mut client = db.login().await;
+    let tx = client.transaction().await.unwrap();
+    tx.batch_execute("set local role gnomon_worker")
+        .await
+        .unwrap();
+    match tx
+        .batch_execute("select gnomon.switch_to_multi_tenant()")
+        .await
+    {
+        Err(e) => assert_eq!(
+            e.code(),
+            Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "{e:?}"
+        ),
+        Ok(()) => panic!("switched without UPDATE on gnomon.tenancy"),
+    }
+    drop(tx);
+    assert_eq!(tenancy_mode(&db).await, "single");
+
+    db.admin()
+        .await
+        .batch_execute("grant update (mode) on gnomon.tenancy to gnomon_worker")
+        .await
+        .unwrap();
+    let tx = client.transaction().await.unwrap();
+    tx.batch_execute("set local role gnomon_worker")
+        .await
+        .unwrap();
+    let switched: uuid::Uuid = tx
+        .query_typed("select gnomon.switch_to_multi_tenant()", &[])
+        .await
+        .unwrap()[0]
+        .get(0);
+    // The grant reaches the switch and nothing else: the update policy
+    // admits no multi-tenant row, so switching back updates nothing.
+    tx.batch_execute("update gnomon.tenancy set mode = 'single'")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(TenantId(switched), first);
+    assert_eq!(tenancy_mode(&db).await, "multi");
 }

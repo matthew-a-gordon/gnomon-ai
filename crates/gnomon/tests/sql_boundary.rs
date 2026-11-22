@@ -361,8 +361,8 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
             (t.get(0), t.get(1), t.get(2), t.get(3));
         assert!(rls, "gnomon.{name} has no RLS");
         if name == "schema_version" || name == "tenancy" {
-            // The ledger describes the schema and the tenancy row the
-            // deployment, not a graph.
+            // The ledger describes the schema, and the tenancy row
+            // describes the deployment. Neither holds a graph.
             continue;
         }
         assert!(tenant, "gnomon.{name} lacks a tenant_id column");
@@ -1766,4 +1766,105 @@ async fn in_single_tenant_mode_claims_that_bind_no_tenant_reach_only_the_default
         .await,
         "recording into another Tenant with claims that bind no Tenant",
     );
+}
+
+#[tokio::test]
+async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_of_every_table() {
+    let db = TestDb::migrated().await;
+    db.grant_kind_registration("authenticated").await;
+    let first = db.default_tenant().await.0;
+    // A single-tenant deployment writes a row into every table through the
+    // Store, naming no Tenant.
+    let store = Store::connect_no_tls(&db.login_url()).await.unwrap();
+    let single = store.as_user(
+        serde_json::from_value(
+            json!({ "role": "authenticated", "app_metadata": { "scopes": ["support"] } }),
+        )
+        .unwrap(),
+    );
+    single
+        .register_kind(&gnomon::NewKind {
+            tenant: None,
+            name: "person".into(),
+            of: gnomon::KindOf::Node,
+            parent: None,
+            properties: json!({ "properties": { "age": { "type": "integer" } } }),
+            search: vec![],
+        })
+        .await
+        .unwrap();
+    let episode = single
+        .record_episode(&NewEpisode {
+            tenant: None,
+            scope: Scope::new("support"),
+            content: "Ada, 36.".into(),
+            reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            authority: None,
+        })
+        .await
+        .unwrap();
+    single
+        .create_node(
+            &gnomon::NewNode {
+                tenant: None,
+                scope: Scope::new("support"),
+                kind: "person".into(),
+            },
+            &gnomon::Patch::new(
+                episode,
+                gnomon::ValidTime::UNKNOWN,
+                serde_json::from_value(json!({ "name": "Ada", "age": 36 })).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let operator = db.operator().await;
+    let tables = tenant_tables(&operator).await;
+    for expected in [
+        "citation",
+        "contribution",
+        "episode",
+        "kind",
+        "kind_rule",
+        "node",
+        "version",
+    ] {
+        assert!(
+            tables.iter().any(|t| t == expected),
+            "{expected} is not in {tables:?}"
+        );
+    }
+    let mut before = Vec::new();
+    for t in &tables {
+        let n: i64 = operator
+            .query_typed(&format!("select count(*) from gnomon.{t}"), &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert!(
+            n > 0,
+            "the single-tenant deployment wrote no row into gnomon.{t}"
+        );
+        before.push(n);
+    }
+
+    db.switch_to_multi_tenant().await;
+
+    let mut client = db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(first, &["support"])).await;
+    for (t, n) in tables.iter().zip(before) {
+        let seen: i64 = tx
+            .query_typed(
+                &format!("select count(*) from gnomon.{t} where tenant_id = $1"),
+                &[(&first, Type::UUID)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(
+            seen, n,
+            "gnomon.{t}: the first Tenant sees {seen} of {n} rows"
+        );
+    }
 }

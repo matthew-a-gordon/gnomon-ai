@@ -44,6 +44,10 @@ pub const TENANT_REQUIRED: &str = "GNT01";
 /// Tenant the caller's claims bind.
 pub const TENANT_MISMATCH: &str = "GNT02";
 
+/// The SQLSTATE the tenancy row raises for any change but the switch from
+/// single-tenant to multi-tenant mode, such as switching back.
+pub const TENANCY_ONE_WAY: &str = "GNT03";
+
 /// The unit of isolation: one customer's graph.
 ///
 /// Every Store call takes an `Option<TenantId>`, and a `TenantId` converts

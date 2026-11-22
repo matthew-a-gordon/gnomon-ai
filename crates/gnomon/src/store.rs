@@ -114,7 +114,7 @@ impl Store {
     /// The claims are
     /// `{"role": "gnomon_worker", "app_metadata": {"tenant_id": <tenant>, "scopes": [<scope>]}}`,
     /// without `"tenant_id"` for `None`. A deployment that replaces
-    /// `gnomon.tenant_id()` and `gnomon.allowed_scopes()` must resolve them.
+    /// `gnomon.tenant_id()` and `gnomon.allowed_scopes()` must read them.
     pub fn as_worker(&self, tenant: impl Into<Option<TenantId>>, scope: Scope) -> Caller<'_> {
         let mut app_metadata = Map::new();
         if let Some(tenant) = tenant.into() {
@@ -191,9 +191,9 @@ impl Caller<'_> {
     /// Opens the call's transaction, sets its role and claims locally, and
     /// returns the call's Tenant as `gnomon.call_tenant` checked it.
     ///
-    /// The claims and the check share one statement, so a call costs no
-    /// more round trips than it did before tenancy modes. The materialized
-    /// CTE sets the claims before the outer select reads them.
+    /// The claims and the check share one statement, so the check adds no
+    /// round trip. The materialized CTE sets the claims before the outer
+    /// select reads them.
     async fn begin<'c>(
         &self,
         client: &'c mut Client,

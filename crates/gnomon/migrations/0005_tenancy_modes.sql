@@ -71,12 +71,20 @@ create trigger tenancy_guard_delete before delete on gnomon.tenancy
 create trigger tenancy_guard_truncate before truncate on gnomon.tenancy
   for each statement execute function gnomon.tenancy_guard_remove();
 
--- Callers and the definer role read the row, because `gnomon.tenant_id()`
--- reads it as whichever of them is calling. Nothing grants a caller any
--- write.
+-- Grants decide who reads and who switches; the policies apply to every
+-- role. The callers and the definer role get SELECT, because
+-- `gnomon.tenant_id()` reads the row as whichever of them is calling. No
+-- caller role gets UPDATE. The update policy admits only the switch, so a
+-- role a deployment grants UPDATE can do nothing else to the row, and the
+-- guard triggers refuse anything else from the owner too.
+--
+-- The row holds no secret. The first Tenant's ID is readable to every
+-- caller in multi-tenant mode, as any Tenant's ID is to whoever holds its
+-- claims.
 alter table gnomon.tenancy enable row level security;
-create policy tenancy_read on gnomon.tenancy
-  for select to authenticated, gnomon_worker, gnomon_definer using (true);
+create policy tenancy_read on gnomon.tenancy for select using (true);
+create policy tenancy_switch on gnomon.tenancy for update
+  using (mode = 'single') with check (mode = 'multi');
 
 -- The default Tenant in single-tenant mode, and null in multi-tenant mode,
 -- so a caller whose claims bind no Tenant never reaches it once the
@@ -87,26 +95,30 @@ create function gnomon.default_tenant() returns uuid
     select t.default_tenant_id from gnomon.tenancy t where t.mode = 'single'
   $$;
 
--- The reference `gnomon.tenant_id()` of migration 0001, which also falls
--- back to the default Tenant when the claims bind none. The fallback reads
--- the tenancy row only for claims with no Tenant, so a caller whose claims
--- bind one pays nothing more per policy check. Policies evaluate this
--- function once per row checked, and the function is never inlined (it pins
--- its search path), so the fallback is written out here rather than calling
--- `gnomon.default_tenant()`: measured on a bounded patch to a Node with 100
--- Contributions, the extra call cost about 0.8 ms of the 1.6 ms that claims
--- with no Tenant add to the 9 ms p50 of claims that bind one.
+-- The reference `gnomon.tenant_id()` of migration 0001, which now falls back
+-- to the default Tenant when the claims bind none. Only claims with no
+-- Tenant read the tenancy row, so a caller whose claims bind one pays
+-- nothing more per policy check.
 --
--- A deployment that already replaced `gnomon.tenant_id()` keeps its own: this
--- migration replaces only the reference body, compared with its whitespace
--- removed. Such a deployment's function must return
--- `coalesce(<its Tenant>, gnomon.default_tenant())` for single-tenant mode to
--- reach the default Tenant. It must also still resolve the worker's claims,
+-- Policies evaluate this function once per row they check, and it is never
+-- inlined, because it pins its search path. So the fallback is written out
+-- here instead of calling `gnomon.default_tenant()`. On a bounded patch to a
+-- Node with 100 Contributions, claims that bind a Tenant measured a 9 ms
+-- p50. Claims with no Tenant added 1.6 ms to that, and the extra function
+-- call had added another 0.8 ms.
+--
+-- A deployment that already replaced `gnomon.tenant_id()` keeps its own.
+-- This migration replaces only the reference body, compared with its
+-- whitespace removed. For single-tenant mode to reach the default Tenant,
+-- such a function must return `coalesce(<its Tenant>,
+-- gnomon.default_tenant())`. Migration 0001 says every replacement must
+-- also read the worker's claims,
 --
 --   {"role": "gnomon_worker",
 --    "app_metadata": {"tenant_id": <tenant>, "scopes": [<scope>]}},
 --
--- which leave out "tenant_id" when a single-tenant worker names no Tenant.
+-- and from this migration on those claims leave out "tenant_id" when a
+-- single-tenant worker names no Tenant.
 do $$
 declare
   reference constant text := $ref$
@@ -188,15 +200,27 @@ create function gnomon.call_tenant(p_tenant_id uuid) returns uuid
 -- again changes nothing and returns the same Tenant.
 --
 -- This is an invoker function granted to no caller role, not a definer
--- (ADR-0009): it runs with the privileges of whoever calls it, and only the
--- role that applied the migrations, which owns the tenancy row, may update
--- that row. A deployment that wants another role to switch grants it
--- EXECUTE on this function and UPDATE on gnomon.tenancy itself.
+-- (ADR-0009). It runs with the privileges of whoever calls it. The role
+-- that applied the migrations owns the tenancy row and may always switch.
+-- A deployment that wants another role to switch grants it EXECUTE on this
+-- function, SELECT on gnomon.tenancy and UPDATE (mode) on gnomon.tenancy.
+-- A role that the update cannot reach gets an error, never a silent
+-- single-tenant deployment.
 create function gnomon.switch_to_multi_tenant() returns uuid
-  language sql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = ''
   as $$
+  declare
+    v_mode text;
+    v_first uuid;
+  begin
     update gnomon.tenancy set mode = 'multi' where mode = 'single';
-    select t.default_tenant_id from gnomon.tenancy t;
+    select t.mode, t.default_tenant_id into v_mode, v_first from gnomon.tenancy t;
+    if v_mode is distinct from 'multi' then
+      raise exception using errcode = 'insufficient_privilege',
+        message = 'the switch to multi-tenant mode could not update gnomon.tenancy';
+    end if;
+    return v_first;
+  end
   $$;
 
 -- Grants. First every grant a default privilege made on this migration's
