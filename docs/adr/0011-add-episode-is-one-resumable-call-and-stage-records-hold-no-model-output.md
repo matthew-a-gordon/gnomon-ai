@@ -21,3 +21,4 @@ A stage record is a Store table under RLS. It holds the Episode, the stage name,
 - Erasure deletes the Episode's stage records.
 - A stage record also stores usage counts: model name, call count, input and output tokens, and the provider's reported cost when given. It holds no text.
 - The server's optional queue is the stage table itself. A worker claims a pending or retry-due record with `FOR UPDATE SKIP LOCKED`, sets a lease time and commits, runs the stage, and writes the next record. A failure sets a retry time with exponential backoff, and after a maximum number of attempts the record stays visible as failed. No separate jobs table exists, and no `pg_cron`.
+- The claim-and-run step is one bounded call, `run_queue`, which runs due stage records until a deadline or a stage limit is reached or the queue is empty, and then returns. The server's polling loop is a loop around it, and the bindings expose it for a consumer who runs its own scheduler (ADR-0016).
