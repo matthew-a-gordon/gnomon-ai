@@ -14,4 +14,14 @@ An Episode is an immutable record of its own, not a Node. A Version, Summary, Co
 
 - A Version cited by another Episode survives Erasure, but loses the Citation and every value the erased Episode alone supplied. Its values are recomputed from the Contributions that remain, in closed Versions as well as current ones (ADR-0007).
 - After an Erasure, a Summary or Community that drew on the erased Episode is missing until the Pipeline regenerates it from the remaining Episodes.
+- Erasure deletes Search's derived rows in the same transaction (ADR-0010):
+  - the full and quantized embeddings of every Version it deletes or recomputes;
+  - the token rows and the BM25 counts they feed;
+  - the adjacency rows;
+  - the name and Alias rows.
+
+  The Pipeline re-embeds recomputed text afterwards.
+- An Erasure is complete at commit, when nothing derived from the Episode is readable. Copies of the erased bytes stay in dead tuples and index pages until the affected tables are vacuumed.
+  - `VACUUM` cannot run in a transaction, so a separate call, which the deployment runs, vacuums them. That call uses the `MAINTAIN` privilege granted to the gnomon role.
+  - The bytes are gone only when that call has finished.
 - Erasure is not exposed over MCP unless a deployment turns it on.

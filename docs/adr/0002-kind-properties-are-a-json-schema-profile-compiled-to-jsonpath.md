@@ -15,6 +15,7 @@ A Kind declares its properties in a profile of JSON Schema 2020-12: `type`, `pro
 
 ## Consequences
 
+- A Kind marks which of its properties feed Search, and a child Kind inherits the marks. Node Kinds default to the name and Aliases. Edge Kinds default to the Sentence (ADR-0010).
 - No property type refers to a Node. Anything that points at a Node is an Edge, so it gets its own Valid time, traversal, endpoint rules, Citations and Erasure.
 - `like_regex` is POSIX and JSON Schema `pattern` is ECMA-262, so `pattern` is left out or restricted to a subset both read the same way. `oneOf` has no clean jsonpath form and is left out.
 - Anthropic's structured output rejects numeric and length bounds, so the Pipeline strips them from the request and checks them on the reply. The Store enforces them on every write.
