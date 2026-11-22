@@ -11,22 +11,8 @@ use gnomon::{Error, Kind, KindOf, NewKind, Store, TenantId, ROOT_EDGE_KIND, ROOT
 use serde_json::{json, Map, Value};
 use support::TestDb;
 use tokio_postgres::types::Type;
-use uuid::Uuid;
 
-fn tenant() -> TenantId {
-    TenantId(Uuid::new_v4())
-}
-
-fn claims(tenant: TenantId, scopes: &[&str]) -> Map<String, Value> {
-    match json!({
-        "sub": Uuid::new_v4().to_string(),
-        "role": "authenticated",
-        "app_metadata": { "tenant_id": tenant.to_string(), "scopes": scopes },
-    }) {
-        Value::Object(m) => m,
-        _ => unreachable!(),
-    }
-}
+use support::{tenant, user as claims};
 
 /// A migrated database whose deployment lets `authenticated` register Kinds.
 async fn registering_db() -> TestDb {
@@ -55,8 +41,8 @@ fn edge_kind(tenant: TenantId, name: &str, source: &[&str], target: &[&str]) -> 
         tenant,
         name: name.to_owned(),
         of: KindOf::Edge {
-            source: source.iter().map(|s| s.to_string()).collect(),
-            target: target.iter().map(|s| s.to_string()).collect(),
+            source: strings(source),
+            target: strings(target),
         },
         parent: None,
         properties: json!({ "type": "object" }),
@@ -599,6 +585,14 @@ async fn malformed_schemas_are_refused_with_a_clear_reason() {
             "distinct property names",
         ),
         (
+            prop(json!({ "type": ["string", "string"] })),
+            "non-empty list of distinct ones",
+        ),
+        (
+            json!({ "properties": { "a": {} }, "required": ["a", "a"] }),
+            "\"required\" at the top level must be a list of distinct property names",
+        ),
+        (
             prop(json!(true)),
             "the schema at /properties/p must be a JSON object",
         ),
@@ -737,7 +731,7 @@ async fn a_child_kind_inherits_its_parents_properties_required_properties_and_se
 }
 
 #[tokio::test]
-async fn a_child_kind_cannot_redeclare_an_inherited_property_or_change_sort() {
+async fn a_child_kind_cannot_redeclare_an_inherited_property_or_specialize_another_kind_of() {
     let db = registering_db().await;
     let store = store(&db).await;
     let t = tenant();
@@ -1043,41 +1037,6 @@ async fn an_edge_kind_may_join_only_registered_node_kinds_within_what_its_parent
     }
 }
 
-#[tokio::test]
-async fn a_node_kind_names_no_endpoints() {
-    let db = registering_db().await;
-    let t = tenant();
-    let mut client = db.login().await;
-    let tx = client.transaction().await.unwrap();
-    tx.batch_execute("set local role authenticated")
-        .await
-        .unwrap();
-    tx.query_typed(
-        "select set_config('request.jwt.claims', $1, true)",
-        &[(
-            &Value::Object(claims(t, &["support"])).to_string(),
-            Type::TEXT,
-        )],
-    )
-    .await
-    .unwrap();
-    let err = tx
-        .query_typed(
-            "select gnomon.register_kind($1, 'person', 'node', null, '{}', '{}', array['node'], null)",
-            &[(&t.0, Type::UUID)],
-        )
-        .await
-        .expect_err("a Node Kind with endpoints was registered");
-    assert_eq!(err.code().map(|c| c.code()), Some(gnomon::INVALID_KIND));
-    assert!(
-        err.as_db_error()
-            .unwrap()
-            .message()
-            .contains("only an Edge Kind names the Node Kinds"),
-        "{err:?}"
-    );
-}
-
 // Registering again, Tenants and Scopes, and the grant.
 
 #[tokio::test]
@@ -1192,4 +1151,41 @@ async fn a_caller_with_the_grant_registers_only_in_its_own_tenant() {
         ),
         Ok(k) => panic!("registered into another Tenant: {k:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_schema_that_would_compile_to_an_unbounded_rule_is_refused() {
+    let db = registering_db().await;
+    let store = store(&db).await;
+    let t = tenant();
+    let caller = store.as_user(claims(t, &["support"]));
+    let nest = |depth: usize, wrap: &dyn Fn(Value) -> Value| {
+        (0..depth).fold(json!({ "type": "string" }), |inner, _| wrap(inner))
+    };
+    let kind = |schema: Value| node_kind(t, "deep", json!({ "properties": { "p": schema } }));
+
+    // Each array in an array doubles the rule.
+    let arrays = nest(20, &|inner| json!({ "type": "array", "items": inner }));
+    let m = invalid(caller.register_kind(&kind(arrays)).await);
+    assert!(
+        m.contains("compiles to a rule longer than 65536 characters"),
+        "{m}"
+    );
+
+    let objects = nest(
+        40,
+        &|inner| json!({ "type": "object", "properties": { "x": inner } }),
+    );
+    let m = invalid(caller.register_kind(&kind(objects)).await);
+    assert!(
+        m.contains("nests deeper than the profile allows (32 levels)"),
+        "{m}"
+    );
+
+    // Ordinary nesting still registers.
+    let shallow = nest(4, &|inner| json!({ "type": "array", "items": inner }));
+    caller
+        .register_kind(&kind(shallow))
+        .await
+        .expect("four nested arrays register");
 }

@@ -102,26 +102,10 @@ async fn the_store_refuses_a_schema_whose_embedding_dimension_pgvector_cannot_st
 
 use chrono::{TimeZone, Utc};
 use gnomon::{EpisodeId, NewEpisode, Scope, TenantId};
-use serde_json::{json, Map, Value};
+use serde_json::Map;
 use tokio_postgres::error::SqlState;
-use uuid::Uuid;
 
-fn tenant() -> TenantId {
-    TenantId(Uuid::new_v4())
-}
-
-/// Verified JWT claims for an end user, in the shape the reference
-/// `gnomon.tenant_id()` and `gnomon.allowed_scopes()` read.
-fn user(tenant: TenantId, scopes: &[&str]) -> Map<String, Value> {
-    match json!({
-        "sub": Uuid::new_v4().to_string(),
-        "role": "authenticated",
-        "app_metadata": { "tenant_id": tenant.to_string(), "scopes": scopes },
-    }) {
-        Value::Object(m) => m,
-        _ => unreachable!(),
-    }
-}
+use support::{tenant, user};
 
 fn episode(tenant: TenantId, scope: &str, content: &str) -> NewEpisode {
     NewEpisode {

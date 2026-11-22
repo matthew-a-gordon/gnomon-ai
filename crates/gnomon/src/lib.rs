@@ -115,7 +115,7 @@ pub enum Error {
     InvalidKind(String),
     /// The Kind's name is already registered in the Tenant with another
     /// definition.
-    #[error("{0}")]
+    #[error("Kind conflict: {0}")]
     KindConflict(String),
     /// Postgres refused or failed the call. RLS refusals and a missing grant
     /// arrive here.

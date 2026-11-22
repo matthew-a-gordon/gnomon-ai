@@ -236,10 +236,11 @@ impl Caller<'_> {
     /// on `gnomon.register_kind`, the call fails with
     /// `insufficient_privilege`.
     pub async fn register_kind(&self, kind: &NewKind) -> Result<Kind, Error> {
-        let (sort, source, target) = match &kind.of {
-            KindOf::Node => ("node", None, None),
-            KindOf::Edge { source, target } => ("edge", Some(source), Some(target)),
+        let (source, target) = match &kind.of {
+            KindOf::Node => (None, None),
+            KindOf::Edge { source, target } => (Some(source), Some(target)),
         };
+        let kind_of = kind.of.sql_name();
         let mut client = self.store.client.lock().await;
         let tx = self.begin(&mut client).await?;
         tx.query_typed(
@@ -247,7 +248,7 @@ impl Caller<'_> {
             &[
                 (&kind.tenant.0, Type::UUID),
                 (&kind.name, Type::TEXT),
-                (&sort, Type::TEXT),
+                (&kind_of, Type::TEXT),
                 (&kind.parent, Type::TEXT),
                 (&kind.properties, Type::JSONB),
                 (&kind.search, Type::TEXT_ARRAY),
@@ -288,13 +289,23 @@ async fn read_kind(
         .await?;
     Ok(rows.first().map(|r| {
         let of = match r.get::<_, &str>(1) {
+            "node" => KindOf::Node,
             "edge" => KindOf::Edge {
                 source: r.get(7),
                 target: r.get(8),
             },
-            _ => KindOf::Node,
+            other => panic!("gnomon.read_kind returned kind_of {other:?}"),
         };
-        let rules: Value = r.get(5);
+        let rules = match r.get::<_, Value>(5) {
+            Value::Object(m) => m
+                .into_iter()
+                .map(|(property, rule)| match rule {
+                    Value::String(rule) => (property, rule),
+                    other => panic!("gnomon.read_kind returned rule {other} for {property}"),
+                })
+                .collect(),
+            other => panic!("gnomon.read_kind returned rules {other}"),
+        };
         Kind {
             tenant,
             name: r.get(0),
@@ -302,13 +313,7 @@ async fn read_kind(
             parent: r.get(2),
             ancestors: r.get(3),
             properties: r.get(4),
-            rules: match rules {
-                Value::Object(m) => m
-                    .into_iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_owned())))
-                    .collect(),
-                _ => Default::default(),
-            },
+            rules,
             search: r.get(6),
         }
     }))

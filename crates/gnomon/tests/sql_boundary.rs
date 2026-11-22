@@ -448,13 +448,15 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
 }
 
 #[tokio::test]
-async fn the_definer_role_cannot_log_in_or_bypass_rls_and_belongs_to_no_role() {
+async fn the_definer_role_cannot_log_in_or_bypass_rls_and_no_role_belongs_to_it_or_it_to_one() {
     let w = world().await;
     let client = w.db.login().await;
     let row = client
         .query_typed(
             "select rolcanlogin, rolsuper or rolbypassrls,
-                    exists (select from pg_auth_members m where m.member = r.oid)
+                    exists (select from pg_auth_members m where m.member = r.oid),
+                    array(select m.member::regrole::text from pg_auth_members m
+                          where m.roleid = r.oid and (m.set_option or m.inherit_option))
              from pg_roles r where rolname = 'gnomon_definer'",
             &[],
         )
@@ -465,6 +467,11 @@ async fn the_definer_role_cannot_log_in_or_bypass_rls_and_belongs_to_no_role() {
     assert!(!login, "gnomon_definer can log in");
     assert!(!bypass, "gnomon_definer can bypass RLS");
     assert!(!member, "gnomon_definer inherits another role's privileges");
+    // The migration role may act as the definer role only while it hands it
+    // the function. A CREATEROLE role keeps ADMIN on a role it created, which
+    // lets it grant the role but not act as it.
+    let members: Vec<String> = row[0].get(3);
+    assert!(members.is_empty(), "{members:?} can act as gnomon_definer");
 }
 
 #[tokio::test]
@@ -719,5 +726,28 @@ async fn a_caller_cannot_redirect_kind_registration_through_its_search_path() {
         real.len(),
         1,
         "registration wrote somewhere other than gnomon.kind"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_calling_register_kind_directly_cannot_give_a_node_kind_endpoints() {
+    let w = world().await;
+    w.db.grant_kind_registration(USER).await;
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(w.t1, &["support"])).await;
+    let err = tx
+        .query_typed(
+            "select gnomon.register_kind($1, 'person', 'node', null, '{}', '{}', array['node'], null)",
+            &[(&w.t1, Type::UUID)],
+        )
+        .await
+        .expect_err("a Node Kind with endpoints was registered");
+    assert_eq!(err.code().map(|c| c.code()), Some(gnomon::INVALID_KIND));
+    assert!(
+        err.as_db_error()
+            .unwrap()
+            .message()
+            .contains("only an Edge Kind names the Node Kinds"),
+        "{err:?}"
     );
 }

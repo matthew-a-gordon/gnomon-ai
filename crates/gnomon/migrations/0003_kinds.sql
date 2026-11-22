@@ -28,9 +28,10 @@
 -- able to SET ROLE to an existing `gnomon_definer`, so that it can create the
 -- role and hand it the function.
 
--- The definer role. It owns the definer functions and nothing else, logs in
--- never, and stays under RLS, so the Tenant policies below still apply inside
--- the definer functions.
+-- The definer role. It owns the definer functions and nothing else, never
+-- logs in, and stays under RLS, so the Tenant policies below still apply
+-- inside the definer functions. A role of that name that already exists must
+-- hold no more than this.
 do $$
 begin
   if not exists (select from pg_roles where rolname = 'gnomon_definer') then
@@ -38,21 +39,17 @@ begin
   end if;
   if exists (
     select from pg_roles
-    where rolname = 'gnomon_definer' and (rolcanlogin or rolsuper or rolbypassrls)
+    where rolname = 'gnomon_definer'
+      and (rolcanlogin or rolsuper or rolbypassrls or rolcreaterole or rolcreatedb or rolreplication)
   ) then
-    raise exception 'the gnomon role gnomon_definer must be NOLOGIN and must not bypass RLS';
+    raise exception 'the gnomon role gnomon_definer must be NOLOGIN, must not bypass RLS, '
+      'and must not create roles or databases or replicate';
   end if;
   if exists (
     select from pg_auth_members m join pg_roles r on r.oid = m.member
     where r.rolname = 'gnomon_definer'
   ) then
     raise exception 'the gnomon role gnomon_definer must not be a member of another role';
-  end if;
-  -- Handing a function to the role needs SET ROLE on it. A CREATEROLE
-  -- migration role holds ADMIN on a role it created, and so may grant itself
-  -- that.
-  if not pg_has_role(current_user, 'gnomon_definer', 'SET') then
-    execute format('grant gnomon_definer to %I', current_user);
   end if;
 end
 $$;
@@ -66,7 +63,7 @@ create table gnomon.kind (
   name text not null
     check (name ~ '^[A-Za-z][A-Za-z0-9_]{0,62}$' and name not in ('node', 'edge')),
   kind_of text not null check (kind_of in ('node', 'edge')),
-  -- The parent Kind: a registered Kind, or the root Kind of the same sort.
+  -- The parent Kind: a registered Kind of the same kind_of, or that root Kind.
   parent text not null,
   -- Every ancestor, the root first and the parent last.
   ancestors text[] not null check (cardinality(ancestors) > 0),
@@ -122,11 +119,6 @@ create policy kind_rule_tenant_register on gnomon.kind_rule
   for insert to gnomon_definer
   with check (tenant_id = gnomon.tenant_id());
 
--- Callers read Kinds and never write them. Only Kind registration writes
--- them, as gnomon_definer.
-grant select on gnomon.kind, gnomon.kind_rule to authenticated, gnomon_worker;
-grant select, insert on gnomon.kind, gnomon.kind_rule to gnomon_definer;
-
 -- The root Kinds every Ontology has. Node Kinds search the name and Aliases
 -- by default and Edge Kinds the Sentence (ADR-0002, ADR-0010); child Kinds
 -- inherit these marks. The root Edge Kind joins any Node to any Node.
@@ -144,6 +136,25 @@ create function gnomon.root_kinds()
       ('node', 'node', array['name', 'aliases'], null::text[], null::text[]),
       ('edge', 'edge', array['sentence'], array['node'], array['node'])
   $$;
+
+-- The keywords of the JSON Schema profile a Kind's properties may use
+-- (ADR-0002). `format` is limited to date, date-time and uuid.
+create function gnomon.kind_profile_keywords()
+  returns text[]
+  language sql immutable parallel safe security invoker set search_path = ''
+  as $$
+    select array[
+      'type', 'properties', 'required', 'enum', 'const', 'items',
+      'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum',
+      'minLength', 'maxLength', 'minItems', 'maxItems', 'anyOf', 'format'
+    ]
+  $$;
+
+-- A property name as one JSON Pointer token (RFC 6901), for error messages.
+create function gnomon.json_pointer_token(p_key text)
+  returns text
+  language sql immutable parallel safe security invoker set search_path = ''
+  as $$ select replace(replace(p_key, '~', '~0'), '/', '~1') $$;
 
 -- Validates one schema of the profile and compiles it to a jsonpath
 -- predicate over `p_subject`, a jsonpath expression such as `$`, `$."a"` or
@@ -168,11 +179,7 @@ create function gnomon.compile_kind_schema(p_schema jsonb, p_subject text, p_at 
   language plpgsql immutable parallel safe security invoker set search_path = ''
   as $$
   declare
-    supported constant text[] := array[
-      'type', 'properties', 'required', 'enum', 'const', 'items',
-      'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum',
-      'minLength', 'maxLength', 'minItems', 'maxItems', 'anyOf', 'format'
-    ];
+    supported constant text[] := gnomon.kind_profile_keywords();
     type_names constant text[] := array[
       'string', 'number', 'integer', 'boolean', 'null', 'array', 'object'
     ];
@@ -180,7 +187,14 @@ create function gnomon.compile_kind_schema(p_schema jsonb, p_subject text, p_at 
     -- longer counts cost about a millisecond per write at 1,000 characters,
     -- growing fast beyond it, so length bounds stop here.
     max_length_bound constant integer := 1000;
+    -- `items` states its element predicate twice, so each level of arrays
+    -- nested in arrays doubles the rule. These limits stop a schema from
+    -- making registration build an arbitrarily large rule. The length is
+    -- checked at every level, so no rule built here exceeds twice it.
+    max_depth constant integer := 32;
+    max_rule_length constant integer := 65536;
     s constant text := p_subject;
+    result text;
     checks text[] := '{}';
     k text;
     v jsonb;
@@ -193,16 +207,21 @@ create function gnomon.compile_kind_schema(p_schema jsonb, p_subject text, p_at 
       raise exception using errcode = 'GNK01',
         message = format('the schema at %s must be a JSON object', p_at);
     end if;
+    -- Every level of nesting adds at least one segment to the pointer, and
+    -- an escaped key holds no '/'.
+    if length(p_at) - length(replace(p_at, '/', '')) > 2 * max_depth then
+      raise exception using errcode = 'GNK01',
+        message = format(
+          'the schema at %s nests deeper than the profile allows (%s levels)', p_at, max_depth);
+    end if;
 
     for k in select jsonb_object_keys(p_schema) order by 1 loop
       if not k = any(supported) then
         raise exception using errcode = 'GNK01',
           message = format(
-            'unsupported JSON Schema keyword "%s" at %s; a Kind''s properties may use only '
-            'type, properties, required, enum, const, items, minimum, maximum, '
-            'exclusiveMinimum, exclusiveMaximum, minLength, maxLength, minItems, maxItems, '
-            'anyOf, and format (date, date-time or uuid)',
-            k, p_at);
+            'unsupported JSON Schema keyword "%s" at %s; a Kind''s properties may use only %s, '
+            'with format limited to date, date-time and uuid',
+            k, p_at, array_to_string(supported, ', '));
       end if;
     end loop;
 
@@ -213,11 +232,12 @@ create function gnomon.compile_kind_schema(p_schema jsonb, p_subject text, p_at 
         parts := array[v #>> '{}'];
       elsif jsonb_typeof(v) = 'array' and jsonb_array_length(v) > 0
         and not exists (select from jsonb_array_elements(v) x where jsonb_typeof(x) <> 'string')
+        and (select count(distinct x) = count(*) from jsonb_array_elements(v) x)
       then
         parts := array(select jsonb_array_elements_text(v));
       else
         raise exception using errcode = 'GNK01',
-          message = format('"type" at %s must be a type name or a non-empty list of them', p_at);
+          message = format('"type" at %s must be a type name or a non-empty list of distinct ones', p_at);
       end if;
       foreach k in array parts loop
         if not k = any(type_names) then
@@ -251,7 +271,7 @@ create function gnomon.compile_kind_schema(p_schema jsonb, p_subject text, p_at 
           gnomon.compile_kind_schema(
             e,
             s || '.' || to_jsonb(k)::text,
-            p_at || '/properties/' || replace(replace(k, '~', '~0'), '/', '~1')
+            p_at || '/properties/' || gnomon.json_pointer_token(k)
           )
         );
       end loop;
@@ -428,7 +448,14 @@ create function gnomon.compile_kind_schema(p_schema jsonb, p_subject text, p_at 
     if cardinality(checks) = 0 then
       return '(1 == 1)';
     end if;
-    return array_to_string(checks, ' && ');
+    result := array_to_string(checks, ' && ');
+    if length(result) > max_rule_length then
+      raise exception using errcode = 'GNK01',
+        message = format(
+          'the schema at %s compiles to a rule longer than %s characters; nest fewer arrays in arrays',
+          coalesce(nullif(p_at, ''), 'the top level'), max_rule_length);
+    end if;
+    return result;
   end
   $$;
 
@@ -447,7 +474,7 @@ create function gnomon.compile_kind_property(p_schema jsonb, p_at text)
 -- Registers a Kind in the caller's Tenant.
 --
 --   p_kind_of       'node' or 'edge'
---   p_parent        the parent Kind, or null for the root Kind of that sort
+--   p_parent        the parent Kind, or null for the root Kind of p_kind_of
 --   p_properties    {"type": "object", "properties": {...}, "required": [...]}
 --                   in the JSON Schema profile; every key is optional
 --   p_search        the properties this Kind adds to Search; it also inherits
@@ -491,6 +518,7 @@ create function gnomon.register_kind(
     target_kinds text[];
     def jsonb;
     existing jsonb;
+    rules jsonb;
     k text;
   begin
     if p_tenant_id is null or p_tenant_id is distinct from gnomon.tenant_id() then
@@ -513,7 +541,7 @@ create function gnomon.register_kind(
         message = format('a Kind is of node or of edge, not %s', coalesce(quote_literal(p_kind_of), 'null'));
     end if;
 
-    -- The parent: the root Kind of the sort, or a registered Kind.
+    -- The parent: a root Kind, or a registered Kind.
     parent_name := coalesce(p_parent, p_kind_of);
     if exists (select from gnomon.root_kinds() r where r.name = parent_name) then
       select r.kind_of, r.search, r.source_kinds, r.target_kinds
@@ -548,9 +576,7 @@ create function gnomon.register_kind(
     end if;
     for k in select jsonb_object_keys(p_properties) order by 1 loop
       if k not in ('type', 'properties', 'required') then
-        if k in ('enum', 'const', 'items', 'minimum', 'maximum', 'exclusiveMinimum',
-                 'exclusiveMaximum', 'minLength', 'maxLength', 'minItems', 'maxItems',
-                 'anyOf', 'format') then
+        if k = any(gnomon.kind_profile_keywords()) then
           raise exception using errcode = 'GNK01',
             message = format(
               '"%s" cannot apply to a whole Kind; the top level of a Kind''s properties '
@@ -592,9 +618,10 @@ create function gnomon.register_kind(
     req := coalesce(p_properties -> 'required', '[]');
     if jsonb_typeof(req) <> 'array'
       or exists (select from jsonb_array_elements(req) x where jsonb_typeof(x) <> 'string')
+      or (select count(distinct x) <> count(*) from jsonb_array_elements(req) x)
     then
       raise exception using errcode = 'GNK01',
-        message = '"required" at the top level must be a list of property names';
+        message = '"required" at the top level must be a list of distinct property names';
     end if;
     for k in select jsonb_array_elements_text(req) loop
       if not props ? k then
@@ -638,9 +665,15 @@ create function gnomon.register_kind(
     end if;
 
     -- Compile every property before writing anything, so a refused Kind
-    -- leaves no row.
-    perform gnomon.compile_kind_property(e.value, '/properties/' || replace(replace(e.key, '~', '~0'), '/', '~1'))
-      from jsonb_each(own) e;
+    -- leaves no row. The inherited properties compiled when the parent
+    -- registered, and compile again to the same rules.
+    rules := coalesce((
+      select jsonb_object_agg(
+        e.key,
+        gnomon.compile_kind_property(e.value, '/properties/' || gnomon.json_pointer_token(e.key))::text
+      )
+      from jsonb_each(props) e
+    ), '{}');
 
     def := jsonb_build_object(
       'kind_of', p_kind_of,
@@ -672,10 +705,8 @@ create function gnomon.register_kind(
     end if;
 
     insert into gnomon.kind_rule (tenant_id, kind, property, rule)
-      select p_tenant_id, p_name, e.key,
-             gnomon.compile_kind_property(
-               e.value, '/properties/' || replace(replace(e.key, '~', '~0'), '/', '~1'))
-      from jsonb_each(props) e;
+      select p_tenant_id, p_name, r.key, r.value::jsonpath
+      from jsonb_each_text(rules) r;
   end
   $$;
 
@@ -753,42 +784,82 @@ create function gnomon.read_kind(p_tenant_id uuid, p_name text)
     where k.tenant_id = p_tenant_id and k.name = p_name
   $$;
 
--- Hand Kind registration to the definer role. Owning a function in a schema
--- needs CREATE on it, which the role holds only for this step.
-grant create on schema gnomon to gnomon_definer;
-alter function gnomon.register_kind(uuid, text, text, text, jsonb, text[], text[], text[])
-  owner to gnomon_definer;
-revoke create on schema gnomon from gnomon_definer;
+-- Grants. First every grant a default privilege made on this migration's
+-- objects is revoked, so each object holds only the grants below.
+do $$
+declare
+  g record;
+begin
+  for g in
+    select format('function %s', p.oid::regprocedure) as object, a.grantee
+    from pg_proc p, aclexplode(p.proacl) a
+    where p.oid in (
+      'gnomon.kind_profile_keywords()'::regprocedure,
+      'gnomon.json_pointer_token(text)'::regprocedure,
+      'gnomon.root_kinds()'::regprocedure,
+      'gnomon.compile_kind_schema(jsonb, text, text)'::regprocedure,
+      'gnomon.compile_kind_property(jsonb, text)'::regprocedure,
+      'gnomon.kind_endpoints(uuid, text[], text[], text)'::regprocedure,
+      'gnomon.read_kind(uuid, text)'::regprocedure,
+      'gnomon.register_kind(uuid, text, text, text, jsonb, text[], text[], text[])'::regprocedure
+    ) and a.grantee <> p.proowner
+    union
+    select format('table %s', c.oid::regclass), a.grantee
+    from pg_class c, aclexplode(c.relacl) a
+    where c.oid in ('gnomon.kind'::regclass, 'gnomon.kind_rule'::regclass)
+      and a.grantee <> c.relowner
+  loop
+    execute format(
+      'revoke all on %s from %s', g.object,
+      case when g.grantee = 0 then 'public' else g.grantee::regrole::text end);
+  end loop;
+  -- A function is executable by PUBLIC unless revoked, with no ACL entry
+  -- until then.
+  revoke all on function gnomon.kind_profile_keywords() from public;
+  revoke all on function gnomon.json_pointer_token(text) from public;
+  revoke all on function gnomon.root_kinds() from public;
+  revoke all on function gnomon.compile_kind_schema(jsonb, text, text) from public;
+  revoke all on function gnomon.compile_kind_property(jsonb, text) from public;
+  revoke all on function gnomon.kind_endpoints(uuid, text[], text[], text) from public;
+  revoke all on function gnomon.read_kind(uuid, text) from public;
+  revoke all on function gnomon.register_kind(uuid, text, text, text, jsonb, text[], text[], text[])
+    from public;
+end
+$$;
 
--- Grants. Callers read Kinds. Kind registration is granted to no one here:
--- every grant a default privilege made is revoked, and each deployment
--- grants EXECUTE to the roles it chooses.
-revoke all on function gnomon.root_kinds() from public;
-revoke all on function gnomon.compile_kind_schema(jsonb, text, text) from public;
-revoke all on function gnomon.compile_kind_property(jsonb, text) from public;
-revoke all on function gnomon.kind_endpoints(uuid, text[], text[], text) from public;
-revoke all on function gnomon.read_kind(uuid, text) from public;
+-- Hand Kind registration to the definer role, after its grants are revoked:
+-- the migration role may revoke them only while it owns the function.
+-- Owning a function needs SET ROLE on the new owner, which a CREATEROLE
+-- migration role may grant itself on a role it created. The owner also needs
+-- CREATE on the schema. Both are held only for this step.
+do $$
+declare
+  joined boolean := not pg_has_role(current_user, 'gnomon_definer', 'SET');
+begin
+  if joined then
+    execute format('grant gnomon_definer to %I', current_user);
+  end if;
+  grant create on schema gnomon to gnomon_definer;
+  alter function gnomon.register_kind(uuid, text, text, text, jsonb, text[], text[], text[])
+    owner to gnomon_definer;
+  revoke create on schema gnomon from gnomon_definer;
+  if joined then
+    execute format('revoke gnomon_definer from %I', current_user);
+  end if;
+end
+$$;
+
+-- Callers read Kinds and never write them. Only Kind registration writes
+-- them, as gnomon_definer. Kind registration itself is granted to no one
+-- here: each deployment grants EXECUTE to the roles it chooses.
+grant select on gnomon.kind, gnomon.kind_rule to authenticated, gnomon_worker;
+grant select, insert on gnomon.kind, gnomon.kind_rule to gnomon_definer;
 grant execute on function gnomon.root_kinds() to authenticated, gnomon_worker, gnomon_definer;
+grant execute on function gnomon.read_kind(uuid, text) to authenticated, gnomon_worker;
+grant execute on function gnomon.kind_profile_keywords() to gnomon_definer;
+grant execute on function gnomon.json_pointer_token(text) to gnomon_definer;
 grant execute on function gnomon.compile_kind_schema(jsonb, text, text) to gnomon_definer;
 grant execute on function gnomon.compile_kind_property(jsonb, text) to gnomon_definer;
 grant execute on function gnomon.kind_endpoints(uuid, text[], text[], text) to gnomon_definer;
-grant execute on function gnomon.read_kind(uuid, text) to authenticated, gnomon_worker;
-
-do $$
-declare
-  f constant regprocedure :=
-    'gnomon.register_kind(uuid, text, text, text, jsonb, text[], text[], text[])'::regprocedure;
-  g record;
-begin
-  execute format('revoke all on function %s from public', f);
-  for g in
-    select distinct a.grantee::regrole::text as grantee
-    from pg_proc p, aclexplode(p.proacl) a
-    where p.oid = f and a.grantee <> p.proowner and a.grantee <> 0
-  loop
-    execute format('revoke all on function %s from %s', f, g.grantee);
-  end loop;
-end
-$$;
 
 insert into gnomon.schema_version (version, name) values (3, '0003_kinds');

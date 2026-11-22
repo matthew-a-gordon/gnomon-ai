@@ -34,6 +34,27 @@ pub use server::Server;
 pub const LOGIN_ROLE: &str = "gnomon_test_login";
 const LOGIN_PASSWORD: &str = "gnomon-test-login";
 
+/// A new Tenant, unknown to every other test.
+pub fn tenant() -> gnomon::TenantId {
+    gnomon::TenantId(uuid::Uuid::new_v4())
+}
+
+/// Verified JWT claims for an end user, in the shape the reference
+/// `gnomon.tenant_id()` and `gnomon.allowed_scopes()` read.
+pub fn user(
+    tenant: gnomon::TenantId,
+    scopes: &[&str],
+) -> serde_json::Map<String, serde_json::Value> {
+    match serde_json::json!({
+        "sub": uuid::Uuid::new_v4().to_string(),
+        "role": "authenticated",
+        "app_metadata": { "tenant_id": tenant.to_string(), "scopes": scopes },
+    }) {
+        serde_json::Value::Object(m) => m,
+        _ => unreachable!(),
+    }
+}
+
 /// Kind registration's signature, as grants and `regprocedure` name it.
 pub const REGISTER_KIND: &str =
     "gnomon.register_kind(uuid, text, text, text, jsonb, text[], text[], text[])";

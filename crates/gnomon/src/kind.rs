@@ -33,6 +33,16 @@ pub enum KindOf {
     },
 }
 
+impl KindOf {
+    /// The value of `kind_of` in the Store's SQL.
+    pub(crate) fn sql_name(&self) -> &'static str {
+        match self {
+            KindOf::Node => "node",
+            KindOf::Edge { .. } => "edge",
+        }
+    }
+}
+
 /// A Kind to register in one Tenant's Ontology.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewKind {
@@ -41,18 +51,17 @@ pub struct NewKind {
     /// and `edge` are the root Kinds and cannot be registered.
     pub name: String,
     pub of: KindOf,
-    /// The Kind this one specializes, of the same sort. `None` is the root
-    /// Kind, [`ROOT_NODE_KIND`] or [`ROOT_EDGE_KIND`].
+    /// The Kind this one specializes, a Kind of Node for a Kind of Node and
+    /// of Edge for a Kind of Edge. `None` is the root Kind, [`ROOT_NODE_KIND`]
+    /// or [`ROOT_EDGE_KIND`].
     pub parent: Option<String>,
     /// The Kind's own properties, as a JSON Schema object:
     /// `{"type": "object", "properties": {...}, "required": [...]}`.
     ///
-    /// Each property's schema may use only `type`, `properties`, `required`,
-    /// `enum`, `const`, `items`, `minimum`, `maximum`, `exclusiveMinimum`,
-    /// `exclusiveMaximum`, `minLength`, `maxLength`, `minItems`, `maxItems`,
-    /// `anyOf`, and `format` limited to `date`, `date-time` and `uuid`.
-    /// Registration refuses any other keyword. A child Kind cannot declare a
-    /// property its ancestors declare.
+    /// Each property's schema uses the JSON Schema profile of ADR-0002, and
+    /// registration refuses any keyword outside it with
+    /// [`Error::InvalidKind`](crate::Error::InvalidKind). A child Kind cannot
+    /// declare a property its ancestors declare.
     pub properties: Value,
     /// The properties this Kind adds to Search. It also inherits every mark
     /// of its ancestors: Node Kinds search the name and Aliases, and Edge
