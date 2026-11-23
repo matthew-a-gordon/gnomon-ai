@@ -676,6 +676,7 @@ pub async fn assert_no_residue(admin: &Client, residue: &Residue<'_>) {
             );
         }
     }
+    assert_no_unused_full_vector(admin).await;
     let gone = [residue.versions, residue.recomputed].concat();
     for table in tables_derived_from_version_text(admin).await {
         if table == SEARCH_TOKEN {
@@ -695,6 +696,43 @@ pub async fn assert_no_residue(admin: &Client, residue: &Residue<'_>) {
             "gnomon.{table} still holds rows of erased or recomputed Versions"
         );
     }
+}
+
+/// The full vectors of vector Search (migration 0017), each the embedding of
+/// one text of a Scope. A row names no Version, so an Erasure that deletes
+/// one leaves no ID behind in the row's text; [`assert_no_unused_full_vector`]
+/// checks it instead.
+pub const FULL_VECTORS: &str = "embedding";
+
+/// Checks, past RLS, that every full vector left is of a text some row of
+/// its Scope still uses: a quantized row of a Version, a Version's text, or a
+/// Sentence. A full vector of erased text has none of them, unless a
+/// surviving Version or Sentence holds the same text.
+pub async fn assert_no_unused_full_vector(admin: &Client) {
+    let unused: Vec<String> = admin
+        .query_typed(
+            "select format('%s %s', e.scope, e.text_hash) from gnomon.embedding e
+             where not exists (select from gnomon.embedding_bit b
+                               where b.tenant_id = e.tenant_id and b.scope = e.scope
+                                 and b.text_hash = e.text_hash)
+               and not exists (select from gnomon.version v
+                               where v.tenant_id = e.tenant_id and v.scope = e.scope
+                                 and v.text_hash = e.text_hash)
+               and not exists (select from gnomon.sentence s
+                               where s.tenant_id = e.tenant_id and s.scope = e.scope
+                                 and gnomon.sentence_text_hash(s.sentence) = e.text_hash)
+             order by 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert!(
+        unused.is_empty(),
+        "gnomon.embedding holds full vectors of text no row uses: {unused:?}"
+    );
 }
 
 /// The token table of full-text Search (migration 0016), whose rows the
@@ -794,14 +832,18 @@ pub async fn assert_search_counts_match_the_token_rows(admin: &Client) {
 }
 
 /// Every row of every gnomon table, read past RLS, as text, but for the two
-/// tables no Erasure touches and the BM25 counts, which
-/// [`assert_only_removed`] checks against the token rows instead.
+/// tables no Erasure touches, the BM25 counts, which [`assert_only_removed`]
+/// checks against the token rows instead, and the full vectors, which it
+/// checks with [`assert_no_unused_full_vector`].
 pub async fn every_row(admin: &Client) -> Vec<String> {
     let tables: Vec<String> = gnomon_tables(admin)
         .await
         .into_iter()
         .filter(|t| {
-            t != "schema_version" && t != "tenancy" && !BM25_COUNT_TABLES.contains(&t.as_str())
+            t != "schema_version"
+                && t != "tenancy"
+                && t != FULL_VECTORS
+                && !BM25_COUNT_TABLES.contains(&t.as_str())
         })
         .collect();
     rows_of(admin, &tables).await
@@ -809,10 +851,11 @@ pub async fn every_row(admin: &Client) -> Vec<String> {
 
 /// Checks that an Erasure removed exactly the rows that name one of `ids` in
 /// their text, from `before`, a read of [`every_row`] taken before it, and
-/// changed nothing else, and that the BM25 counts went down with the token
-/// rows it removed.
+/// changed nothing else, that the BM25 counts went down with the token rows
+/// it removed, and that it left no full vector of text no row uses.
 pub async fn assert_only_removed(admin: &Client, before: &[String], ids: &[Uuid]) {
     assert_search_counts_match_the_token_rows(admin).await;
+    assert_no_unused_full_vector(admin).await;
     let needles: Vec<String> = ids.iter().map(Uuid::to_string).collect();
     let kept: Vec<String> = before
         .iter()

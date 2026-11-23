@@ -25,6 +25,7 @@ pub mod alembic;
 pub mod erasure;
 pub mod server;
 pub mod tls;
+pub mod vectors;
 pub mod wire;
 
 use std::collections::hash_map::DefaultHasher;

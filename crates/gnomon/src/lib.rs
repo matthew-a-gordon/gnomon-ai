@@ -34,7 +34,7 @@ pub use node::{
     EpisodeRetraction, NewNode, NodeId, NodeVersion, Patch, Precision, Retraction, Statement,
     StatementKind, ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
-pub use search::{FullTextCandidate, Versioned};
+pub use search::{FullTextCandidate, VectorCandidate, Versioned};
 pub use stage::{StageError, StageOutcome, StageRecord, StageStatus, StageUsage, StageWrite};
 pub use store::{Caller, Store};
 pub use vacuum::{VacuumMode, VacuumReport};

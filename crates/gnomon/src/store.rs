@@ -41,7 +41,8 @@ use crate::{
     FullTextCandidate, GraphErasure, Kind, KindOf, MergeRule, NewEdge, NewEpisode, NewKind,
     NewNode, NodeId, NodeVersion, Patch, Precision, Retraction, Scope, StageError, StageOutcome,
     StageRecord, StageStatus, StageUsage, StageWrite, StatementKind, Step, TenantId, Traversal,
-    VacuumMode, VacuumReport, ValidTime, VersionId, Versioned, WriteOutcome, WriteStatus,
+    VacuumMode, VacuumReport, ValidTime, VectorCandidate, VersionId, Versioned, WriteOutcome,
+    WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -1110,6 +1111,101 @@ impl Caller<'_> {
                 },
                 scope: Scope::new(r.get::<_, String>(3)),
                 score: r.get(4),
+                rank: r.get(5),
+            })
+            .collect())
+    }
+
+    /// Stores the embedding of a Version's text, after the write that opened
+    /// the Version committed (ADR-0010). `text_hash` names the text that was
+    /// embedded: the Version's [`text_hash`](NodeVersion::text_hash), or, for
+    /// an Edge Version, the hash of its Sentence, which SQL's
+    /// `gnomon.sentence_text_hash` gives. Versions with the same text in a
+    /// Scope share one full vector: when one is stored already it stays, and
+    /// `embedding` is not used, so a Refinement needs no new embedding. Each
+    /// Version gets its own quantized row. Storing a Version's embedding again
+    /// with another of its texts moves it to that text.
+    ///
+    /// An `embedding` of another length than the exported dimension, of
+    /// length zero, or holding a number that is not finite fails with
+    /// [`Error::Database`] and SQLSTATE 22023. A Version the caller cannot
+    /// see, or a hash of neither of its texts, fails with
+    /// [`Error::InvalidWrite`].
+    pub async fn store_embedding(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        version: VersionId,
+        text_hash: &str,
+        embedding: &[f32],
+    ) -> Result<(), Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        self.store
+            .statements
+            .query(
+                &tx,
+                "select gnomon.store_embedding($1, $2, $3, $4)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&version.0, Type::UUID),
+                    (&text_hash, Type::TEXT),
+                    (&embedding, Type::FLOAT4_ARRAY),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        tx.commit().await.map_err(Error::from_store)?;
+        Ok(())
+    }
+
+    /// The vector branch of Search (ADR-0010): the Versions whose stored
+    /// embeddings are nearest `query` by cosine distance, As-of `as_of`,
+    /// nearest first, at most `limit` of them. The search is exact over the
+    /// Versions the caller can see, whatever the size of its Tenant and
+    /// Scopes: the 400 nearest by the quantized embeddings, or `limit` when it
+    /// is larger, are re-ranked at full precision. A Version whose embedding
+    /// is not stored yet is not found here; the full-text branch finds it.
+    ///
+    /// A `limit` below 1, or a `query` that [`store_embedding`]
+    /// (Self::store_embedding) would refuse, fails with
+    /// [`Error::Database`] and SQLSTATE 22023.
+    pub async fn search_vector(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        query: &[f32],
+        as_of: AsOf,
+        limit: i32,
+    ) -> Result<Vec<VectorCandidate>, Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
+                "select version_id, node_id, edge_id, scope, distance, rank
+                 from gnomon.search_vector($1, $2, $3, $4, $5)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&query, Type::FLOAT4_ARRAY),
+                    (&as_of.valid_at, Type::TIMESTAMPTZ),
+                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&limit, Type::INT4),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|r| VectorCandidate {
+                version: VersionId(r.get(0)),
+                of: match r.get::<_, Option<uuid::Uuid>>(1) {
+                    Some(node) => Versioned::Node(NodeId(node)),
+                    None => Versioned::Edge(EdgeId(r.get(2))),
+                },
+                scope: Scope::new(r.get::<_, String>(3)),
+                distance: r.get(4),
                 rank: r.get(5),
             })
             .collect())

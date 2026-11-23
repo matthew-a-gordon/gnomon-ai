@@ -2027,6 +2027,25 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         "Ada knows herself.",
     )
     .await;
+    // An embedding of the Node's current Version (ADR-0010).
+    let current = single
+        .read_node(
+            None,
+            node,
+            gnomon::AsOf::current(Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    single
+        .store_embedding(
+            None,
+            current.id,
+            &current.text_hash,
+            &support::vectors::Rng::new(1).unit(),
+        )
+        .await
+        .unwrap();
     let tables = tenant_tables(&operator).await;
     for expected in [
         "citation",
@@ -2044,6 +2063,8 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         "stage_record",
         "stage_usage",
         "statement",
+        "embedding",
+        "embedding_bit",
     ] {
         assert!(
             tables.iter().any(|t| t == expected),
@@ -5869,4 +5890,475 @@ async fn the_search_index_function_is_a_definer_no_role_may_execute_and_callers_
             assert_eq!(privileges, expected, "{role} on gnomon.{table}");
         }
     }
+}
+
+/// The full vectors and quantized rows of vector Search (ADR-0010,
+/// migration 0017).
+const EMBEDDING_TABLES: &[&str] = &["embedding", "embedding_bit"];
+
+/// `searchable_world()` with an embedding stored for every Version, as each
+/// Scope's worker, and a Node named "twin" in Tenant 1's `support` and
+/// `billing` Scopes, whose Versions have the same text. Only billing's twin
+/// is embedded.
+struct EmbeddedWorld {
+    w: World,
+    support_twin: Uuid,
+    billing_twin: Uuid,
+    twin_hash: String,
+    /// A Version of Tenant 1's `support` with an embedding, and its hash.
+    support_version: Uuid,
+    support_hash: String,
+}
+
+async fn embedded_world() -> EmbeddedWorld {
+    let w = searchable_world().await;
+    let store = Store::connect(&w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let mut rng = support::vectors::Rng::new(18);
+    let admin = w.db.admin().await;
+    for row in admin
+        .query_typed(
+            "select tenant_id, scope, id, text_hash from gnomon.version",
+            &[],
+        )
+        .await
+        .unwrap()
+    {
+        let (tenant, scope, id, hash): (Uuid, String, Uuid, String) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
+        store
+            .as_worker(TenantId(tenant), Scope::new(scope))
+            .store_embedding(TenantId(tenant), gnomon::VersionId(id), &hash, &rng.unit())
+            .await
+            .unwrap();
+    }
+    let support_row = admin
+        .query_typed(
+            "select id, text_hash from gnomon.version where tenant_id = $1 and scope = 'support'",
+            &[(&w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    let mut twins = Vec::new();
+    for (scope, episode) in [("support", w.t1_support), ("billing", w.t1_billing)] {
+        let caller = store.as_worker(TenantId(w.t1), Scope::new(scope));
+        let (node, _) = caller
+            .create_node(
+                &gnomon::NewNode {
+                    tenant: Some(TenantId(w.t1)),
+                    scope: Scope::new(scope),
+                    kind: gnomon::ROOT_NODE_KIND.into(),
+                },
+                &gnomon::Patch::new(
+                    EpisodeId(episode),
+                    gnomon::ValidTime::UNKNOWN,
+                    support::erasure::values(json!({ "name": "twin" })),
+                ),
+            )
+            .await
+            .unwrap();
+        let version = caller
+            .read_node(
+                TenantId(w.t1),
+                node,
+                gnomon::AsOf::current(Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        twins.push((caller, version));
+    }
+    let (billing_caller, billing_twin) = twins.pop().unwrap();
+    let (_, support_twin) = twins.pop().unwrap();
+    assert_eq!(support_twin.text_hash, billing_twin.text_hash);
+    billing_caller
+        .store_embedding(
+            TenantId(w.t1),
+            billing_twin.id,
+            &billing_twin.text_hash,
+            &rng.unit(),
+        )
+        .await
+        .unwrap();
+    drop(billing_caller);
+    EmbeddedWorld {
+        support_twin: support_twin.id.0,
+        billing_twin: billing_twin.id.0,
+        twin_hash: support_twin.text_hash,
+        support_version: support_row[0].get(0),
+        support_hash: support_row[0].get(1),
+        w,
+    }
+}
+
+async fn embedding_rows(db: &TestDb) -> Vec<String> {
+    let tables: Vec<String> = EMBEDDING_TABLES.iter().map(|t| t.to_string()).collect();
+    support::erasure::rows_of(&db.admin().await, &tables).await
+}
+
+/// A unit vector of the exported dimension, as SQL text.
+fn sql_vector() -> String {
+    let v = support::vectors::Rng::new(5).unit();
+    format!(
+        "array[{}]::real[]",
+        v.iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+#[tokio::test]
+async fn a_caller_reads_only_its_own_tenants_and_scopes_embeddings() {
+    let ew = embedded_world().await;
+    let w = &ew.w;
+    let query = sql_vector();
+    for role in [USER, WORKER] {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        for table in EMBEDDING_TABLES {
+            let seen: Vec<(Uuid, String)> = tx
+                .query_typed(
+                    &format!("select distinct tenant_id, scope from gnomon.{table}"),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| (r.get(0), r.get(1)))
+                .collect();
+            assert_eq!(
+                seen,
+                vec![(w.t1, "support".to_owned())],
+                "{role} read gnomon.{table}"
+            );
+        }
+        // Search finds only the caller's own Scope, and nothing when it
+        // names the other Tenant.
+        let at = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
+        for (tenant, expected) in [(w.t1, vec!["support".to_owned()]), (w.t2, vec![])] {
+            let scopes: Vec<String> = tx
+                .query_typed(
+                    &format!(
+                        "select distinct scope from gnomon.search_vector($1, {query}, $2, null, 400)"
+                    ),
+                    &[(&tenant, Type::UUID), (&at, Type::TIMESTAMPTZ)],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            assert_eq!(scopes, expected, "{role} searched {tenant}");
+        }
+    }
+}
+
+/// Fails unless `result` is a refusal: a privilege or RLS refusal, the
+/// Store's refusal of an invalid write, or a foreign key.
+fn assert_refused_write(result: Result<impl std::fmt::Debug, tokio_postgres::Error>, what: &str) {
+    match result {
+        Err(e) => assert!(
+            [
+                SqlState::INSUFFICIENT_PRIVILEGE,
+                SqlState::from_code(gnomon::INVALID_WRITE),
+                SqlState::FOREIGN_KEY_VIOLATION,
+            ]
+            .iter()
+            .any(|c| e.code() == Some(c)),
+            "{what}: expected a refusal, got {e:?}"
+        ),
+        Ok(v) => panic!("{what} was allowed: {v:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_caller_cannot_write_an_embedding_of_another_tenant_or_scope_or_attach_another_scopes_text(
+) {
+    let ew = embedded_world().await;
+    let w = &ew.w;
+    let before = embedding_rows(&w.db).await;
+    let (t1, t2) = (w.t1, w.t2);
+    let (own, own_hash) = (ew.support_version, &ew.support_hash);
+    let (twin, billing_twin, twin_hash) = (ew.support_twin, ew.billing_twin, &ew.twin_hash);
+    let v = sql_vector();
+    let attempts = [
+        // A full vector or a quantized row in a Scope or Tenant the caller
+        // cannot see: RLS.
+        format!(
+            "insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
+             values ('{t1}', 'billing', '{own_hash}', gnomon.embedding_vector({v}))"
+        ),
+        format!(
+            "insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
+             values ('{t2}', 'support', '{own_hash}', gnomon.embedding_vector({v}))"
+        ),
+        format!(
+            "insert into gnomon.embedding_bit (tenant_id, scope, version_id, text_hash)
+             values ('{t1}', 'billing', '{billing_twin}', '{twin_hash}')"
+        ),
+        // The caller's own Version, attached to billing's full vector of the
+        // same text: no full vector of that text is in the caller's Scope,
+        // and the foreign key carries the Scope.
+        format!(
+            "insert into gnomon.embedding_bit (tenant_id, scope, version_id, text_hash)
+             values ('{t1}', 'support', '{twin}', '{twin_hash}')"
+        ),
+        // Billing's Version, in the caller's Scope.
+        format!(
+            "insert into gnomon.embedding_bit (tenant_id, scope, version_id, text_hash)
+             values ('{t1}', 'support', '{billing_twin}', '{twin_hash}')"
+        ),
+        // The same through the Store's function.
+        format!("select gnomon.store_embedding('{t1}', '{billing_twin}', '{twin_hash}', {v})"),
+        format!("select gnomon.store_embedding('{t2}', '{own}', '{own_hash}', {v})"),
+        // The caller's own Version moved to a text that is not its own.
+        format!(
+            "update gnomon.embedding_bit set text_hash = '{twin_hash}' where version_id = '{own}'"
+        ),
+        format!("select gnomon.store_embedding('{t1}', '{own}', '{twin_hash}', {v})"),
+        // What only the Store derives, and what only Erasure deletes.
+        format!(
+            "update gnomon.embedding_bit set recorded_to = 'infinity' where version_id = '{own}'"
+        ),
+        format!("update gnomon.embedding_bit set q = ~q where version_id = '{own}'"),
+        format!(
+            "update gnomon.embedding_bit set valid_from = '-infinity' where version_id = '{own}'"
+        ),
+        format!("update gnomon.embedding set embedding = gnomon.embedding_vector({v})"),
+        "delete from gnomon.embedding_bit".to_owned(),
+        "delete from gnomon.embedding".to_owned(),
+        "truncate gnomon.embedding_bit".to_owned(),
+    ];
+    for role in [USER, WORKER] {
+        for sql in &attempts {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+            assert_refused_write(tx.batch_execute(sql).await, &format!("{role}: {sql}"));
+        }
+        // A full vector of the caller's own Scope that no quantized row uses
+        // fails at commit, so none is stored for a text no Version has.
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        tx.batch_execute(&format!(
+            "insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
+             values ('{t1}', 'support', repeat('ab', 32), gnomon.embedding_vector({v}))"
+        ))
+        .await
+        .unwrap();
+        assert_refused_write(
+            tx.commit().await,
+            &format!("{role}: a full vector no row uses"),
+        );
+    }
+    assert_eq!(embedding_rows(&w.db).await, before);
+}
+
+#[tokio::test]
+async fn a_quantized_row_holds_what_the_store_derives_whatever_a_caller_inserts() {
+    let ew = embedded_world().await;
+    let w = &ew.w;
+    let (t1, twin, twin_hash) = (w.t1, ew.support_twin, &ew.twin_hash);
+    let v = sql_vector();
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(w.t1, &["support"])).await;
+    tx.batch_execute(&format!(
+        "insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
+         values ('{t1}', 'support', '{twin_hash}', gnomon.embedding_vector({v}));
+         insert into gnomon.embedding_bit (tenant_id, scope, version_id, text_hash, q,
+                                           valid_from, valid_to, recorded_from, recorded_to)
+         values ('{t1}', 'support', '{twin}', '{twin_hash}',
+                 ~(repeat('0', gnomon.embedding_dimension())::bit varying)::bit({d}),
+                 '2001-01-01', '2002-01-01', '2001-01-01', '2002-01-01')",
+        d = support::DEFAULT_DIMENSION
+    ))
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let admin = w.db.admin().await;
+    let pgvector: String = admin
+        .query_typed(
+            "select quote_ident(extnamespace::regnamespace::text) from pg_extension
+             where extname = 'vector'",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let derived = admin
+        .query_typed(
+            &format!(
+                "select b.q = {pgvector}.binary_quantize(e.embedding)::bit varying,
+                    (b.valid_from, b.valid_to, b.recorded_from, b.recorded_to)
+                      = (x.valid_from, x.valid_to, x.recorded_from, x.recorded_to)
+             from gnomon.embedding_bit b
+             join gnomon.embedding e using (tenant_id, scope, text_hash)
+             join gnomon.version x on x.tenant_id = b.tenant_id and x.id = b.version_id
+             where b.version_id = $1"
+            ),
+            &[(&twin, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    let (bits, times): (bool, bool) = (derived[0].get(0), derived[0].get(1));
+    assert!(bits, "the bits are those of the stored full vector");
+    assert!(times, "the time columns are the Version's");
+}
+
+#[tokio::test]
+async fn callers_hold_only_select_insert_and_a_text_hash_update_on_the_embedding_tables() {
+    let w = world().await;
+    let admin = w.db.admin().await;
+    for role in [USER, WORKER, support::LOGIN_ROLE, "gnomon_definer"] {
+        for table in EMBEDDING_TABLES {
+            let privileges: Vec<String> = admin
+                .query_typed(
+                    "select p from unnest(array['SELECT', 'INSERT', 'UPDATE', 'DELETE',
+                                              'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']) p
+                     where has_table_privilege($1, ('gnomon.' || $2)::regclass, p)
+                     union all
+                     select 'UPDATE (' || a.attname || ')'
+                     from pg_attribute a
+                     where a.attrelid = ('gnomon.' || $2)::regclass and a.attnum > 0
+                       and not a.attisdropped
+                       and has_column_privilege($1, a.attrelid, a.attnum, 'UPDATE')",
+                    &[(&role, Type::TEXT), (table, Type::TEXT)],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            let expected: Vec<&str> = match (role, *table) {
+                (r, _) if r == support::LOGIN_ROLE => vec![],
+                ("gnomon_definer", _) => vec!["SELECT", "DELETE"],
+                (_, "embedding") => vec!["SELECT", "INSERT"],
+                _ => vec!["SELECT", "INSERT", "UPDATE (text_hash)"],
+            };
+            assert_eq!(privileges, expected, "{role} on gnomon.{table}");
+        }
+    }
+    // The trigger functions and the Erasure policies' check run for no
+    // caller of their own.
+    for function in [
+        "gnomon.embedding_bit_derive()",
+        "gnomon.embedding_check_used()",
+        "gnomon.erasure_reaches_text(uuid, text, text)",
+    ] {
+        for role in [USER, WORKER] {
+            let may: bool = admin
+                .query_typed(
+                    "select has_function_privilege($1, $2, 'EXECUTE')",
+                    &[(&role, Type::TEXT), (&function, Type::TEXT)],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+            assert!(!may, "{role} may execute {function}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_callers_search_path()
+{
+    // A deployment whose pgvector lives in a schema the caller roles cannot
+    // reach, as Supabase keeps it in `extensions`, before the migrations.
+    // The schema belongs to the role that applies the migrations, so the
+    // migration can grant the caller roles USAGE on it.
+    let db = TestDb::empty_with_login().await;
+    let operator = db.operator().await;
+    let migrator: String = operator
+        .query_typed("select current_user::text", &[])
+        .await
+        .unwrap()[0]
+        .get(0);
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "create schema vecs authorization {}; revoke all on schema vecs from public;
+             create extension vector with schema vecs",
+            support::quote_ident(&migrator)
+        ))
+        .await
+        .unwrap();
+    for (file, sql) in support::exported(support::DEFAULT_DIMENSION) {
+        operator
+            .batch_execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("apply {file}: {e:?}"));
+    }
+    let store = Store::connect(&db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let t = TenantId(Uuid::new_v4());
+    let caller = store.as_worker(t, Scope::new("support"));
+    let episode = caller
+        .record_episode(&NewEpisode {
+            tenant: Some(t),
+            scope: Scope::new("support"),
+            content: "an Episode".into(),
+            reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            authority: None,
+        })
+        .await
+        .unwrap();
+    let (node, _) = caller
+        .create_node(
+            &gnomon::NewNode {
+                tenant: Some(t),
+                scope: Scope::new("support"),
+                kind: gnomon::ROOT_NODE_KIND.into(),
+            },
+            &gnomon::Patch::new(
+                episode,
+                gnomon::ValidTime::UNKNOWN,
+                support::erasure::values(json!({ "name": "Ada" })),
+            ),
+        )
+        .await
+        .unwrap();
+    let as_of = gnomon::AsOf::current(Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap());
+    let version = caller.read_node(t, node, as_of).await.unwrap().unwrap();
+    let embedding = support::vectors::Rng::new(1).unit();
+    caller
+        .store_embedding(t, version.id, &version.text_hash, &embedding)
+        .await
+        .unwrap();
+    let found = caller.search_vector(t, &embedding, as_of, 5).await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].version, version.id);
+
+    // A caller whose own search path leads to a schema of look-alikes
+    // reaches the same functions: every name the functions use is qualified.
+    let mut client = db.login().await;
+    let tx = as_caller(
+        &mut client,
+        WORKER,
+        &json!({ "role": "gnomon_worker", "app_metadata": { "tenant_id": t.0.to_string(), "scopes": ["support"] } })
+            .to_string(),
+    )
+    .await;
+    tx.batch_execute(
+        "create function pg_temp.binary_quantize(real[]) returns bit language sql as $$ select B'1' $$;
+         set local search_path = pg_temp, public",
+    )
+    .await
+    .unwrap();
+    let ids: Vec<Uuid> = tx
+        .query_typed(
+            "select version_id from gnomon.search_vector($1, $2, $3, null, 5)",
+            &[
+                (&t.0, Type::UUID),
+                (&embedding, Type::FLOAT4_ARRAY),
+                (&as_of.valid_at, Type::TIMESTAMPTZ),
+            ],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(ids, vec![version.id.0]);
 }

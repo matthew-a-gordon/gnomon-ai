@@ -25,6 +25,33 @@ use uuid::Uuid;
 /// find any copy of it.
 const MARKER: &str = "erased-7f3a";
 
+/// Stores an embedding of the values of every Version of the worker's
+/// Scope, current and closed, one vector per text.
+async fn embed_every_version(w: &World) {
+    let rows =
+        w.db.admin()
+            .await
+            .query_typed(
+                "select id, text_hash from gnomon.version where scope = $1",
+                &[(&SCOPE, Type::TEXT)],
+            )
+            .await
+            .unwrap();
+    let mut rng = support::vectors::Rng::new(3);
+    let mut vectors = std::collections::HashMap::new();
+    for r in rows {
+        let (id, hash): (Uuid, String) = (r.get(0), r.get(1));
+        let v = vectors
+            .entry(hash.clone())
+            .or_insert_with(|| rng.unit())
+            .clone();
+        w.caller()
+            .store_embedding(w.tenant, gnomon::VersionId(id), &hash, &v)
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value_only_it_supplied()
 {
@@ -155,6 +182,35 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
     w.write_stage_records(SCOPE, e, &format!("{MARKER}-model"))
         .await;
     let f_stages = w.write_stage_records(SCOPE, f, "claude-sonnet-5-5").await;
+    // Embeddings the Pipeline would have stored (ADR-0010): one of every
+    // Version's values, current and closed, and one of the Sentence of the
+    // Version derived from E alone and of the one F alone gave the shared
+    // Edge, each moving that Version's embedding to its Sentence.
+    embed_every_version(&w).await;
+    for (version, sentence) in [
+        (e_only_version, format!("{MARKER}: b owns 7% of Acme")),
+        (shared_first, "a holds forty percent of Acme".to_owned()),
+    ] {
+        let hash: String =
+            w.db.admin()
+                .await
+                .query_typed(
+                    "select gnomon.sentence_text_hash($1)",
+                    &[(&sentence, Type::TEXT)],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+        w.caller()
+            .store_embedding(
+                w.tenant,
+                version,
+                &hash,
+                &support::vectors::Rng::new(9).unit(),
+            )
+            .await
+            .unwrap();
+    }
     // Last, E is retracted, which marks it and retracts what only it cites.
     w.caller().retract_episode(w.tenant, e).await.unwrap();
 
@@ -258,6 +314,13 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
     let derived = tables_derived_from_version_text(&admin).await;
     assert!(derived.iter().any(|t| t == "sentence"), "{derived:?}");
     assert!(derived.iter().any(|t| t == "search_token"), "{derived:?}");
+    assert!(derived.iter().any(|t| t == "embedding_bit"), "{derived:?}");
+    let full_vectors: i64 = admin
+        .query_typed("select count(*) from gnomon.embedding", &[])
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert!(full_vectors > 0, "the Versions E never touched keep theirs");
     support::erasure::assert_search_counts_match_the_token_rows(&admin).await;
     assert_eq!(
         w.sentence_of(untouched_version).await.as_deref(),

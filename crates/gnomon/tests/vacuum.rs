@@ -25,13 +25,15 @@ use tokio_postgres::Client;
 const MARKER: &str = "vacuumed-7f3e";
 
 /// The tables an Erasure deletes from or rewrites today: those migration
-/// 0013's header lists, and the token table and BM25 counts of migration
-/// 0016.
+/// 0013's header lists, the token table and BM25 counts of migration 0016,
+/// and the full and quantized embeddings of migration 0017.
 const ERASED_TABLES: &[&str] = &[
     "gnomon.bound_statement",
     "gnomon.citation",
     "gnomon.contribution",
     "gnomon.edge",
+    "gnomon.embedding",
+    "gnomon.embedding_bit",
     "gnomon.episode",
     "gnomon.episode_retraction",
     "gnomon.erasure_reach",
@@ -145,6 +147,28 @@ async fn an_episode_written_everywhere(w: &World) -> gnomon::EpisodeId {
         .unwrap();
     w.write_stage_records(SCOPE, e, &format!("{MARKER}-model"))
         .await;
+    // The embedding of every Version's values (ADR-0010).
+    let mut rng = support::vectors::Rng::new(13);
+    for row in
+        w.db.admin()
+            .await
+            .query_typed(
+                "select id, text_hash from gnomon.version where scope = $1",
+                &[(&SCOPE, tokio_postgres::types::Type::TEXT)],
+            )
+            .await
+            .unwrap()
+    {
+        w.caller()
+            .store_embedding(
+                w.tenant,
+                gnomon::VersionId(row.get(0)),
+                row.get(1),
+                &rng.unit(),
+            )
+            .await
+            .unwrap();
+    }
     e
 }
 
