@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gnomon::{Bound, BoundSide, BoundStatement, EndOfValidity, Precision, VacuumMode, ValidTime};
 use serde_json::json;
-use support::erasure::{at, gnomon_tables, World};
+use support::erasure::{at, gnomon_tables, World, SCOPE};
 use tokio_postgres::types::Type;
 use tokio_postgres::Client;
 
@@ -36,9 +36,15 @@ const ERASED_TABLES: &[&str] = &[
     "gnomon.erasure_reach",
     "gnomon.node",
     "gnomon.sentence",
+    "gnomon.stage_record",
+    "gnomon.stage_usage",
     "gnomon.statement",
     "gnomon.version",
 ];
+
+/// The stage tables (migration 0014), which Erase Episode deletes the
+/// Episode's rows from.
+const STAGE_TABLES: &[&str] = &["gnomon.stage_record", "gnomon.stage_usage"];
 
 /// Turns autovacuum off on every gnomon table of this database and installs
 /// `pgstattuple`, so a test sees the dead tuples an Erasure leaves until the
@@ -75,9 +81,9 @@ async fn dead_tuples(admin: &Client, tables: &[String]) -> BTreeMap<String, i64>
     out
 }
 
-/// An Episode that states a plan, ends it, bounds a Version and writes an
-/// Edge with a Sentence, beside another Episode whose values stay. Returns
-/// the Episode to erase.
+/// An Episode that states a plan, ends it, bounds a Version, writes an Edge
+/// with a Sentence and has stage records with usage counts, beside another
+/// Episode whose values stay. Returns the Episode to erase.
 async fn an_episode_written_everywhere(w: &World) -> gnomon::EpisodeId {
     let e = w
         .episode_saying(at(2024, 1, 1), None, &format!("{MARKER} said so"))
@@ -133,6 +139,7 @@ async fn an_episode_written_everywhere(w: &World) -> gnomon::EpisodeId {
         )
         .await
         .unwrap();
+    w.stage_records(SCOPE, e, &format!("{MARKER}-model")).await;
     e
 }
 
@@ -150,6 +157,12 @@ async fn the_dead_tuples_an_episode_erasure_leaves_are_gone_after_the_call() {
         before["gnomon.version"] > 0 && before["gnomon.episode"] > 0,
         "the Erasure leaves dead tuples: {before:?}"
     );
+    for table in STAGE_TABLES {
+        assert!(
+            before[*table] > 0,
+            "the Erasure leaves dead stage rows: {before:?}"
+        );
+    }
     println!("dead tuples after the Erasure: {before:?}");
 
     let maintenance = w.db.maintenance_store().await;
@@ -355,6 +368,49 @@ async fn the_call_refuses_and_vacuums_nothing_when_a_table_lacks_maintain() {
     }
     let left = dead_tuples(&admin, &erasure.touched_tables).await;
     assert!(left["gnomon.version"] > 0, "nothing was vacuumed: {left:?}");
+}
+
+#[tokio::test]
+async fn the_stage_tables_are_vacuumed_because_migration_0014_grants_maintain_on_them() {
+    let w = World::new().await;
+    let admin = w.db.admin().await;
+    hold_dead_tuples(&admin).await;
+    let e = an_episode_written_everywhere(&w).await;
+    let erasure = w.erase(e).await;
+    let maintenance = w.db.maintenance_store().await;
+
+    // Without the grant the call refuses, naming the stage table.
+    let operator = w.db.operator().await;
+    operator
+        .batch_execute("revoke maintain on gnomon.stage_record from gnomon_maintainer")
+        .await
+        .unwrap();
+    match maintenance.vacuum_erasures(VacuumMode::Plain).await {
+        Err(gnomon::Error::VacuumRefused(m)) => assert!(m.contains("gnomon.stage_record"), "{m}"),
+        other => panic!("the call ran without MAINTAIN on gnomon.stage_record: {other:?}"),
+    }
+    let left = dead_tuples(&admin, &[STAGE_TABLES[0].to_owned()]).await;
+    assert!(left[STAGE_TABLES[0]] > 0, "nothing was vacuumed: {left:?}");
+
+    // With the migration's grant it runs and leaves no dead stage row.
+    operator
+        .batch_execute("grant maintain on gnomon.stage_record to gnomon_maintainer")
+        .await
+        .unwrap();
+    let vacuum = maintenance
+        .vacuum_erasure(&erasure.touched_tables, VacuumMode::Plain)
+        .await
+        .unwrap();
+    let stage: Vec<String> = STAGE_TABLES.iter().map(|t| t.to_string()).collect();
+    for table in &stage {
+        assert!(
+            vacuum.tables.contains(table),
+            "{table}: {:?}",
+            vacuum.tables
+        );
+    }
+    let after = dead_tuples(&admin, &stage).await;
+    assert!(after.values().all(|&n| n == 0), "{after:?}");
 }
 
 #[tokio::test]

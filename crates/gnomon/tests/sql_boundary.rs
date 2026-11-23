@@ -1941,6 +1941,33 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         .await
         .unwrap();
     single.retract_episode(None, spare).await.unwrap();
+    // A stage record with usage counts (ADR-0011).
+    single
+        .write_stages(None, &[gnomon::StageWrite::pending(episode, "graph")])
+        .await
+        .unwrap();
+    let claim = single
+        .claim_stage(None, Some(episode), std::time::Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .unwrap();
+    single
+        .write_stages(
+            None,
+            &[gnomon::StageWrite::finish(
+                &claim,
+                gnomon::StageOutcome::Succeeded,
+                vec![gnomon::StageUsage {
+                    model: "claude-sonnet-5-5".into(),
+                    calls: 1,
+                    input_tokens: 10,
+                    output_tokens: 1,
+                    cost_usd: None,
+                }],
+            )],
+        )
+        .await
+        .unwrap();
     // An Edge from the Node to itself, and its Version's Sentence, which the
     // table's owner stores until ticket #26 adds the function that does.
     let (_, edge) = single
@@ -1980,6 +2007,8 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         "edge",
         "episode_retraction",
         "sentence",
+        "stage_record",
+        "stage_usage",
         "statement",
     ] {
         assert!(
@@ -4884,4 +4913,283 @@ async fn no_caller_can_list_the_vacuum_tables_or_vacuum_reindex_or_cluster_a_gno
         before,
         "a caller rewrote a gnomon table"
     );
+}
+
+/// The stage tables (ADR-0011, migration 0014).
+const STAGE_TABLES: &[&str] = &["stage_record", "stage_usage"];
+
+/// `world()` with stage records for its Episodes: each Episode's graph stage
+/// failed once and is due again in an hour, with usage counts, and its
+/// sentences stage is pending, so it is due now. Written through the Store
+/// by the worker of each Episode's own Tenant and Scope.
+async fn staged_world() -> World {
+    let w = world().await;
+    let store = Store::connect(&w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let admin = w.db.admin().await;
+    let episodes = admin
+        .query_typed("select tenant_id, scope, id from gnomon.episode", &[])
+        .await
+        .unwrap();
+    for row in &episodes {
+        let (tenant, scope, episode): (Uuid, String, Uuid) = (row.get(0), row.get(1), row.get(2));
+        let (tenant, episode) = (TenantId(tenant), EpisodeId(episode));
+        let caller = store.as_worker(tenant, Scope::new(scope));
+        caller
+            .write_stages(tenant, &[gnomon::StageWrite::pending(episode, "graph")])
+            .await
+            .unwrap();
+        let claim = caller
+            .claim_stage(tenant, Some(episode), std::time::Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .unwrap();
+        caller
+            .write_stages(
+                tenant,
+                &[
+                    gnomon::StageWrite::finish(
+                        &claim,
+                        gnomon::StageOutcome::Retry {
+                            error: gnomon::StageError {
+                                code: "rate_limited".into(),
+                                status: Some(429),
+                            },
+                            after: std::time::Duration::from_secs(3600),
+                        },
+                        vec![gnomon::StageUsage {
+                            model: "claude-sonnet-5-5".into(),
+                            calls: 1,
+                            input_tokens: 100,
+                            output_tokens: 10,
+                            cost_usd: None,
+                        }],
+                    ),
+                    gnomon::StageWrite::pending(episode, "sentences"),
+                ],
+            )
+            .await
+            .unwrap();
+    }
+    w
+}
+
+/// Every row of the stage tables, read past RLS.
+async fn stage_rows(db: &TestDb) -> Vec<String> {
+    let admin = db.admin().await;
+    let tables: Vec<String> = STAGE_TABLES.iter().map(|t| t.to_string()).collect();
+    support::erasure::rows_of(&admin, &tables).await
+}
+
+#[tokio::test]
+async fn a_caller_cannot_read_another_tenants_or_scopes_stage_records() {
+    let w = staged_world().await;
+    for role in [USER, WORKER] {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        for table in STAGE_TABLES {
+            let ids = visible_ids(
+                &tx,
+                &format!("select distinct episode_id from gnomon.{table}"),
+                &[],
+            )
+            .await;
+            assert_eq!(ids, vec![w.t1_support], "{role} read {table}: {ids:?}");
+        }
+        for (tenant, episode) in [(w.t1, w.t1_billing), (w.t2, w.t2_support)] {
+            for function in ["read_stage_records", "read_stage_usage"] {
+                let rows = tx
+                    .query_typed(
+                        &format!("select * from gnomon.{function}($1, $2)"),
+                        &[(&tenant, Type::UUID), (&episode, Type::UUID)],
+                    )
+                    .await
+                    .unwrap();
+                assert!(rows.is_empty(), "{role} read {episode} through {function}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_caller_cannot_write_another_tenants_or_scopes_stage_records() {
+    let w = staged_world().await;
+    let before = stage_rows(&w.db).await;
+    let mut client = w.db.login().await;
+    let caller = claims(w.t1, &["support"]);
+
+    // Direct inserts, naming another Tenant, another Scope, or an Episode of
+    // another Scope under the caller's own.
+    for (tenant, scope, episode, code) in [
+        (
+            w.t2,
+            "support",
+            w.t2_support,
+            SqlState::INSUFFICIENT_PRIVILEGE,
+        ),
+        (
+            w.t1,
+            "billing",
+            w.t1_billing,
+            SqlState::INSUFFICIENT_PRIVILEGE,
+        ),
+        (
+            w.t1,
+            "support",
+            w.t1_billing,
+            SqlState::FOREIGN_KEY_VIOLATION,
+        ),
+        (
+            w.t1,
+            "support",
+            w.t2_support,
+            SqlState::FOREIGN_KEY_VIOLATION,
+        ),
+    ] {
+        for sql in [
+            "insert into gnomon.stage_record (tenant_id, scope, episode_id, stage)
+             values ($1, $2, $3, 'forged')",
+            "insert into gnomon.stage_usage
+               (tenant_id, scope, episode_id, stage, model, calls, input_tokens, output_tokens)
+             values ($1, $2, $3, 'graph', 'forged', 1, 1, 1)",
+        ] {
+            let tx = as_caller(&mut client, WORKER, &caller).await;
+            let refused = tx
+                .execute_typed(
+                    sql,
+                    &[
+                        (&tenant, Type::UUID),
+                        (&scope, Type::TEXT),
+                        (&episode, Type::UUID),
+                    ],
+                )
+                .await;
+            match refused {
+                Err(e) => assert_eq!(e.code(), Some(&code), "{sql} into {scope}: {e:?}"),
+                Ok(n) => panic!("{sql} into {tenant} {scope} was allowed: {n}"),
+            }
+        }
+    }
+
+    // The stage functions, for another Tenant's or Scope's Episode.
+    for (tenant, episode) in [(w.t1, w.t1_billing), (w.t2, w.t2_support)] {
+        for (sql, code) in [
+            ("select gnomon.stage_pending($1, $2, 'forged')", "GNW01"),
+            (
+                "select gnomon.add_stage_usage($1, $2, 'graph', 'forged', 1, 1, 1, null)",
+                "GNW01",
+            ),
+            (
+                "select gnomon.finish_stage($1, $2, 'graph', 1, 'succeeded', null, null, null)",
+                "GNS01",
+            ),
+        ] {
+            let tx = as_caller(&mut client, WORKER, &caller).await;
+            let refused = tx
+                .query_typed(sql, &[(&tenant, Type::UUID), (&episode, Type::UUID)])
+                .await;
+            match refused {
+                Err(e) => assert_eq!(e.code().map(SqlState::code), Some(code), "{sql}: {e:?}"),
+                Ok(_) => panic!("{sql} for {episode} was allowed"),
+            }
+        }
+    }
+
+    // Direct updates reach no row of another Tenant or Scope.
+    let tx = as_caller(&mut client, WORKER, &caller).await;
+    for sql in [
+        "update gnomon.stage_record set status = 'succeeded', retry_at = null
+         where episode_id = any($1)",
+        "update gnomon.stage_usage set calls = 0 where episode_id = any($1)",
+    ] {
+        let n = tx
+            .execute_typed(
+                sql,
+                &[(&vec![w.t1_billing, w.t2_support], Type::UUID_ARRAY)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{sql} changed another Tenant's or Scope's rows");
+    }
+    tx.commit().await.unwrap();
+    assert_eq!(stage_rows(&w.db).await, before);
+}
+
+#[tokio::test]
+async fn a_caller_cannot_claim_another_tenants_or_scopes_stage_records() {
+    let w = staged_world().await;
+    let mut client = w.db.login().await;
+    for (role, tenant, episode) in [
+        (USER, w.t1, None),
+        (WORKER, w.t1, Some(w.t1_billing)),
+        (WORKER, w.t2, None),
+        (WORKER, w.t2, Some(w.t2_support)),
+    ] {
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        let claimed = visible_ids(
+            &tx,
+            "select episode_id from gnomon.claim_stage($1, $2, interval '1 hour')",
+            &[(&tenant, Type::UUID), (&episode, Type::UUID)],
+        )
+        .await;
+        if tenant == w.t1 && episode.is_none() {
+            assert_eq!(claimed, vec![w.t1_support], "{role} claimed {claimed:?}");
+        } else {
+            assert!(claimed.is_empty(), "{role} claimed {claimed:?} in {tenant}");
+        }
+        tx.rollback().await.unwrap();
+    }
+    // Claims that bind no Tenant or Scope claim nothing.
+    for no_claims in [
+        "{}",
+        r#"{"app_metadata": {"tenant_id": null, "scopes": []}}"#,
+    ] {
+        let tx = as_caller(&mut client, WORKER, no_claims).await;
+        let claimed = visible_ids(
+            &tx,
+            "select episode_id from gnomon.claim_stage($1, null, interval '1 hour')",
+            &[(&w.t1, Type::UUID)],
+        )
+        .await;
+        assert!(claimed.is_empty(), "claims {no_claims} claimed {claimed:?}");
+    }
+    // The other Tenant's and Scope's pending records are still pending.
+    let admin = w.db.admin().await;
+    let pending: i64 = admin
+        .query_typed(
+            "select count(*) from gnomon.stage_record where stage = 'sentences' and status = 'pending'",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(pending, 4);
+}
+
+#[tokio::test]
+async fn a_caller_cannot_delete_a_stage_record_or_change_what_it_names() {
+    let w = staged_world().await;
+    let before = stage_rows(&w.db).await;
+    let mut client = w.db.login().await;
+    for sql in [
+        "delete from gnomon.stage_record where episode_id = $1",
+        "delete from gnomon.stage_usage where episode_id = $1",
+        "update gnomon.stage_record set scope = 'billing' where episode_id = $1",
+        "update gnomon.stage_record set episode_id = gnomon.uuid_v7() where episode_id = $1",
+        "update gnomon.stage_record set tenant_id = gnomon.uuid_v7() where episode_id = $1",
+        "update gnomon.stage_record set stage = 'renamed' where episode_id = $1",
+        "update gnomon.stage_record set created_at = now() where episode_id = $1",
+        "update gnomon.stage_usage set model = 'renamed' where episode_id = $1",
+        "update gnomon.stage_usage set scope = 'billing' where episode_id = $1",
+    ] {
+        for role in [USER, WORKER] {
+            let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+            assert_refused(
+                tx.execute_typed(sql, &[(&w.t1_support, Type::UUID)]).await,
+                &format!("{role}: {sql}"),
+            );
+        }
+    }
+    assert_eq!(stage_rows(&w.db).await, before);
 }

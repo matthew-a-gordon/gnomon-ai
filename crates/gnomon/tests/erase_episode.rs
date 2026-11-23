@@ -143,6 +143,10 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
     w.store_sentence(shared_version, "a owns 40% of Acme").await;
     w.store_sentence(untouched_version, "d owns 1% of Acme")
         .await;
+    // Stage records and usage counts the Pipeline would have written, for E
+    // and for F (ADR-0011). Only E's go.
+    w.stage_records(SCOPE, e, &format!("{MARKER}-model")).await;
+    let f_stages = w.stage_records(SCOPE, f, "claude-sonnet-5-5").await;
     // Last, E is retracted, which marks it and retracts what only it cites.
     w.caller().retract_episode(w.tenant, e).await.unwrap();
 
@@ -195,6 +199,8 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         "citation",
         "contribution",
         "episode_retraction",
+        "stage_record",
+        "stage_usage",
         "statement",
     ] {
         assert!(
@@ -208,6 +214,8 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .await
         .unwrap()
         .is_none());
+    assert!(w.stage_records_of(SCOPE, e).await.is_empty());
+    assert_eq!(w.stage_records_of(SCOPE, f).await, f_stages);
 
     // What the Erasure left alone keeps its Sentence.
     let derived = tables_derived_from_version_text(&admin).await;

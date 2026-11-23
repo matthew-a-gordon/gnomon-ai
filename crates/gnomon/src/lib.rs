@@ -10,6 +10,7 @@ mod edge;
 mod kind;
 pub mod migrations;
 mod node;
+mod stage;
 mod store;
 mod vacuum;
 
@@ -29,6 +30,7 @@ pub use node::{
     EpisodeRetraction, NewNode, NodeId, NodeVersion, Patch, Precision, Retraction, Statement,
     StatementKind, ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
+pub use stage::{StageError, StageOutcome, StageRecord, StageStatus, StageUsage, StageWrite};
 pub use store::{Caller, Store};
 pub use vacuum::{VacuumMode, VacuumReport};
 
@@ -56,6 +58,11 @@ pub const TENANT_MISMATCH: &str = "GNT02";
 /// The SQLSTATE the tenancy row raises for any change but the switch from
 /// single-tenant to multi-tenant mode, such as switching back.
 pub const TENANCY_ONE_WAY: &str = "GNT03";
+
+/// The SQLSTATE a stage write raises when it finishes a stage record that is
+/// no longer running at the attempt its claim returned, because another
+/// claim took the record after its lease expired.
+pub const STAGE_CLAIM_LOST: &str = "GNS01";
 
 /// The unit of isolation: one customer's graph.
 ///
@@ -180,6 +187,11 @@ pub enum Error {
     /// not grant `MAINTAIN` on a table. The message names the tables.
     #[error("vacuum refused: {0}")]
     VacuumRefused(String),
+    /// A stage write finished a record that another claim has taken since
+    /// this caller's lease expired, so the call's transaction rolled back,
+    /// the stage's output with it. The message names the record.
+    #[error("stage claim lost: {0}")]
+    StageClaimLost(String),
     /// Postgres refused or failed the call. RLS refusals and a missing grant
     /// arrive here, and so do failures to connect, a refused TLS
     /// certificate included.
@@ -200,7 +212,8 @@ impl Error {
             | Error::InvalidWrite(_)
             | Error::TenantRequired(_)
             | Error::TenantMismatch(_)
-            | Error::VacuumRefused(_) => None,
+            | Error::VacuumRefused(_)
+            | Error::StageClaimLost(_) => None,
         }
     }
 
@@ -214,6 +227,7 @@ impl Error {
             (Some(INVALID_WRITE), Some(m)) => Error::InvalidWrite(m),
             (Some(TENANT_REQUIRED), Some(m)) => Error::TenantRequired(m),
             (Some(TENANT_MISMATCH), Some(m)) => Error::TenantMismatch(m),
+            (Some(STAGE_CLAIM_LOST), Some(m)) => Error::StageClaimLost(m),
             _ => Error::Database(e),
         }
     }

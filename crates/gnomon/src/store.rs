@@ -25,6 +25,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::error::SqlState;
@@ -38,8 +39,9 @@ use crate::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Direction, EdgeId,
     EdgeVersion, EndOfValidity, Episode, EpisodeErasure, EpisodeId, EpisodeRetraction, Error,
     GraphErasure, Kind, KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId,
-    NodeVersion, Patch, Precision, Retraction, Scope, StatementKind, Step, TenantId, Traversal,
-    VacuumMode, VacuumReport, ValidTime, VersionId, WriteOutcome, WriteStatus,
+    NodeVersion, Patch, Precision, Retraction, Scope, StageError, StageOutcome, StageRecord,
+    StageStatus, StageUsage, StageWrite, StatementKind, Step, TenantId, Traversal, VacuumMode,
+    VacuumReport, ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -140,6 +142,7 @@ impl Store {
             store: self,
             role: CallerRole::User,
             claims: Value::Object(claims).to_string(),
+            stages: Default::default(),
         }
     }
 
@@ -166,6 +169,7 @@ impl Store {
             store: self,
             role: CallerRole::Worker,
             claims: claims.to_string(),
+            stages: Default::default(),
         }
     }
 }
@@ -429,6 +433,30 @@ pub struct Caller<'s> {
     store: &'s Store,
     role: CallerRole,
     claims: String,
+    /// Stage records to write in the transaction of the next call that
+    /// commits (see [`Caller::recording`]).
+    stages: std::sync::Mutex<Vec<StageWrite>>,
+}
+
+impl<'s> Caller<'s> {
+    /// Returns a Caller, with this one's role and claims, whose next call
+    /// that commits also writes `writes`, in the same transaction and before
+    /// the commit (ADR-0011). The stage's output and its record then commit
+    /// or fail together: a refused write fails the call, and a call that
+    /// fails writes no record. The records are written once, by the first
+    /// call that commits; a call that fails leaves them for the next.
+    ///
+    /// A finish refused because another claim took the record fails the
+    /// call with [`Error::StageClaimLost`], and its output rolls back with
+    /// it.
+    pub fn recording(&self, writes: Vec<StageWrite>) -> Caller<'s> {
+        Caller {
+            store: self.store,
+            role: self.role,
+            claims: self.claims.clone(),
+            stages: std::sync::Mutex::new(writes),
+        }
+    }
 }
 
 impl Caller<'_> {
@@ -463,6 +491,20 @@ impl Caller<'_> {
         Ok((tx, TenantId(rows[0].get(0))))
     }
 
+    /// Writes the stage records this Caller is [`recording`](Self::recording)
+    /// in `tx`, then commits it.
+    async fn commit(&self, tx: Transaction<'_>, tenant: TenantId) -> Result<(), Error> {
+        let writes = self.stages.lock().unwrap().clone();
+        for write in &writes {
+            write_stage(&tx, &self.store.statements, tenant, write).await?;
+        }
+        tx.commit().await?;
+        if !writes.is_empty() {
+            self.stages.lock().unwrap().clear();
+        }
+        Ok(())
+    }
+
     /// Records an Episode and returns its new ID, a UUID v7.
     pub async fn record_episode(&self, episode: &NewEpisode) -> Result<EpisodeId, Error> {
         let mut client = self.store.client.lock().await;
@@ -482,7 +524,7 @@ impl Caller<'_> {
                 ],
             )
             .await?;
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(EpisodeId(rows[0].get(0)))
     }
 
@@ -504,7 +546,7 @@ impl Caller<'_> {
                 &[(&tenant.0, Type::UUID), (&id.0, Type::UUID)],
             )
             .await?;
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(rows.first().map(|r| Episode {
             tenant: TenantId(r.get(0)),
             scope: Scope::new(r.get::<_, String>(1)),
@@ -550,7 +592,7 @@ impl Caller<'_> {
             .await
             .map_err(Error::from_store)?;
         let registered = read_kind(&tx, &self.store.statements, tenant, &kind.name).await?;
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(registered.expect("a Kind just registered is visible to its registrant"))
     }
 
@@ -583,7 +625,7 @@ impl Caller<'_> {
             )
             .await
             .map_err(Error::from_store)?;
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(())
     }
 
@@ -605,7 +647,7 @@ impl Caller<'_> {
                 &[(&tenant.0, Type::UUID), (&kind, Type::TEXT)],
             )
             .await?;
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(MergeRule::from_sql(rows[0].get(0)))
     }
 
@@ -619,7 +661,7 @@ impl Caller<'_> {
         let mut client = self.store.client.lock().await;
         let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
         let kind = read_kind(&tx, &self.store.statements, tenant, name).await?;
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(kind)
     }
 }
@@ -811,7 +853,7 @@ impl Caller<'_> {
                 write_patch(&tx, statements, tenant, of, patch, correct).await?,
             ));
         }
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(done)
     }
 
@@ -845,7 +887,7 @@ impl Caller<'_> {
                 ],
             )
             .await?;
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(rows.first().map(|r| node_version(r, 0)))
     }
 
@@ -881,7 +923,7 @@ impl Caller<'_> {
                 ],
             )
             .await?;
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(rows.iter().map(|r| node_version(r, 0)).collect())
     }
 
@@ -915,7 +957,7 @@ impl Caller<'_> {
                 ],
             )
             .await?;
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(rows.first().map(|r| edge_version(r, 0)))
     }
 
@@ -968,7 +1010,7 @@ impl Caller<'_> {
                 ],
             )
             .await?;
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(rows
             .iter()
             .map(|r| Step {
@@ -1053,7 +1095,7 @@ impl Caller<'_> {
                 }
                 other => other?,
             };
-            tx.commit().await?;
+            self.commit(tx, tenant).await?;
             let r = &rows[0];
             let change = match r.get::<_, &str>(0) {
                 "refinement" => BoundChange::Refinement,
@@ -1224,7 +1266,7 @@ impl Caller<'_> {
                 }
                 other => other?,
             };
-            tx.commit().await?;
+            self.commit(tx, tenant).await?;
             return Ok(write_outcome(&rows[0]));
         }
     }
@@ -1270,7 +1312,7 @@ impl Caller<'_> {
                 }
                 other => other?,
             };
-            tx.commit().await?;
+            self.commit(tx, tenant).await?;
             let row = &rows[0];
             return Ok(EpisodeRetraction {
                 recorded_at: row.get(0),
@@ -1326,7 +1368,7 @@ impl Caller<'_> {
                 other => other?,
             };
             let touched_tables = touched_tables(&self.store.statements, &tx).await?;
-            tx.commit().await?;
+            self.commit(tx, tenant).await?;
             let row = &rows[0];
             let ids = |i: usize| row.get::<_, Vec<uuid::Uuid>>(i);
             return Ok(EpisodeErasure {
@@ -1437,7 +1479,7 @@ impl Caller<'_> {
                 other => other?,
             };
             let touched_tables = touched_tables(&self.store.statements, &tx).await?;
-            tx.commit().await?;
+            self.commit(tx, tenant).await?;
             let row = &rows[0];
             let ids = |i: usize| row.get::<_, Vec<uuid::Uuid>>(i);
             return Ok(GraphErasure {
@@ -1491,7 +1533,7 @@ impl Caller<'_> {
                 &[(&tenant.0, Type::UUID), (&id, Type::UUID)],
             )
             .await?;
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(rows
             .iter()
             .map(|r| crate::Statement {
@@ -1531,7 +1573,7 @@ impl Caller<'_> {
                 &[(&tenant.0, Type::UUID), (&version.0, Type::UUID)],
             )
             .await?;
-        tx.commit().await?;
+        self.commit(tx, tenant).await?;
         Ok(rows
             .iter()
             .map(|r| Citation {
@@ -1789,4 +1831,248 @@ async fn read_kind(
             search: r.get(6),
         }
     }))
+}
+
+impl Caller<'_> {
+    /// Writes stage records in one transaction of their own (ADR-0011), such
+    /// as the pending record of an Episode's first stage, or the retry of a
+    /// stage whose output rolled back. A pending record is refused with
+    /// [`Error::InvalidWrite`] for an Episode the caller cannot see, and any
+    /// write with a stage name, model name or error code that is not an
+    /// identifier fails with a check violation.
+    pub async fn write_stages(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        writes: &[StageWrite],
+    ) -> Result<(), Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        for write in writes {
+            write_stage(&tx, &self.store.statements, tenant, write).await?;
+        }
+        self.commit(tx, tenant).await?;
+        Ok(())
+    }
+
+    /// Claims one due stage record in the caller's Scopes, or of `episode`
+    /// only: one that is pending, retry-due, or running with an expired
+    /// lease, the one due longest first. It sets the record running with a
+    /// lease of `lease` from now, by the database's clock, counts the
+    /// attempt, commits and returns the record, or `None` when nothing is
+    /// due. Two concurrent claims never return the same record, because the
+    /// claim skips a record another claim holds (`FOR UPDATE SKIP LOCKED`).
+    /// A lease of zero expires at once, so the next claim may take the
+    /// record again.
+    pub async fn claim_stage(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        episode: Option<EpisodeId>,
+        lease: Duration,
+    ) -> Result<Option<StageRecord>, Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let statements = &self.store.statements;
+        let rows = statements
+            .query(
+                &tx,
+                "select tenant_id, scope, episode_id, stage, status::text, attempts,
+                        last_error_code, last_error_status, retry_at, lease_until, created_at,
+                        updated_at
+                 from gnomon.claim_stage($1, $2, $3 * interval '1 second')",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&episode.map(|e| e.0), Type::UUID),
+                    (&lease.as_secs_f64(), Type::FLOAT8),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        let claimed = match rows.first() {
+            None => None,
+            Some(row) => {
+                let episode = EpisodeId(row.get(2));
+                let usage = read_stage_usage(&tx, statements, tenant, episode).await?;
+                Some(stage_record(
+                    TenantId(row.get(0)),
+                    episode,
+                    row,
+                    usage
+                        .get(&row.get::<_, String>(3))
+                        .cloned()
+                        .unwrap_or_default(),
+                ))
+            }
+        };
+        self.commit(tx, tenant).await?;
+        Ok(claimed)
+    }
+
+    /// Reads every stage record of an Episode, with its usage counts, in the
+    /// order they were written. A caller that cannot see the Episode reads
+    /// none.
+    pub async fn stage_records(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        episode: EpisodeId,
+    ) -> Result<Vec<StageRecord>, Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let statements = &self.store.statements;
+        let rows = statements
+            .query(
+                &tx,
+                "select null::uuid, scope, null::uuid, stage, status::text, attempts,
+                        last_error_code, last_error_status, retry_at, lease_until, created_at,
+                        updated_at
+                 from gnomon.read_stage_records($1, $2)",
+                &[(&tenant.0, Type::UUID), (&episode.0, Type::UUID)],
+            )
+            .await?;
+        let mut usage = read_stage_usage(&tx, statements, tenant, episode).await?;
+        self.commit(tx, tenant).await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let of_stage = usage.remove(&row.get::<_, String>(3)).unwrap_or_default();
+                stage_record(tenant, episode, row, of_stage)
+            })
+            .collect())
+    }
+}
+
+/// A stage record from a row of `tenant_id, scope, episode_id, stage,
+/// status, attempts, last_error_code, last_error_status, retry_at,
+/// lease_until, created_at, updated_at`. The Tenant and the Episode come from
+/// the caller, which a read does not return.
+fn stage_record(
+    tenant: TenantId,
+    episode: EpisodeId,
+    row: &Row,
+    usage: Vec<StageUsage>,
+) -> StageRecord {
+    let code: Option<String> = row.get(6);
+    StageRecord {
+        tenant,
+        scope: Scope::new(row.get::<_, String>(1)),
+        episode,
+        stage: row.get(3),
+        status: StageStatus::parse(row.get(4)),
+        attempts: row.get(5),
+        last_error: code.map(|code| StageError {
+            code,
+            status: row.get(7),
+        }),
+        retry_at: row.get(8),
+        lease_until: row.get(9),
+        created_at: row.get(10),
+        updated_at: row.get(11),
+        usage,
+    }
+}
+
+/// The usage counts of an Episode's stage records, by stage, each in order
+/// of model.
+async fn read_stage_usage(
+    tx: &Transaction<'_>,
+    statements: &Statements,
+    tenant: TenantId,
+    episode: EpisodeId,
+) -> Result<HashMap<String, Vec<StageUsage>>, Error> {
+    let rows = statements
+        .query(
+            tx,
+            "select stage, model, calls, input_tokens, output_tokens, cost_usd::float8
+             from gnomon.read_stage_usage($1, $2)",
+            &[(&tenant.0, Type::UUID), (&episode.0, Type::UUID)],
+        )
+        .await?;
+    let mut by_stage: HashMap<String, Vec<StageUsage>> = HashMap::new();
+    for row in &rows {
+        by_stage.entry(row.get(0)).or_default().push(StageUsage {
+            model: row.get(1),
+            calls: row.get(2),
+            input_tokens: row.get(3),
+            output_tokens: row.get(4),
+            cost_usd: row.get(5),
+        });
+    }
+    Ok(by_stage)
+}
+
+/// Writes one stage record in `tx`.
+async fn write_stage(
+    tx: &Transaction<'_>,
+    statements: &Statements,
+    tenant: TenantId,
+    write: &StageWrite,
+) -> Result<(), Error> {
+    match write {
+        StageWrite::Pending { episode, stage } => {
+            statements
+                .query(
+                    tx,
+                    "select gnomon.stage_pending($1, $2, $3)",
+                    &[
+                        (&tenant.0, Type::UUID),
+                        (&episode.0, Type::UUID),
+                        (stage, Type::TEXT),
+                    ],
+                )
+                .await
+                .map_err(Error::from_store)?;
+        }
+        StageWrite::Finish {
+            episode,
+            stage,
+            attempt,
+            outcome,
+            usage,
+        } => {
+            let (status, error, retry_after) = match outcome {
+                StageOutcome::Succeeded => (StageStatus::Succeeded, None, None),
+                StageOutcome::Retry { error, after } => {
+                    (StageStatus::Retry, Some(error), Some(after.as_secs_f64()))
+                }
+                StageOutcome::Failed { error } => (StageStatus::Failed, Some(error), None),
+            };
+            statements
+                .query(
+                    tx,
+                    "select gnomon.finish_stage($1, $2, $3, $4, $5::text::gnomon.stage_status,
+                                                $6, $7, $8 * interval '1 second')",
+                    &[
+                        (&tenant.0, Type::UUID),
+                        (&episode.0, Type::UUID),
+                        (stage, Type::TEXT),
+                        (attempt, Type::INT4),
+                        (&status.as_str(), Type::TEXT),
+                        (&error.map(|e| e.code.as_str()), Type::TEXT),
+                        (&error.and_then(|e| e.status), Type::INT4),
+                        (&retry_after, Type::FLOAT8),
+                    ],
+                )
+                .await
+                .map_err(Error::from_store)?;
+            for u in usage {
+                statements
+                    .query(
+                        tx,
+                        "select gnomon.add_stage_usage($1, $2, $3, $4, $5, $6, $7, $8::numeric)",
+                        &[
+                            (&tenant.0, Type::UUID),
+                            (&episode.0, Type::UUID),
+                            (stage, Type::TEXT),
+                            (&u.model, Type::TEXT),
+                            (&u.calls, Type::INT4),
+                            (&u.input_tokens, Type::INT8),
+                            (&u.output_tokens, Type::INT8),
+                            (&u.cost_usd, Type::FLOAT8),
+                        ],
+                    )
+                    .await
+                    .map_err(Error::from_store)?;
+            }
+        }
+    }
+    Ok(())
 }

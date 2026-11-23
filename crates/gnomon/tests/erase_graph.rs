@@ -195,6 +195,9 @@ async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_t
     let mut ids: Vec<Uuid> = edges.iter().map(|e| e.0).collect();
     ids.push(x.0);
     let versions = w.versions_of(&ids).await;
+    // The stage records of the Episode that wrote x, which stay with the
+    // Episode (ADR-0011).
+    let e_stages = w.stage_records(SCOPE, e, "claude-sonnet-5-5").await;
     let admin = w.db.admin().await;
     let before = every_row(&admin).await;
 
@@ -238,6 +241,7 @@ async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_t
             .unwrap()
             .is_some());
     }
+    assert_eq!(w.stage_records_of(SCOPE, e).await, e_stages);
 }
 
 #[tokio::test]
@@ -333,6 +337,11 @@ async fn erasing_a_scope_removes_every_row_in_it_and_every_edge_that_joins_its_n
     let versions = w
         .versions_of(&[edge_ids.clone(), vec![acme.0, acct.0]].concat())
         .await;
+    // Stage records of a billing Episode, which go with the Scope, and of a
+    // support Episode, which stay (ADR-0011).
+    w.stage_records("billing", b1, &format!("{MARKER}-model"))
+        .await;
+    let s1_stages = w.stage_records(SCOPE, s1, "claude-sonnet-5-5").await;
     let admin = w.db.admin().await;
     let before = every_row(&admin).await;
 
@@ -359,6 +368,8 @@ async fn erasing_a_scope_removes_every_row_in_it_and_every_edge_that_joins_its_n
         "version",
         "episode_retraction",
         "sentence",
+        "stage_record",
+        "stage_usage",
     ] {
         assert!(tables.iter().any(|t| t == expected), "{tables:?}");
     }
@@ -398,6 +409,8 @@ async fn erasing_a_scope_removes_every_row_in_it_and_every_edge_that_joins_its_n
         w.current_values(sa, at(2024, 4, 1)).await,
         Some(json!({ "plan": "pro" }))
     );
+    assert!(w.stage_records_of("billing", b1).await.is_empty());
+    assert_eq!(w.stage_records_of(SCOPE, s1).await, s1_stages);
 }
 
 #[tokio::test]

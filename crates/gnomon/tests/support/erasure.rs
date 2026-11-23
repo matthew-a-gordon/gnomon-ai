@@ -6,7 +6,8 @@
 use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
     AsOf, EdgeId, EpisodeErasure, EpisodeId, GraphErasure, KindOf, NewEdge, NewEpisode, NewKind,
-    NewNode, NodeId, NodeVersion, Patch, Scope, Store, TenantId, ValidTime, VersionId,
+    NewNode, NodeId, NodeVersion, Patch, Scope, StageOutcome, StageRecord, StageUsage, StageWrite,
+    Store, TenantId, ValidTime, VersionId,
 };
 use serde_json::{json, Map, Value};
 use tokio_postgres::types::Type;
@@ -381,6 +382,62 @@ impl World {
         self.read_as_of(node, valid_at, known_at)
             .await
             .map(|v| Value::Object(v.values))
+    }
+
+    /// Writes what the Pipeline would for an Episode of `scope` (ADR-0011):
+    /// its graph stage claimed and finished with `model`'s usage, and its
+    /// sentences stage pending. Returns the Episode's stage records.
+    pub async fn stage_records(
+        &self,
+        scope: &str,
+        episode: EpisodeId,
+        model: &str,
+    ) -> Vec<StageRecord> {
+        let caller = self.worker_in(scope);
+        caller
+            .write_stages(self.tenant, &[StageWrite::pending(episode, "graph")])
+            .await
+            .unwrap();
+        let claim = caller
+            .claim_stage(
+                self.tenant,
+                Some(episode),
+                std::time::Duration::from_secs(3600),
+            )
+            .await
+            .unwrap()
+            .expect("the graph stage is due");
+        caller
+            .write_stages(
+                self.tenant,
+                &[
+                    StageWrite::finish(
+                        &claim,
+                        StageOutcome::Succeeded,
+                        vec![StageUsage {
+                            model: model.into(),
+                            calls: 2,
+                            input_tokens: 800,
+                            output_tokens: 90,
+                            cost_usd: Some(0.004),
+                        }],
+                    ),
+                    StageWrite::pending(episode, "sentences"),
+                ],
+            )
+            .await
+            .unwrap();
+        let records = caller.stage_records(self.tenant, episode).await.unwrap();
+        assert_eq!(records.len(), 2);
+        records
+    }
+
+    /// An Episode's stage records, as the worker of `scope` reads them.
+    pub async fn stage_records_of(&self, scope: &str, episode: EpisodeId) -> Vec<StageRecord> {
+        self.worker_in(scope)
+            .stage_records(self.tenant, episode)
+            .await
+            .unwrap()
     }
 
     /// Whether a Node or Edge row exists, read past RLS.
