@@ -80,6 +80,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0011_erase_episode",
         template: include_str!("../migrations/0011_erase_episode.sql"),
     },
+    Migration {
+        version: 12,
+        name: "0012_erase_node_edge_scope",
+        template: include_str!("../migrations/0012_erase_node_edge_scope.sql"),
+    },
 ];
 
 /// The schema version this build of the Store expects: the last migration's.

@@ -342,6 +342,11 @@ async fn a_caller_cannot_redirect_the_store_functions_through_its_search_path() 
 /// alone.
 const ONTOLOGY_TABLES: &[&str] = &["kind", "kind_rule", "kind_merge"];
 
+/// The list a running Erasure of a Node, an Edge or a Scope keeps of what it
+/// reaches in Scopes the caller cannot see. No caller role may read it, and
+/// it holds no row once the Erasure returns.
+const ERASURE_REACH: &str = "erasure_reach";
+
 #[tokio::test]
 async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_tenant_scope_policy()
 {
@@ -370,30 +375,68 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
             continue;
         }
         assert!(tenant, "gnomon.{name} lacks a tenant_id column");
-        let ontology = ONTOLOGY_TABLES.contains(&name.as_str());
-        assert_eq!(
-            scope, !ontology,
-            "gnomon.{name}: graph tables have a scope column and Ontology tables none"
-        );
         let policies = client
             .query_typed(
-                "select qual, with_check from pg_policies where schemaname = 'gnomon' and tablename = $1",
+                "select qual, with_check, roles::text[] from pg_policies
+                 where schemaname = 'gnomon' and tablename = $1",
                 &[(&name, Type::TEXT)],
             )
             .await
             .unwrap();
         assert!(!policies.is_empty(), "gnomon.{name} has no policy");
+        if name == ERASURE_REACH {
+            // The list a running Erasure keeps of what it reaches: no Scope,
+            // and a policy for the definer role alone, which shows each
+            // transaction only its own rows.
+            assert!(!scope, "gnomon.{name} has a scope column");
+            for p in &policies {
+                let roles: Vec<String> = p.get(2);
+                assert_eq!(roles, vec!["gnomon_definer"], "gnomon.{name} policy roles");
+                let using: String = p.get(0);
+                assert_eq!(
+                    using,
+                    "((tenant_id = gnomon.tenant_id()) AND \
+                     (written_in = pg_current_xact_id_if_assigned()))"
+                );
+            }
+            continue;
+        }
+        let ontology = ONTOLOGY_TABLES.contains(&name.as_str());
+        assert_eq!(
+            scope, !ontology,
+            "gnomon.{name}: graph tables have a scope column and Ontology tables none"
+        );
         let expected = if ontology {
             "(tenant_id = gnomon.tenant_id())"
         } else {
             "((tenant_id = gnomon.tenant_id()) AND (scope = ANY (gnomon.allowed_scopes())))"
         };
         for p in &policies {
-            let (using, check): (Option<String>, Option<String>) = (p.get(0), p.get(1));
+            let (using, check, roles): (Option<String>, Option<String>, Vec<String>) =
+                (p.get(0), p.get(1), p.get(2));
             assert!(
                 using.is_some() || check.is_some(),
                 "gnomon.{name} has a policy that checks nothing"
             );
+            // The definer's reach, for Erasure alone: it reads and deletes,
+            // in the caller's Tenant, only the rows of Edges a running
+            // Erasure listed, and never writes through it.
+            if let Some(reach) = using
+                .as_deref()
+                .filter(|u| u.contains("gnomon.erasure_reaches"))
+            {
+                assert_eq!(
+                    roles,
+                    ["gnomon_definer"],
+                    "gnomon.{name}: who has the reach"
+                );
+                assert!(
+                    reach.starts_with("((tenant_id = gnomon.tenant_id()) AND "),
+                    "gnomon.{name}: the reach is {reach}"
+                );
+                assert_eq!(check, None, "gnomon.{name}: the definer's reach writes");
+                continue;
+            }
             if let Some(using) = using {
                 assert_eq!(using, expected, "gnomon.{name} USING");
             }
@@ -410,6 +453,9 @@ const DEFINERS: &[&str] = &[
     "gnomon.register_kind(",
     "gnomon.set_merge_rule(",
     "gnomon.erase_episode(",
+    "gnomon.erase_node(",
+    "gnomon.erase_edge(",
+    "gnomon.erase_scope(",
 ];
 
 #[tokio::test]
@@ -461,6 +507,9 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
         "gnomon.call_tenant(",
         "gnomon.switch_to_multi_tenant()",
         "gnomon.erase_episode(",
+        "gnomon.erase_node(",
+        "gnomon.erase_edge(",
+        "gnomon.erase_scope(",
     ] {
         assert!(
             names.iter().any(|n| n.starts_with(expected)),
@@ -1655,11 +1704,12 @@ async fn tenant_tables(client: &Client) -> Vec<String> {
             "select c.relname::text
              from pg_class c join pg_namespace n on n.oid = c.relnamespace
              where n.nspname = 'gnomon' and c.relkind in ('r', 'p')
+               and c.relname <> $1
                and exists (select from pg_attribute a
                            where a.attrelid = c.oid and a.attname = 'tenant_id'
                              and not a.attisdropped)
              order by 1",
-            &[],
+            &[(&ERASURE_REACH, Type::TEXT)],
         )
         .await
         .unwrap()
@@ -3592,7 +3642,8 @@ async fn the_statement_functions_run_as_the_invoker_and_add_no_definer() {
         );
     }
     // ADR-0009 names three definers: Erasure, Kind registration and the
-    // merge-rule setter.
+    // merge-rule setter. Erasure is four functions, of an Episode, a Node, an
+    // Edge and a Scope.
     let definers =
         w.db.admin()
             .await
@@ -3604,7 +3655,7 @@ async fn the_statement_functions_run_as_the_invoker_and_add_no_definer() {
             )
             .await
             .unwrap();
-    assert_eq!(definers[0].get::<_, i64>(0), 3);
+    assert_eq!(definers[0].get::<_, i64>(0), DEFINERS.len() as i64);
 }
 
 // Retract Episode (ADR-0003, ADR-0007, ADR-0009). It runs as the invoker, so
@@ -3898,28 +3949,32 @@ async fn row_count(db: &TestDb) -> i64 {
 async fn the_migrations_grant_erasure_to_no_role_but_its_owner() {
     let w = world().await;
     let client = w.db.admin().await;
-    let rows = client
-        .query_typed(
-            &format!(
-                "select coalesce(nullif(a.grantee, 0)::regrole::text, 'public'),
-                        p.proowner::regrole::text, p.prosecdef
-                 from pg_proc p left join lateral aclexplode(p.proacl) a on true
-                 where p.oid = '{}'::regprocedure",
-                support::ERASE_EPISODE
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
-    let owner: String = rows[0].get(1);
-    assert_eq!(owner, "gnomon_definer");
-    assert!(rows[0].get::<_, bool>(2), "Erasure is SECURITY DEFINER");
-    let grantees: Vec<String> = rows
-        .iter()
-        .filter_map(|r| r.get::<_, Option<String>>(0))
-        .filter(|g| g != "gnomon_definer")
-        .collect();
-    assert!(grantees.is_empty(), "Erasure is granted to {grantees:?}");
+    for erasure in support::ERASURES {
+        let rows = client
+            .query_typed(
+                &format!(
+                    "select coalesce(nullif(a.grantee, 0)::regrole::text, 'public'),
+                            p.proowner::regrole::text, p.prosecdef
+                     from pg_proc p left join lateral aclexplode(p.proacl) a on true
+                     where p.oid = '{erasure}'::regprocedure"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        let owner: String = rows[0].get(1);
+        assert_eq!(owner, "gnomon_definer", "{erasure}");
+        assert!(
+            rows[0].get::<_, bool>(2),
+            "{erasure} is not SECURITY DEFINER"
+        );
+        let grantees: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get::<_, Option<String>>(0))
+            .filter(|g| g != "gnomon_definer")
+            .collect();
+        assert!(grantees.is_empty(), "{erasure} is granted to {grantees:?}");
+    }
 }
 
 #[tokio::test]
@@ -4235,4 +4290,386 @@ async fn an_erasure_refuses_a_transaction_that_already_wrote_what_the_episode_to
         Err(e) => assert_eq!(e.code().map(|c| c.code()), Some("GNW01"), "{e:?}"),
         Ok(v) => panic!("an Erasure after a write in its own transaction was allowed: {v:?}"),
     }
+}
+
+// Erase a Node, an Edge or a Scope (ADR-0003, ADR-0005, ADR-0009). Erasure
+// as the definer: granted to no caller role, refused across Tenants and for
+// what the caller cannot see, and its reach into other Scopes, which erases
+// the Edges joining an erased Node, is open to no caller.
+
+const ERASE_NODE: &str = "select erased_nodes from gnomon.erase_node($1, $2)";
+const ERASE_EDGE: &str = "select erased_edges from gnomon.erase_edge($1, $2)";
+const ERASE_SCOPE: &str = "select erased_nodes from gnomon.erase_scope($1, $2)";
+
+/// The Nodes fixture with more of Tenant one's graph: a Node of billing, an
+/// Edge of billing that joins only it, an Edge of billing that joins `n1`,
+/// and an Edge of Tenant two.
+struct Graph {
+    n: Nodes,
+    billing_node: Uuid,
+    billing_edge: Uuid,
+    crossing_edge: Uuid,
+    t2_edge: Uuid,
+}
+
+async fn graph() -> Graph {
+    let n = nodes().await;
+    let store = Store::connect(&n.w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let t1 = TenantId(n.w.t1);
+    let both = store.as_user(
+        match json!({
+            "role": "authenticated",
+            "app_metadata": { "tenant_id": n.w.t1.to_string(), "scopes": ["support", "billing"] }
+        }) {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        },
+    );
+    let patch = |episode: Uuid| {
+        gnomon::Patch::new(
+            EpisodeId(episode),
+            gnomon::ValidTime::UNKNOWN,
+            serde_json::Map::new(),
+        )
+    };
+    let (billing_node, _) = both
+        .create_node(
+            &gnomon::NewNode {
+                tenant: Some(t1),
+                scope: Scope::new("billing"),
+                kind: gnomon::ROOT_NODE_KIND.into(),
+            },
+            &gnomon::Patch::new(
+                EpisodeId(n.w.t1_billing),
+                gnomon::ValidTime::UNKNOWN,
+                match json!({ "name": "billing's" }) {
+                    serde_json::Value::Object(m) => m,
+                    _ => unreachable!(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let edge = |scope: &'static str, source: Uuid, target: Uuid, episode: Uuid| {
+        let both = &both;
+        let patch = &patch;
+        async move {
+            both.create_edge(
+                &gnomon::NewEdge {
+                    tenant: Some(t1),
+                    scope: Scope::new(scope),
+                    kind: gnomon::ROOT_EDGE_KIND.into(),
+                    source: gnomon::NodeId(source),
+                    target: gnomon::NodeId(target),
+                },
+                &patch(episode),
+            )
+            .await
+            .unwrap()
+            .0
+             .0
+        }
+    };
+    let billing_edge = edge("billing", billing_node.0, billing_node.0, n.w.t1_billing).await;
+    let crossing_edge = edge("billing", billing_node.0, n.n1, n.w.t1_billing).await;
+    let t2_edge = store
+        .as_worker(TenantId(n.w.t2), Scope::new("support"))
+        .create_edge(
+            &gnomon::NewEdge {
+                tenant: Some(TenantId(n.w.t2)),
+                scope: Scope::new("support"),
+                kind: gnomon::ROOT_EDGE_KIND.into(),
+                source: gnomon::NodeId(n.n2),
+                target: gnomon::NodeId(n.n2),
+            },
+            &patch(n.w.t2_support),
+        )
+        .await
+        .unwrap()
+        .0
+         .0;
+    n.w.db.grant_erasure(WORKER).await;
+    Graph {
+        billing_node: billing_node.0,
+        billing_edge,
+        crossing_edge,
+        t2_edge,
+        n,
+    }
+}
+
+#[tokio::test]
+async fn a_caller_role_without_the_grant_cannot_erase_a_node_an_edge_or_a_scope() {
+    let n = nodes().await;
+    let before = row_count(&n.w.db).await;
+    let t1 = n.w.t1;
+    let edge: Uuid = {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+        let id = tx
+            .query_typed(
+                "select gnomon.create_edge($1, 'support', 'edge', $2, $2)",
+                &[(&t1, Type::UUID), (&n.n1, Type::UUID)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        tx.commit().await.unwrap();
+        id
+    };
+    let before = before + 1;
+    for role in [USER, WORKER] {
+        for (sql, id, what) in [
+            (ERASE_NODE, Some(n.n1), "a Node"),
+            (ERASE_EDGE, Some(edge), "an Edge"),
+            (ERASE_SCOPE, None, "a Scope"),
+        ] {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            let r = match id {
+                Some(id) => {
+                    tx.query_typed(sql, &[(&t1, Type::UUID), (&id, Type::UUID)])
+                        .await
+                }
+                None => {
+                    tx.query_typed(sql, &[(&t1, Type::UUID), (&"support", Type::TEXT)])
+                        .await
+                }
+            };
+            assert_refused(r, &format!("{role} erasing {what} without the grant"));
+        }
+    }
+    assert_eq!(row_count(&n.w.db).await, before, "nothing was erased");
+}
+
+#[tokio::test]
+async fn a_caller_with_the_grant_cannot_erase_another_tenants_node_edge_or_scope_or_one_it_cannot_see(
+) {
+    let g = graph().await;
+    let (t1, t2) = (g.n.w.t1, g.n.w.t2);
+    let before = row_count(&g.n.w.db).await;
+    // (claims' Tenant, the call's Tenant, the call, the target, what, refused
+    // for privilege rather than as not visible)
+    enum Target {
+        Id(Uuid),
+        Scope(&'static str),
+    }
+    let cases = [
+        (
+            t1,
+            t2,
+            ERASE_NODE,
+            Target::Id(g.n.n2),
+            "another Tenant's Node",
+            true,
+        ),
+        (
+            t1,
+            t1,
+            ERASE_NODE,
+            Target::Id(g.n.n2),
+            "another Tenant's Node by ID",
+            false,
+        ),
+        (
+            t1,
+            t1,
+            ERASE_NODE,
+            Target::Id(g.billing_node),
+            "a Node of a Scope it cannot see",
+            false,
+        ),
+        (
+            t1,
+            Uuid::nil(),
+            ERASE_NODE,
+            Target::Id(g.n.n1),
+            "a Node of the nil Tenant",
+            true,
+        ),
+        (
+            t2,
+            t1,
+            ERASE_NODE,
+            Target::Id(g.n.n1),
+            "a Node under another Tenant's claims",
+            true,
+        ),
+        (
+            t1,
+            t2,
+            ERASE_EDGE,
+            Target::Id(g.t2_edge),
+            "another Tenant's Edge",
+            true,
+        ),
+        (
+            t1,
+            t1,
+            ERASE_EDGE,
+            Target::Id(g.t2_edge),
+            "another Tenant's Edge by ID",
+            false,
+        ),
+        (
+            t1,
+            t1,
+            ERASE_EDGE,
+            Target::Id(g.billing_edge),
+            "an Edge of a Scope it cannot see",
+            false,
+        ),
+        (
+            t1,
+            t1,
+            ERASE_EDGE,
+            Target::Id(g.crossing_edge),
+            "an Edge of a Scope it cannot see that joins its Node",
+            false,
+        ),
+        (
+            t1,
+            t2,
+            ERASE_SCOPE,
+            Target::Scope("support"),
+            "another Tenant's Scope",
+            true,
+        ),
+        (
+            t1,
+            t1,
+            ERASE_SCOPE,
+            Target::Scope("billing"),
+            "a Scope it cannot see",
+            false,
+        ),
+        (
+            t2,
+            t1,
+            ERASE_SCOPE,
+            Target::Scope("support"),
+            "a Scope under another Tenant's claims",
+            true,
+        ),
+    ];
+    for (claimed, tenant, sql, target, what, privilege) in cases {
+        let mut client = g.n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(claimed, &["support"])).await;
+        let r = match target {
+            Target::Id(id) => {
+                tx.query_typed(sql, &[(&tenant, Type::UUID), (&id, Type::UUID)])
+                    .await
+            }
+            Target::Scope(s) => {
+                tx.query_typed(sql, &[(&tenant, Type::UUID), (&s, Type::TEXT)])
+                    .await
+            }
+        };
+        if privilege {
+            assert_refused(r, what);
+        } else {
+            match r {
+                Err(e) => assert_eq!(e.code().map(|c| c.code()), Some("GNW01"), "{what}: {e:?}"),
+                Ok(v) => panic!("erasing {what} was allowed: {v:?}"),
+            }
+        }
+    }
+    assert_eq!(row_count(&g.n.w.db).await, before, "nothing was erased");
+}
+
+#[tokio::test]
+async fn no_caller_reaches_the_erasure_list_or_its_parts_and_an_erasure_widens_nothing_after_it() {
+    let g = graph().await;
+    let t1 = g.n.w.t1;
+    for role in [USER, WORKER] {
+        for (sql, what) in [
+            (
+                "select count(*) from gnomon.erasure_reach",
+                "reading the Erasure's list",
+            ),
+            (
+                "insert into gnomon.erasure_reach (tenant_id, id) values ($1, $2)",
+                "listing a Node for an Erasure",
+            ),
+            (
+                "select gnomon.erasure_reaches($1, array[$2])",
+                "the reach check",
+            ),
+            (
+                "select gnomon.erasure_reaches_version($1, $2)",
+                "the Version reach check",
+            ),
+            (
+                "select gnomon.erase_versioned_rows($1, array[$2])",
+                "the row deletes",
+            ),
+            (
+                "select gnomon.erase_graph($1, null, array[$2], '{}')",
+                "the shared Erasure",
+            ),
+        ] {
+            let mut client = g.n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support", "billing"])).await;
+            let r = tx
+                .query_typed(sql, &[(&t1, Type::UUID), (&g.n.n1, Type::UUID)])
+                .await;
+            assert_refused(r, &format!("{role} {what}"));
+        }
+    }
+
+    // The worker of support erases n1, which an Edge of billing joins, and
+    // that Edge goes. In the same transaction the worker still sees nothing
+    // of billing and still cannot erase billing's other Edge.
+    let mut client = g.n.w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    let edges: Vec<Uuid> = tx
+        .query_typed(
+            "select erased_edges from gnomon.erase_node($1, $2)",
+            &[(&t1, Type::UUID), (&g.n.n1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(edges, vec![g.crossing_edge]);
+    for table in ["edge", "contribution", "version", "citation", "node"] {
+        let n: i64 = tx
+            .query_typed(
+                &format!("select count(*) from gnomon.{table} where scope = 'billing'"),
+                &[],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(
+            n, 0,
+            "the worker sees billing's {table} rows after an Erasure"
+        );
+    }
+    let r = tx
+        .query_typed(
+            ERASE_EDGE,
+            &[(&t1, Type::UUID), (&g.billing_edge, Type::UUID)],
+        )
+        .await;
+    match r {
+        Err(e) => assert_eq!(e.code().map(|c| c.code()), Some("GNW01"), "{e:?}"),
+        Ok(v) => panic!("an Erasure widened what the caller may erase: {v:?}"),
+    }
+    drop(tx);
+    let left: i64 =
+        g.n.w
+            .db
+            .admin()
+            .await
+            .query_typed("select count(*) from gnomon.erasure_reach", &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+    assert_eq!(left, 0, "an Erasure left its list behind");
+    assert!(
+        version_rows(&g.n.w.db, g.billing_node).await.0 > 0,
+        "billing's Node keeps its Versions"
+    );
 }

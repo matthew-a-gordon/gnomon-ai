@@ -36,10 +36,10 @@ use crate::connect::ConnectOptions;
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Direction, EdgeId,
-    EdgeVersion, EndOfValidity, Episode, EpisodeErasure, EpisodeId, EpisodeRetraction, Error, Kind,
-    KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId, NodeVersion, Patch,
-    Precision, Retraction, Scope, StatementKind, Step, TenantId, Traversal, ValidTime, VersionId,
-    WriteOutcome, WriteStatus,
+    EdgeVersion, EndOfValidity, Episode, EpisodeErasure, EpisodeId, EpisodeRetraction, Error,
+    GraphErasure, Kind, KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId,
+    NodeVersion, Patch, Precision, Retraction, Scope, StatementKind, Step, TenantId, Traversal,
+    ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -1186,6 +1186,114 @@ impl Caller<'_> {
                 recomputed_edges: ids(2).into_iter().map(EdgeId).collect(),
                 erased_nodes: ids(3).into_iter().map(NodeId).collect(),
                 erased_edges: ids(4).into_iter().map(EdgeId).collect(),
+            });
+        }
+    }
+
+    /// Erases a Node (ADR-0003): its Versions, Contributions, statements and
+    /// Citations, and every Edge that joins it, whatever the Edge's Scope,
+    /// with that Edge's own rows. An endpoint of such an Edge left with
+    /// nothing is erased too when no other Edge joins it and the caller sees
+    /// its Scope. The Episodes stay. The Node must be one the caller sees.
+    ///
+    /// Erasure is granted to no caller role by the migrations, so a call
+    /// fails with [`Error::Database`] carrying `insufficient_privilege` until
+    /// the deployment grants EXECUTE on `gnomon.erase_node` (ADR-0009).
+    pub async fn erase_node(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        node: NodeId,
+    ) -> Result<GraphErasure, Error> {
+        self.erase_graph(
+            tenant.into(),
+            "select erased_at, erased_episodes, erased_nodes, erased_edges
+             from gnomon.erase_node($1, $2)",
+            &node.0,
+            Type::UUID,
+        )
+        .await
+    }
+
+    /// Erases an Edge (ADR-0003): its Versions, Contributions, statements,
+    /// Citations and Sentences. Each endpoint left with nothing is erased too
+    /// when no other Edge joins it and the caller sees its Scope. The Edge
+    /// must be one the caller sees. It is granted as
+    /// [`erase_node`](Self::erase_node) is, on `gnomon.erase_edge`.
+    pub async fn erase_edge(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        edge: EdgeId,
+    ) -> Result<GraphErasure, Error> {
+        self.erase_graph(
+            tenant.into(),
+            "select erased_at, erased_episodes, erased_nodes, erased_edges
+             from gnomon.erase_edge($1, $2)",
+            &edge.0,
+            Type::UUID,
+        )
+        .await
+    }
+
+    /// Erases a Scope (ADR-0003): every row in it, its Episodes among them,
+    /// and every Edge of another Scope that joins one of its Nodes, with that
+    /// Edge's own rows. An endpoint outside the Scope left with nothing is
+    /// erased too when no other Edge joins it and the caller sees its Scope.
+    /// Nothing else outside the Scope changes. The caller must see the Scope.
+    /// It is granted as [`erase_node`](Self::erase_node) is, on
+    /// `gnomon.erase_scope`.
+    pub async fn erase_scope(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        scope: &Scope,
+    ) -> Result<GraphErasure, Error> {
+        self.erase_graph(
+            tenant.into(),
+            "select erased_at, erased_episodes, erased_nodes, erased_edges
+             from gnomon.erase_scope($1, $2)",
+            &scope.as_str(),
+            Type::TEXT,
+        )
+        .await
+    }
+
+    /// Runs one of the Erasures of a Node, an Edge or a Scope, retrying a
+    /// serialization failure or a deadlock as a write does.
+    async fn erase_graph(
+        &self,
+        tenant: Option<TenantId>,
+        sql: &'static str,
+        target: &(dyn ToSql + Sync),
+        target_type: Type,
+    ) -> Result<GraphErasure, Error> {
+        let mut client = self.store.client.lock().await;
+        let mut attempt = 0;
+        loop {
+            let (tx, tenant) = self.begin(&mut client, tenant).await?;
+            let rows = self
+                .store
+                .statements
+                .query(
+                    &tx,
+                    sql,
+                    &[(&tenant.0, Type::UUID), (target, target_type.clone())],
+                )
+                .await
+                .map_err(Error::from_store);
+            let rows = match rows {
+                Err(e) if attempt < WRITE_RETRIES && is_retryable(&e) => {
+                    attempt += 1;
+                    continue;
+                }
+                other => other?,
+            };
+            tx.commit().await?;
+            let row = &rows[0];
+            let ids = |i: usize| row.get::<_, Vec<uuid::Uuid>>(i);
+            return Ok(GraphErasure {
+                erased_at: row.get(0),
+                erased_episodes: ids(1).into_iter().map(EpisodeId).collect(),
+                erased_nodes: ids(2).into_iter().map(NodeId).collect(),
+                erased_edges: ids(3).into_iter().map(EdgeId).collect(),
             });
         }
     }

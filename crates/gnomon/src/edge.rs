@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-use crate::{MergeRule, NodeId, NodeVersion, Scope, TenantId, ValidTime, VersionId};
+use crate::{EpisodeId, MergeRule, NodeId, NodeVersion, Scope, TenantId, ValidTime, VersionId};
 
 /// The ID of an Edge, a UUID v7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -155,5 +155,25 @@ pub struct EpisodeErasure {
     /// them, in order of ID.
     pub erased_nodes: Vec<NodeId>,
     /// The Edges erased because nothing was left of them, in order of ID.
+    pub erased_edges: Vec<EdgeId>,
+}
+
+/// What the Erasure of a Node, an Edge or a Scope removed (ADR-0003). It
+/// recomputes nothing: no Version of another Node or Edge was derived from
+/// what it erases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphErasure {
+    /// When the Erasure ran: when the call's transaction started.
+    pub erased_at: DateTime<Utc>,
+    /// The Episodes erased, in order of ID. Only a Scope's Erasure erases
+    /// Episodes: those of the Scope.
+    pub erased_episodes: Vec<EpisodeId>,
+    /// The Nodes erased, in order of ID: the Node named, or every Node of the
+    /// Scope named, and each endpoint of an erased Edge that was left with
+    /// nothing, that no Edge joins and that is in a Scope the caller sees.
+    pub erased_nodes: Vec<NodeId>,
+    /// The Edges erased, in order of ID: the Edge named, or every Edge that
+    /// joins an erased Node, whatever its Scope, and every Edge of the Scope
+    /// named.
     pub erased_edges: Vec<EdgeId>,
 }

@@ -22,6 +22,7 @@
 #![allow(dead_code)] // Each test binary uses a different part of the harness.
 
 pub mod alembic;
+pub mod erasure;
 pub mod server;
 pub mod tls;
 pub mod wire;
@@ -104,8 +105,13 @@ pub const REGISTER_KIND: &str =
 /// registration.
 pub const SET_MERGE_RULE: &str = "gnomon.set_merge_rule(uuid, text, text)";
 
-/// Erasure's signature, which a deployment grants like Kind registration.
+/// Erasure's signatures, which a deployment grants like Kind registration:
+/// Erase Episode, and the Erasure of a Node, an Edge or a Scope.
 pub const ERASE_EPISODE: &str = "gnomon.erase_episode(uuid, uuid)";
+pub const ERASE_NODE: &str = "gnomon.erase_node(uuid, uuid)";
+pub const ERASE_EDGE: &str = "gnomon.erase_edge(uuid, uuid)";
+pub const ERASE_SCOPE: &str = "gnomon.erase_scope(uuid, text)";
+pub const ERASURES: &[&str] = &[ERASE_EPISODE, ERASE_NODE, ERASE_EDGE, ERASE_SCOPE];
 
 /// The embedding dimension the suites export with unless a test chooses one.
 pub const DEFAULT_DIMENSION: u32 = 1536;
@@ -425,17 +431,17 @@ impl TestDb {
             .expect("grant Kind registration");
     }
 
-    /// What a deployment does to let `role` erase Episodes. The migrations
-    /// grant Erasure to no one (ADR-0009).
+    /// What a deployment does to let `role` erase Episodes, Nodes, Edges
+    /// and Scopes. The migrations grant Erasure to no one (ADR-0009).
     pub async fn grant_erasure(&self, role: &str) {
         let role = quote_ident(role);
-        self.admin()
-            .await
-            .batch_execute(&format!(
-                "grant execute on function {ERASE_EPISODE} to {role}"
-            ))
-            .await
-            .expect("grant Erasure");
+        let admin = self.admin().await;
+        for erasure in ERASURES {
+            admin
+                .batch_execute(&format!("grant execute on function {erasure} to {role}"))
+                .await
+                .expect("grant Erasure");
+        }
     }
 
     /// The deployment's operator: the role that applied the migrations and

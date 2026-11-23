@@ -9,357 +9,21 @@ mod support;
 
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
-    AsOf, Bound, BoundSide, BoundStatement, EdgeId, EndOfValidity, EpisodeErasure, EpisodeId,
-    KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId, NodeVersion, Patch,
-    Precision, Retraction, Scope, Store, TenantId, ValidTime, VersionId,
+    AsOf, Bound, BoundSide, BoundStatement, EndOfValidity, EpisodeId, MergeRule, NewEdge,
+    NewEpisode, NewNode, Patch, Precision, Retraction, Scope, ValidTime,
 };
-use serde_json::{json, Map, Value};
-use support::TestDb;
+use serde_json::{json, Value};
+use support::erasure::{
+    assert_no_residue, at, gnomon_tables, snapshot, tables_derived_from_version_text,
+    tables_with_an_episode_reference, values, Residue, World, SCOPE,
+};
 use tokio_postgres::types::Type;
-use tokio_postgres::Client;
 use uuid::Uuid;
-
-const SCOPE: &str = "support";
 
 /// Text that only the erased Episode states, so a scan of every table can
 /// find any copy of it.
 const MARKER: &str = "erased-7f3a";
-
-fn at(y: i32, m: u32, d: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
-}
-
-fn values(v: Value) -> Map<String, Value> {
-    match v {
-        Value::Object(m) => m,
-        other => panic!("not an object: {other}"),
-    }
-}
-
-struct World {
-    db: TestDb,
-    store: Store,
-    tenant: TenantId,
-}
-
-impl World {
-    /// A Tenant with the Node Kinds `account`, which declares `plan`, and
-    /// `company`, and the Edge Kind `owns`, which declares `share`. The
-    /// worker may register Kinds and erase Episodes.
-    async fn new() -> World {
-        let db = TestDb::migrated().await;
-        db.grant_kind_registration("gnomon_worker").await;
-        db.grant_erasure("gnomon_worker").await;
-        let store = Store::connect(&db.login_url(), &support::connect_options())
-            .await
-            .unwrap();
-        let w = World {
-            db,
-            store,
-            tenant: support::tenant(),
-        };
-        for (name, of, properties) in [
-            (
-                "account",
-                KindOf::Node,
-                json!({ "plan": { "type": "string" } }),
-            ),
-            ("company", KindOf::Node, json!({})),
-            (
-                "owns",
-                KindOf::Edge {
-                    source: vec!["account".into()],
-                    target: vec!["company".into()],
-                },
-                json!({ "share": { "type": "integer" } }),
-            ),
-        ] {
-            w.caller()
-                .register_kind(&NewKind {
-                    tenant: Some(w.tenant),
-                    name: name.into(),
-                    of,
-                    parent: None,
-                    properties: json!({ "type": "object", "properties": properties }),
-                    search: vec![],
-                })
-                .await
-                .unwrap();
-        }
-        w
-    }
-
-    fn caller(&self) -> gnomon::Caller<'_> {
-        self.store.as_worker(self.tenant, Scope::new(SCOPE))
-    }
-
-    fn claims(&self) -> String {
-        json!({
-            "role": "gnomon_worker",
-            "app_metadata": { "tenant_id": self.tenant.0.to_string(), "scopes": [SCOPE] }
-        })
-        .to_string()
-    }
-
-    /// A raw transaction as the worker, as the Store opens one.
-    async fn raw<'c>(&self, client: &'c mut Client) -> tokio_postgres::Transaction<'c> {
-        let tx = client.transaction().await.unwrap();
-        tx.batch_execute("set local role gnomon_worker")
-            .await
-            .unwrap();
-        tx.query_typed(
-            "select set_config('request.jwt.claims', $1, true)",
-            &[(&self.claims(), Type::TEXT)],
-        )
-        .await
-        .unwrap();
-        tx
-    }
-
-    async fn episode(&self, reference_time: DateTime<Utc>, authority: Option<i32>) -> EpisodeId {
-        self.episode_saying(reference_time, authority, "an Episode")
-            .await
-    }
-
-    async fn episode_saying(
-        &self,
-        reference_time: DateTime<Utc>,
-        authority: Option<i32>,
-        content: &str,
-    ) -> EpisodeId {
-        self.caller()
-            .record_episode(&NewEpisode {
-                tenant: Some(self.tenant),
-                scope: Scope::new(SCOPE),
-                content: format!("{content} from {reference_time}"),
-                reference_time,
-                authority,
-            })
-            .await
-            .unwrap()
-    }
-
-    async fn node(&self, kind: &str, episode: EpisodeId, vt: ValidTime, v: Value) -> NodeId {
-        self.caller()
-            .create_node(
-                &NewNode {
-                    tenant: Some(self.tenant),
-                    scope: Scope::new(SCOPE),
-                    kind: kind.into(),
-                },
-                &Patch::new(episode, vt, values(v)),
-            )
-            .await
-            .unwrap()
-            .0
-    }
-
-    async fn edge(
-        &self,
-        source: NodeId,
-        target: NodeId,
-        episode: EpisodeId,
-        vt: ValidTime,
-        v: Value,
-    ) -> EdgeId {
-        self.caller()
-            .create_edge(
-                &NewEdge {
-                    tenant: Some(self.tenant),
-                    scope: Scope::new(SCOPE),
-                    kind: "owns".into(),
-                    source,
-                    target,
-                },
-                &Patch::new(episode, vt, values(v)),
-            )
-            .await
-            .unwrap()
-            .0
-    }
-
-    async fn write(
-        &self,
-        node: NodeId,
-        episode: EpisodeId,
-        vt: ValidTime,
-        v: Value,
-    ) -> DateTime<Utc> {
-        self.caller()
-            .write_node(self.tenant, node, &Patch::new(episode, vt, values(v)))
-            .await
-            .unwrap()
-            .recorded_at
-    }
-
-    async fn write_edge(&self, edge: EdgeId, episode: EpisodeId, vt: ValidTime, v: Value) {
-        self.caller()
-            .write_edge(self.tenant, edge, &Patch::new(episode, vt, values(v)))
-            .await
-            .unwrap();
-    }
-
-    async fn erase(&self, episode: EpisodeId) -> EpisodeErasure {
-        self.caller()
-            .erase_episode(self.tenant, episode)
-            .await
-            .unwrap()
-    }
-
-    async fn read(&self, node: NodeId, valid_at: DateTime<Utc>) -> Option<NodeVersion> {
-        self.caller()
-            .read_node(self.tenant, node, AsOf::current(valid_at))
-            .await
-            .unwrap()
-    }
-
-    async fn read_as_of(
-        &self,
-        node: NodeId,
-        valid_at: DateTime<Utc>,
-        known_at: DateTime<Utc>,
-    ) -> Option<NodeVersion> {
-        self.caller()
-            .read_node(self.tenant, node, AsOf::at(valid_at, known_at))
-            .await
-            .unwrap()
-    }
-
-    async fn current_values(&self, node: NodeId, valid_at: DateTime<Utc>) -> Option<Value> {
-        self.read(node, valid_at)
-            .await
-            .map(|v| Value::Object(v.values))
-    }
-
-    async fn values_as_of(
-        &self,
-        node: NodeId,
-        valid_at: DateTime<Utc>,
-        known_at: DateTime<Utc>,
-    ) -> Option<Value> {
-        self.read_as_of(node, valid_at, known_at)
-            .await
-            .map(|v| Value::Object(v.values))
-    }
-
-    /// Whether a Node or Edge row exists, read past RLS.
-    async fn exists(&self, table: &str, id: Uuid) -> bool {
-        self.db
-            .admin()
-            .await
-            .query_typed(
-                &format!("select from gnomon.{table} where id = $1"),
-                &[(&id, Type::UUID)],
-            )
-            .await
-            .unwrap()
-            .len()
-            == 1
-    }
-
-    async fn store_sentence(&self, version: VersionId, sentence: &str) {
-        self.db
-            .admin()
-            .await
-            .execute_typed(
-                "insert into gnomon.sentence (tenant_id, scope, version_id, sentence)
-                 values ($1, $2, $3, $4)",
-                &[
-                    (&self.tenant.0, Type::UUID),
-                    (&SCOPE, Type::TEXT),
-                    (&version.0, Type::UUID),
-                    (&sentence, Type::TEXT),
-                ],
-            )
-            .await
-            .unwrap();
-    }
-
-    async fn sentence_of(&self, version: VersionId) -> Option<String> {
-        self.db
-            .admin()
-            .await
-            .query_typed(
-                "select sentence from gnomon.sentence where version_id = $1",
-                &[(&version.0, Type::UUID)],
-            )
-            .await
-            .unwrap()
-            .first()
-            .map(|r| r.get(0))
-    }
-
-    async fn current_edge_version(&self, edge: EdgeId, valid_at: DateTime<Utc>) -> VersionId {
-        self.caller()
-            .read_edge(self.tenant, edge, AsOf::current(valid_at))
-            .await
-            .unwrap()
-            .expect("the Edge holds")
-            .id
-    }
-}
-
-/// Every gnomon table, from the catalog.
-async fn gnomon_tables(admin: &Client) -> Vec<String> {
-    admin
-        .query_typed(
-            "select c.relname::text from pg_class c join pg_namespace n on n.oid = c.relnamespace
-             where n.nspname = 'gnomon' and c.relkind in ('r', 'p') order by 1",
-            &[],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get(0))
-        .collect()
-}
-
-/// The gnomon tables that reference an Episode: a foreign key to
-/// `gnomon.episode`, or an `episode_id` column.
-async fn tables_with_an_episode_reference(admin: &Client) -> Vec<String> {
-    admin
-        .query_typed(
-            "select distinct c.relname::text
-             from pg_class c join pg_namespace n on n.oid = c.relnamespace
-             where n.nspname = 'gnomon' and c.relkind in ('r', 'p') and c.relname <> 'episode'
-               and (exists (select from pg_constraint k
-                            where k.conrelid = c.oid and k.contype = 'f'
-                              and k.confrelid = 'gnomon.episode'::regclass)
-                    or exists (select from pg_attribute a
-                               where a.attrelid = c.oid and a.attname = 'episode_id'
-                                 and not a.attisdropped))
-             order by 1",
-            &[],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get(0))
-        .collect()
-}
-
-/// The gnomon tables whose rows are derived from a Version's text: a foreign
-/// key to `gnomon.version`, apart from the Citations, which name an Episode
-/// and are checked as such. Each names its Version in `version_id`.
-async fn tables_derived_from_version_text(admin: &Client) -> Vec<String> {
-    admin
-        .query_typed(
-            "select distinct c.relname::text
-             from pg_class c join pg_namespace n on n.oid = c.relnamespace
-             join pg_constraint k on k.conrelid = c.oid and k.contype = 'f'
-             where n.nspname = 'gnomon' and k.confrelid = 'gnomon.version'::regclass
-               and c.relname <> 'citation'
-             order by 1",
-            &[],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get(0))
-        .collect()
-}
 
 #[tokio::test]
 async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value_only_it_supplied()
@@ -511,27 +175,20 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
     assert_eq!(erasure.erased_edges, vec![e_only]);
     assert!(erasure.erased_nodes.contains(&b));
 
-    // No row of any table names E or holds a value only E stated. The scan
-    // reads every table in the schema, so a table a later migration adds
-    // fails here until Erasure deletes from it.
-    let id = e.0.to_string();
-    for table in gnomon_tables(&admin).await {
-        let n: i64 = admin
-            .query_typed(
-                &format!(
-                    "select count(*) from gnomon.{table} x
-                     where strpos(x::text, $1) > 0 or strpos(x::text, $2) > 0"
-                ),
-                &[(&id, Type::TEXT), (&MARKER, Type::TEXT)],
-            )
-            .await
-            .unwrap()[0]
-            .get(0);
-        assert_eq!(
-            n, 0,
-            "gnomon.{table} still holds the erased Episode or its values"
-        );
-    }
+    // No row of any table names E or holds a value only E stated, and
+    // nothing derived from the text of a Version the Erasure deleted or
+    // recomputed is left. The check reads every table in the schema, so a
+    // table a later migration adds fails here until Erasure deletes from it.
+    assert_no_residue(
+        &admin,
+        &Residue {
+            episodes: &[e.0],
+            recomputed: &recomputed,
+            markers: &[MARKER],
+            ..Residue::default()
+        },
+    )
+    .await;
     let referencing = tables_with_an_episode_reference(&admin).await;
     for expected in [
         "bound_statement",
@@ -545,17 +202,6 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
             "{expected} is missing from {referencing:?}"
         );
     }
-    for table in &referencing {
-        let n: i64 = admin
-            .query_typed(
-                &format!("select count(*) from gnomon.{table} where episode_id = $1"),
-                &[(&e.0, Type::UUID)],
-            )
-            .await
-            .unwrap()[0]
-            .get(0);
-        assert_eq!(n, 0, "gnomon.{table} still names the erased Episode");
-    }
     assert!(w
         .caller()
         .read_episode(w.tenant, e)
@@ -563,24 +209,9 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .unwrap()
         .is_none());
 
-    // Nothing derived from the text of a Version the Erasure deleted or
-    // recomputed is left, and what it left alone keeps its Sentence.
+    // What the Erasure left alone keeps its Sentence.
     let derived = tables_derived_from_version_text(&admin).await;
     assert!(derived.iter().any(|t| t == "sentence"), "{derived:?}");
-    for table in &derived {
-        let n: i64 = admin
-            .query_typed(
-                &format!("select count(*) from gnomon.{table} where version_id = any($1)"),
-                &[(&recomputed, Type::UUID_ARRAY)],
-            )
-            .await
-            .unwrap()[0]
-            .get(0);
-        assert_eq!(
-            n, 0,
-            "gnomon.{table} still holds rows of recomputed Versions"
-        );
-    }
     assert_eq!(
         w.sentence_of(untouched_version).await.as_deref(),
         Some("d owns 1% of Acme")
@@ -890,25 +521,6 @@ async fn a_node_left_with_no_versions_is_erased_with_its_last_edge_and_a_bare_no
     );
 }
 
-/// Every row of every gnomon table the caller sees, as text.
-async fn snapshot(tx: &tokio_postgres::Transaction<'_>, tables: &[String]) -> Vec<String> {
-    let mut rows = Vec::new();
-    for table in tables {
-        for r in tx
-            .query_typed(
-                &format!("select '{table} ' || to_jsonb(x)::text from gnomon.{table} x"),
-                &[],
-            )
-            .await
-            .unwrap()
-        {
-            rows.push(r.get(0));
-        }
-    }
-    rows.sort();
-    rows
-}
-
 #[tokio::test]
 async fn the_same_erasure_on_the_same_starting_data_always_removes_the_same_rows() {
     let w = World::new().await;
@@ -949,7 +561,9 @@ async fn the_same_erasure_on_the_same_starting_data_always_removes_the_same_rows
     let tables: Vec<String> = gnomon_tables(&w.db.admin().await)
         .await
         .into_iter()
-        .filter(|t| t != "schema_version" && t != "tenancy")
+        // No caller reads the list an Erasure of a Node, an Edge or a Scope
+        // keeps while it runs, which is empty once it returns.
+        .filter(|t| t != "schema_version" && t != "tenancy" && t != "erasure_reach")
         .collect();
 
     let mut runs = Vec::new();

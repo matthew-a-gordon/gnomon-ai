@@ -19,7 +19,9 @@ use tokio_postgres::error::SqlState;
 use uuid::Uuid;
 
 pub use connect::{ConnectOptions, Tls};
-pub use edge::{Direction, EdgeId, EdgeVersion, EpisodeErasure, NewEdge, Step, Traversal};
+pub use edge::{
+    Direction, EdgeId, EdgeVersion, EpisodeErasure, GraphErasure, NewEdge, Step, Traversal,
+};
 pub use kind::{Kind, KindOf, MergeRule, NewKind, ROOT_EDGE_KIND, ROOT_NODE_KIND};
 pub use node::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, EndOfValidity,
