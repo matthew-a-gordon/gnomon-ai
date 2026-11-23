@@ -11,6 +11,7 @@ mod kind;
 pub mod migrations;
 mod node;
 mod store;
+mod vacuum;
 
 use std::fmt;
 
@@ -29,6 +30,7 @@ pub use node::{
     StatementKind, ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
 pub use store::{Caller, Store};
+pub use vacuum::{Vacuum, VacuumMode};
 
 /// The SQLSTATE Kind registration raises for a definition outside the
 /// profile or the Ontology's rules.
@@ -171,6 +173,13 @@ pub enum Error {
     /// `sslmode` contradicts the Store's [`Tls`] setting.
     #[error("invalid connection settings: {0}")]
     InvalidConnection(String),
+    /// The vacuum call refused to run: a table it was asked to vacuum is not
+    /// one an Erasure touches, or the login role may not vacuum a table it
+    /// must, because it does not hold `gnomon_maintainer` or a migration
+    /// did not grant `MAINTAIN` on a table. The message names the tables.
+    /// No table was vacuumed.
+    #[error("vacuum refused: {0}")]
+    VacuumRefused(String),
     /// Postgres refused or failed the call. RLS refusals and a missing grant
     /// arrive here, and so do failures to connect, a refused TLS
     /// certificate included.
@@ -190,7 +199,8 @@ impl Error {
             | Error::KindConflict(_)
             | Error::InvalidWrite(_)
             | Error::TenantRequired(_)
-            | Error::TenantMismatch(_) => None,
+            | Error::TenantMismatch(_)
+            | Error::VacuumRefused(_) => None,
         }
     }
 

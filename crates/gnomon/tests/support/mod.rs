@@ -43,6 +43,12 @@ pub use server::Server;
 pub const LOGIN_ROLE: &str = "gnomon_test_login";
 const LOGIN_PASSWORD: &str = "gnomon-test-login";
 
+/// The role the vacuum call logs in as: a login role that holds
+/// `gnomon_maintainer` with INHERIT and without SET, as migration 0013 tells
+/// a deployment to grant it, and may switch to `authenticated` only for the
+/// Store's schema check. It shares the login role's password.
+pub const MAINTENANCE_ROLE: &str = "gnomon_test_maintenance";
+
 /// The settings the suites connect the Store with.
 ///
 /// The test servers run without TLS, so TLS is off, which a deployment
@@ -365,8 +371,15 @@ impl Server {
                    if not exists (select from pg_roles where rolname = '{LOGIN_ROLE}') then
                      create role {LOGIN_ROLE} login noinherit password '{LOGIN_PASSWORD}';
                    end if;
+                   if not exists (select from pg_roles where rolname = '{MAINTENANCE_ROLE}') then
+                     create role {MAINTENANCE_ROLE} login noinherit password '{LOGIN_PASSWORD}';
+                   end if;
+                   if exists (select from pg_roles where rolname = 'gnomon_maintainer') then
+                     grant gnomon_maintainer to {MAINTENANCE_ROLE} with inherit true, set false;
+                   end if;
                  end $$;
-                 grant authenticated, gnomon_worker to {LOGIN_ROLE};"
+                 grant authenticated, gnomon_worker to {LOGIN_ROLE};
+                 grant authenticated to {MAINTENANCE_ROLE};"
             ))
             .await
             .expect("create the login role");
@@ -490,6 +503,25 @@ impl TestDb {
         gnomon::Store::connect(&self.login_url(), &connect_options())
             .await
             .expect("the Store connects")
+    }
+
+    /// The Store, connected as [`MAINTENANCE_ROLE`] through the callers'
+    /// path, the pooler in a pooler lane, to run the vacuum call.
+    pub async fn maintenance_store(&self) -> gnomon::Store {
+        gnomon::Store::connect(&self.maintenance_url(), &connect_options())
+            .await
+            .expect("the Store connects as the maintenance role")
+    }
+
+    /// The maintenance role's connection string, through the callers' path.
+    pub fn maintenance_url(&self) -> String {
+        let (host, port) = self.server.callers_host_port();
+        login_url(
+            &server::pooled_user(MAINTENANCE_ROLE),
+            &host,
+            port,
+            &self.name,
+        )
     }
 
     /// A raw connection as the login role, for the SQL-boundary suite.

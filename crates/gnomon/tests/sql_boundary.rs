@@ -4695,3 +4695,200 @@ async fn no_caller_reaches_the_erasure_list_or_its_parts_and_an_erasure_widens_n
         "billing's Node keeps its Versions"
     );
 }
+
+// The vacuum call after Erasure (ADR-0003, migration 0013). It is not a
+// definer and no caller role gets it: `gnomon_maintainer` holds MAINTAIN on
+// every table an Erasure touches and nothing else, and a deployment grants
+// it to the login role that runs the call.
+
+const MAINTAINER: &str = "gnomon_maintainer";
+
+/// Every gnomon table, from the catalog.
+async fn every_gnomon_table(client: &Client) -> Vec<String> {
+    client
+        .query_typed(
+            "select format('%I.%I', 'gnomon', relname) from pg_class
+             where relnamespace = 'gnomon'::regnamespace and relkind in ('r', 'p')
+             order by relname",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_migrations_grant_maintain_on_every_table_an_erasure_touches_to_the_maintenance_role_alone(
+) {
+    let w = world().await;
+    let admin = w.db.admin().await;
+    let erasure_tables: Vec<String> = admin
+        .query_typed("select table_name from gnomon.erasure_vacuum_tables()", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert!(
+        erasure_tables.contains(&"gnomon.version".to_owned())
+            && erasure_tables.contains(&"gnomon.erasure_reach".to_owned()),
+        "{erasure_tables:?}"
+    );
+    for table in every_gnomon_table(&admin).await {
+        let rows = admin
+            .query_typed(
+                "select r, has_table_privilege(r, $1, 'MAINTAIN')
+                 from unnest(array['public', 'authenticated', 'gnomon_worker', 'gnomon_definer',
+                                   'gnomon_maintainer']) r",
+                &[(&table, Type::TEXT)],
+            )
+            .await
+            .unwrap();
+        for row in rows {
+            let (role, maintain): (String, bool) = (row.get(0), row.get(1));
+            let expected = role == MAINTAINER && erasure_tables.contains(&table);
+            assert_eq!(maintain, expected, "{role} MAINTAIN on {table}");
+        }
+        // The maintenance role reads and writes nothing.
+        let other: bool = admin
+            .query_typed(
+                "select has_table_privilege($1, $2,
+                   'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')",
+                &[(&MAINTAINER, Type::TEXT), (&table, Type::TEXT)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert!(
+            !other,
+            "{MAINTAINER} holds a privilege beside MAINTAIN on {table}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_maintenance_role_cannot_log_in_or_bypass_rls_belongs_to_no_role_and_executes_one_function(
+) {
+    let w = world().await;
+    let admin = w.db.admin().await;
+    let row = admin
+        .query_typed(
+            "select rolcanlogin, rolsuper or rolbypassrls or rolcreaterole or rolcreatedb,
+                    exists (select from pg_auth_members m where m.member = r.oid)
+             from pg_roles r where rolname = $1",
+            &[(&MAINTAINER, Type::TEXT)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.len(), 1, "the maintenance role exists");
+    assert!(!row[0].get::<_, bool>(0), "{MAINTAINER} can log in");
+    assert!(
+        !row[0].get::<_, bool>(1),
+        "{MAINTAINER} holds a role attribute"
+    );
+    assert!(
+        !row[0].get::<_, bool>(2),
+        "{MAINTAINER} inherits another role's privileges"
+    );
+    let granted: Vec<String> = admin
+        .query_typed(
+            "select p.oid::regprocedure::text
+             from pg_proc p, aclexplode(p.proacl) a
+             where p.pronamespace = 'gnomon'::regnamespace and a.grantee = $1::text::regrole
+             order by 1",
+            &[(&MAINTAINER, Type::TEXT)],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(granted, ["gnomon.erasure_vacuum_tables()"]);
+    // The listing function is granted to no caller role.
+    let grantees: Vec<String> = admin
+        .query_typed(
+            "select coalesce(nullif(a.grantee, 0)::regrole::text, 'public')
+             from pg_proc p, aclexplode(p.proacl) a
+             where p.oid = 'gnomon.erasure_vacuum_tables()'::regprocedure
+               and a.grantee <> p.proowner",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(grantees, [MAINTAINER]);
+}
+
+/// The file each table's data lives in, which `VACUUM (FULL)` and `CLUSTER`
+/// change.
+async fn filenodes(admin: &Client, tables: &[String]) -> Vec<i64> {
+    let mut out = Vec::new();
+    for t in tables {
+        let row = admin
+            .query_typed(
+                "select pg_relation_filenode($1::text::regclass)::bigint",
+                &[(t, Type::TEXT)],
+            )
+            .await
+            .unwrap();
+        out.push(row[0].get(0));
+    }
+    out
+}
+
+#[tokio::test]
+async fn no_caller_can_list_the_vacuum_tables_or_vacuum_reindex_or_cluster_a_gnomon_table() {
+    let w = world().await;
+    let admin = w.db.admin().await;
+    let tables = every_gnomon_table(&admin).await;
+    let before = filenodes(&admin, &tables).await;
+
+    for role in [USER, WORKER] {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        assert_refused(
+            tx.query_typed("select * from gnomon.erasure_vacuum_tables()", &[])
+                .await,
+            &format!("{role} lists the vacuum tables"),
+        );
+        drop(tx);
+        for statement in [
+            "reindex table gnomon.version",
+            "cluster gnomon.version using version_pkey",
+        ] {
+            let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+            let r = tx.batch_execute(statement).await;
+            match r {
+                Err(e) => assert!(
+                    e.code() == Some(&SqlState::INSUFFICIENT_PRIVILEGE)
+                        || e.code() == Some(&SqlState::UNDEFINED_OBJECT),
+                    "{role}: {statement}: {e:?}"
+                ),
+                Ok(()) => panic!("{role} ran {statement}"),
+            }
+        }
+    }
+    // The login role holds the caller roles without inheriting them, so it
+    // has no USAGE on the schema. `VACUUM` outside a transaction is refused,
+    // or would skip a table it may not vacuum with a warning: either way no
+    // table is rewritten.
+    let login = w.db.login().await;
+    for t in &tables {
+        if let Err(e) = login.batch_execute(&format!("vacuum (full) {t}")).await {
+            assert_eq!(
+                e.code(),
+                Some(&SqlState::INSUFFICIENT_PRIVILEGE),
+                "vacuum {t}: {e:?}"
+            );
+        }
+    }
+    assert_eq!(
+        filenodes(&admin, &tables).await,
+        before,
+        "a caller rewrote a gnomon table"
+    );
+}

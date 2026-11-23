@@ -234,9 +234,15 @@ pub(super) fn env(name: &str) -> Option<String> {
 /// names a Supavisor tenant, which Supavisor reads from the suffix of the
 /// user name. That tenant is Supavisor's, not a gnomon Tenant.
 fn login_user() -> String {
+    pooled_user(super::LOGIN_ROLE)
+}
+
+/// The user name `role` connects with through the callers' path: the role
+/// itself, or `<role>.<Supavisor tenant>` behind Supavisor.
+pub(super) fn pooled_user(role: &str) -> String {
     match env("GNOMON_TEST_SUPAVISOR_TENANT") {
-        Some(tenant) => format!("{}.{tenant}", super::LOGIN_ROLE),
-        None => super::LOGIN_ROLE.to_owned(),
+        Some(tenant) => format!("{role}.{tenant}"),
+        None => role.to_owned(),
     }
 }
 

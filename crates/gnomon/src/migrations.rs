@@ -85,6 +85,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0012_erase_node_edge_scope",
         template: include_str!("../migrations/0012_erase_node_edge_scope.sql"),
     },
+    Migration {
+        version: 13,
+        name: "0013_vacuum_after_erasure",
+        template: include_str!("../migrations/0013_vacuum_after_erasure.sql"),
+    },
 ];
 
 /// The schema version this build of the Store expects: the last migration's.

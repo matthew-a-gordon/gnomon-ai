@@ -39,7 +39,7 @@ use crate::{
     EdgeVersion, EndOfValidity, Episode, EpisodeErasure, EpisodeId, EpisodeRetraction, Error,
     GraphErasure, Kind, KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId,
     NodeVersion, Patch, Precision, Retraction, Scope, StatementKind, Step, TenantId, Traversal,
-    ValidTime, VersionId, WriteOutcome, WriteStatus,
+    Vacuum, VacuumMode, ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -170,6 +170,118 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Vacuums the tables a given Erasure touched, its
+    /// [`touched_tables`](crate::EpisodeErasure::touched_tables), and
+    /// returns once every one is vacuumed (ADR-0003). Until then copies of
+    /// the erased bytes stay in their dead tuples and index pages.
+    ///
+    /// The call is not a Store function and runs as no caller role:
+    /// `VACUUM` cannot run inside a transaction block, so each table's
+    /// `VACUUM` goes as a simple query of one statement, outside any
+    /// transaction, as the login role the Store connected as. Through a
+    /// transaction-mode pooler that is a transaction of its own. The login
+    /// role must hold `gnomon_maintainer`, which migration 0013 grants
+    /// `MAINTAIN` on every table an Erasure touches; the deployment grants it
+    /// `with inherit true, set false`.
+    ///
+    /// It refuses with [`Error::VacuumRefused`], and vacuums nothing, when a
+    /// table is not one an Erasure touches or the login role may not vacuum
+    /// it. `VACUUM` itself would skip such a table with only a warning.
+    /// `VACUUM` removes only dead tuples no open transaction can still see,
+    /// so a transaction that began before the Erasure committed keeps them.
+    pub async fn vacuum_erasure(
+        &self,
+        tables: &[String],
+        mode: VacuumMode,
+    ) -> Result<Vacuum, Error> {
+        let mut client = self.client.lock().await;
+        let erasure_tables = self.erasure_vacuum_tables(&mut client).await?;
+        let unknown: Vec<&str> = tables
+            .iter()
+            .filter(|t| !erasure_tables.iter().any(|(name, _)| name == *t))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            return Err(Error::VacuumRefused(format!(
+                "{} {} not a table an Erasure touches",
+                unknown.join(", "),
+                if unknown.len() == 1 { "is" } else { "are" }
+            )));
+        }
+        let chosen = erasure_tables
+            .into_iter()
+            .filter(|(name, _)| tables.contains(name))
+            .collect();
+        vacuum(&client, chosen, mode).await
+    }
+
+    /// Vacuums every table any Erasure touches, and so every table touched
+    /// by every Erasure since the call last ran, and returns once every one
+    /// is vacuumed. It runs and refuses as
+    /// [`vacuum_erasure`](Self::vacuum_erasure) does. The tables come from
+    /// the catalog (`gnomon.erasure_vacuum_tables()`), so a table a later
+    /// migration adds is among them.
+    pub async fn vacuum_erasures(&self, mode: VacuumMode) -> Result<Vacuum, Error> {
+        let mut client = self.client.lock().await;
+        let erasure_tables = self.erasure_vacuum_tables(&mut client).await?;
+        vacuum(&client, erasure_tables, mode).await
+    }
+
+    /// Every table an Erasure touches, and whether the login role may
+    /// vacuum it, read in a transaction of its own.
+    async fn erasure_vacuum_tables(
+        &self,
+        client: &mut Client,
+    ) -> Result<Vec<(String, bool)>, Error> {
+        let tx = client.transaction().await?;
+        let rows = self
+            .statements
+            .query(
+                &tx,
+                "select table_name, maintainable from gnomon.erasure_vacuum_tables()",
+                &[],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+}
+
+/// Vacuums `tables`, each with its own `VACUUM` outside any transaction,
+/// after checking that the login role may vacuum every one.
+async fn vacuum(
+    client: &Client,
+    tables: Vec<(String, bool)>,
+    mode: VacuumMode,
+) -> Result<Vacuum, Error> {
+    let refused: Vec<&str> = tables
+        .iter()
+        .filter(|(_, maintainable)| !maintainable)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !refused.is_empty() {
+        return Err(Error::VacuumRefused(format!(
+            "the login role may not vacuum {}: grant it gnomon_maintainer, and MAINTAIN on \
+             each table to gnomon_maintainer",
+            refused.join(", ")
+        )));
+    }
+    let tables: Vec<String> = tables.into_iter().map(|(name, _)| name).collect();
+    for table in &tables {
+        // The name is the catalog's own, quoted by `format('%I.%I')`.
+        client
+            .batch_execute(&format!("vacuum ({}) {table}", mode.options()))
+            .await?;
+    }
+    let row = client.query_typed("select clock_timestamp()", &[]).await?;
+    Ok(Vacuum {
+        tables,
+        mode,
+        finished_at: row[0].get(0),
+    })
+}
+
 /// How the Store sends its parameterized statements: unnamed through
 /// `query_typed` by default, or, with named statements turned on, prepared
 /// once per connection under a name and reused.
@@ -274,6 +386,26 @@ fn is_missing_schema(e: &tokio_postgres::Error) -> bool {
             || *c == SqlState::UNDEFINED_TABLE
             || *c == SqlState::UNDEFINED_FUNCTION
     )
+}
+
+/// The gnomon tables the current transaction deleted rows from or updated
+/// rows in, which an Erasure leaves dead tuples in, from the transaction's
+/// own statistics. They count the rows a trigger or a foreign key changed
+/// too, so a table a later migration adds is never missed.
+async fn touched_tables(
+    statements: &Statements,
+    tx: &Transaction<'_>,
+) -> Result<Vec<String>, Error> {
+    let rows = statements
+        .query(
+            tx,
+            "select coalesce(array_agg(format('%I.%I', schemaname, relname) order by relname), '{}')
+             from pg_catalog.pg_stat_xact_user_tables
+             where schemaname = 'gnomon' and n_tup_upd + n_tup_del > 0",
+            &[],
+        )
+        .await?;
+    Ok(rows[0].get(0))
 }
 
 /// One caller's view of the Store. Every method is one transaction.
@@ -1177,6 +1309,7 @@ impl Caller<'_> {
                 }
                 other => other?,
             };
+            let touched_tables = touched_tables(&self.store.statements, &tx).await?;
             tx.commit().await?;
             let row = &rows[0];
             let ids = |i: usize| row.get::<_, Vec<uuid::Uuid>>(i);
@@ -1186,6 +1319,7 @@ impl Caller<'_> {
                 recomputed_edges: ids(2).into_iter().map(EdgeId).collect(),
                 erased_nodes: ids(3).into_iter().map(NodeId).collect(),
                 erased_edges: ids(4).into_iter().map(EdgeId).collect(),
+                touched_tables,
             });
         }
     }
@@ -1286,6 +1420,7 @@ impl Caller<'_> {
                 }
                 other => other?,
             };
+            let touched_tables = touched_tables(&self.store.statements, &tx).await?;
             tx.commit().await?;
             let row = &rows[0];
             let ids = |i: usize| row.get::<_, Vec<uuid::Uuid>>(i);
@@ -1294,6 +1429,7 @@ impl Caller<'_> {
                 erased_episodes: ids(1).into_iter().map(EpisodeId).collect(),
                 erased_nodes: ids(2).into_iter().map(NodeId).collect(),
                 erased_edges: ids(3).into_iter().map(EdgeId).collect(),
+                touched_tables,
             });
         }
     }
