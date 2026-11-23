@@ -29,7 +29,7 @@ async fn supabase_migration_up_applies_only_the_new_migration_after_a_release() 
     )
     .unwrap();
     support::supabase_migration_up(workdir.path(), &url).expect("the consumer's migration applies");
-    match gnomon::Store::connect_no_tls(&db.login_url()).await {
+    match gnomon::Store::connect(&db.login_url(), &support::connect_options()).await {
         Err(gnomon::Error::SchemaVersion { found, .. }) => {
             assert_eq!(found, Some(gnomon::migrations::SCHEMA_VERSION - 1));
         }
@@ -47,7 +47,7 @@ async fn supabase_migration_up_applies_only_the_new_migration_after_a_release() 
         1,
         "the CLI applied more than the new migration: {applied}"
     );
-    gnomon::Store::connect_no_tls(&db.login_url())
+    gnomon::Store::connect(&db.login_url(), &support::connect_options())
         .await
         .expect("the Store accepts the upgraded schema");
 }

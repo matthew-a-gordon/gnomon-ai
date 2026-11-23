@@ -22,7 +22,9 @@ async fn registering_db() -> TestDb {
 }
 
 async fn store(db: &TestDb) -> Store {
-    Store::connect_no_tls(&db.login_url()).await.unwrap()
+    Store::connect(&db.login_url(), &support::connect_options())
+        .await
+        .unwrap()
 }
 
 fn node_kind(tenant: TenantId, name: &str, properties: Value) -> NewKind {

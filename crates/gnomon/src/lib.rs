@@ -5,6 +5,7 @@
 //! background work in one Tenant and Scope. [`migrations`] exports the schema
 //! the Store expects into a consumer's migration chain.
 
+mod connect;
 mod kind;
 pub mod migrations;
 mod node;
@@ -16,6 +17,7 @@ use chrono::{DateTime, Utc};
 use tokio_postgres::error::SqlState;
 use uuid::Uuid;
 
+pub use connect::{ConnectOptions, Tls};
 pub use kind::{Kind, KindOf, NewKind, ROOT_EDGE_KIND, ROOT_NODE_KIND};
 pub use node::{
     AsOf, Bound, Citation, NewNode, NodeId, NodeVersion, Patch, ValidTime, VersionId, WriteOutcome,
@@ -158,8 +160,14 @@ pub enum Error {
     /// bind, or the claims bind none. The message names both.
     #[error("Tenant mismatch: {0}")]
     TenantMismatch(String),
+    /// The connection settings are invalid or contradict each other, such
+    /// as a trusted CA PEM that does not parse, or a connection string whose
+    /// `sslmode` contradicts the Store's [`Tls`] setting.
+    #[error("invalid connection settings: {0}")]
+    InvalidConnection(String),
     /// Postgres refused or failed the call. RLS refusals and a missing grant
-    /// arrive here.
+    /// arrive here, and so do failures to connect, a refused TLS
+    /// certificate included.
     #[error(transparent)]
     Database(#[from] tokio_postgres::Error),
 }
@@ -171,6 +179,7 @@ impl Error {
             Error::Database(e) => e.code(),
             Error::SchemaVersion { .. }
             | Error::InvalidEmbeddingDimension(_)
+            | Error::InvalidConnection(_)
             | Error::InvalidKind(_)
             | Error::KindConflict(_)
             | Error::InvalidWrite(_)

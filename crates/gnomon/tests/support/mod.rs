@@ -23,6 +23,7 @@
 
 pub mod alembic;
 pub mod server;
+pub mod tls;
 pub mod wire;
 
 use std::collections::hash_map::DefaultHasher;
@@ -40,6 +41,26 @@ pub use server::Server;
 /// nothing else, the authenticator pattern ADR-0001 relies on.
 pub const LOGIN_ROLE: &str = "gnomon_test_login";
 const LOGIN_PASSWORD: &str = "gnomon-test-login";
+
+/// The settings the suites connect the Store with.
+///
+/// The test servers run without TLS, so TLS is off, which a deployment
+/// must ask for explicitly. Named statements are on only when
+/// `GNOMON_TEST_NAMED_STATEMENTS` is `1`, for a pooler that supports them.
+pub fn connect_options() -> gnomon::ConnectOptions {
+    gnomon::ConnectOptions::default()
+        .tls(gnomon::Tls::plaintext())
+        .named_statements(named_statements_from_env())
+}
+
+/// Whether `GNOMON_TEST_NAMED_STATEMENTS` turns named statements on.
+pub fn named_statements_from_env() -> bool {
+    match std::env::var("GNOMON_TEST_NAMED_STATEMENTS").as_deref() {
+        Err(_) | Ok("") | Ok("0") => false,
+        Ok("1") => true,
+        Ok(other) => panic!("GNOMON_TEST_NAMED_STATEMENTS={other:?}: use 0 or 1"),
+    }
+}
 
 /// A new Tenant, unknown to every other test.
 pub fn tenant() -> gnomon::TenantId {
@@ -170,7 +191,7 @@ impl Server {
     /// `GNOMON_TEST_MIGRATION_PASSWORD`, or the superuser's when that is
     /// unset, as on the Supabase CLI stack and the test images.
     fn migration_url(&self, scheme: &str, db: &str) -> String {
-        let (host, port) = self.host_port();
+        let (host, port) = self.admin_host_port();
         let user = self
             .migration_role
             .clone()
@@ -424,21 +445,33 @@ impl TestDb {
         self.server.migration_url(scheme, &self.name)
     }
 
+    /// The Store, connected as the login role with [`connect_options`].
+    pub async fn store(&self) -> gnomon::Store {
+        gnomon::Store::connect(&self.login_url(), &connect_options())
+            .await
+            .expect("the Store connects")
+    }
+
     /// A raw connection as the login role, for the SQL-boundary suite.
     pub async fn login(&self) -> Client {
         connect(&self.login_config()).await
     }
 
     fn login_config(&self) -> Config {
-        let mut c = self.server.admin_config(&self.name);
-        c.user(LOGIN_ROLE).password(LOGIN_PASSWORD);
+        let (host, port) = self.server.callers_host_port();
+        let mut c = Config::new();
+        c.host(&host)
+            .port(port)
+            .dbname(&self.name)
+            .user(&self.server.login_user)
+            .password(LOGIN_PASSWORD);
         c
     }
 
     /// The login role's connection string, in the key=value form the Store
     /// accepts.
     pub fn login_url(&self) -> String {
-        let (host, port) = self.server.host_port();
+        let (host, port) = self.server.callers_host_port();
         self.login_url_at(&host, port)
     }
 
@@ -448,16 +481,27 @@ impl TestDb {
     }
 
     fn login_url_at(&self, host: &str, port: u16) -> String {
-        login_url(host, port, &self.name)
+        login_url(&self.server.login_user, host, port, &self.name)
     }
 
-    /// The server's TCP address, for a proxy to forward to.
+    /// Where callers connect, for a proxy to forward to: the pooler in a
+    /// pooler lane, otherwise the server.
     pub async fn server_addr(&self) -> std::net::SocketAddr {
-        let (host, port) = self.server.host_port();
-        let mut addrs = tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .unwrap();
-        addrs.next().unwrap()
+        let (host, port) = self.server.callers_host_port();
+        resolve(&host, port).await
+    }
+
+    /// The server's own address, behind any pooler, for a test of what the
+    /// Store sends whichever pooler the lane runs.
+    pub async fn direct_server_addr(&self) -> std::net::SocketAddr {
+        let (host, port) = self.server.admin_host_port();
+        resolve(&host, port).await
+    }
+
+    /// The login role's connection string, through a proxy at `addr` in
+    /// front of the server itself, with no pooler's user name suffix.
+    pub fn direct_login_url_through(&self, addr: std::net::SocketAddr) -> String {
+        login_url(LOGIN_ROLE, &addr.ip().to_string(), addr.port(), &self.name)
     }
 }
 
@@ -485,14 +529,20 @@ impl Drop for TestDb {
     }
 }
 
-/// The login role's connection string for database `db` on the server.
-pub async fn login_url_to(db: &str) -> String {
-    let (host, port) = Server::get().await.host_port();
-    login_url(&host, port, db)
+async fn resolve(host: &str, port: u16) -> std::net::SocketAddr {
+    let mut addrs = tokio::net::lookup_host((host, port)).await.unwrap();
+    addrs.next().unwrap()
 }
 
-fn login_url(host: &str, port: u16, db: &str) -> String {
-    format!("host={host} port={port} dbname={db} user={LOGIN_ROLE} password={LOGIN_PASSWORD}")
+/// The login role's connection string for database `db` on the server.
+pub async fn login_url_to(db: &str) -> String {
+    let server = Server::get().await;
+    let (host, port) = server.callers_host_port();
+    login_url(&server.login_user, &host, port, db)
+}
+
+fn login_url(user: &str, host: &str, port: u16, db: &str) -> String {
+    format!("host={host} port={port} dbname={db} user={user} password={LOGIN_PASSWORD}")
 }
 
 /// `s` with every byte but unreserved URL characters percent-encoded.

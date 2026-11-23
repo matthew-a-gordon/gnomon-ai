@@ -23,11 +23,15 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use tokio::sync::Mutex;
+use tokio_postgres::config::SslMode;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::types::Type;
-use tokio_postgres::{Client, NoTls, Transaction};
 
+use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::{Client, Config, NoTls, Row, Statement, Transaction};
+
+use crate::connect::ConnectOptions;
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
     AsOf, Bound, Citation, Episode, EpisodeId, Error, Kind, KindOf, NewEpisode, NewKind, NewNode,
@@ -62,30 +66,60 @@ impl CallerRole {
 /// The Store holds one connection and runs one call at a time on it.
 pub struct Store {
     client: Mutex<Client>,
+    statements: Statements,
     embedding_dimension: EmbeddingDimension,
 }
 
 impl Store {
-    /// Connects without TLS and checks the schema version.
-    ///
-    /// The check runs once, here. A Store that connected before a
-    /// migration was applied keeps the version it checked until it
-    /// reconnects.
+    /// Connects as the login role and checks the schema version.
     ///
     /// `connection` is a libpq-style URL or key=value string for the login
     /// role, which must be able to `SET ROLE` to `authenticated` and
-    /// `gnomon_worker`. TLS with certificate verification is not built yet,
-    /// so this connects in plain text.
-    pub async fn connect_no_tls(connection: &str) -> Result<Store, Error> {
-        let (mut client, conn) = tokio_postgres::connect(connection, NoTls).await?;
-        tokio::spawn(async move {
-            // The connection ends when the Store drops its client. An error
-            // here surfaces on the Store's next call.
-            let _ = conn.await;
-        });
-        let embedding_dimension = check_schema(&mut client).await?;
+    /// `gnomon_worker`. `options` decide TLS and the statement mode. By
+    /// default the Store connects with TLS and verifies the server's
+    /// certificate, and the connection string's `sslmode` cannot turn that
+    /// off: `sslmode=disable` with TLS on is refused, and so is
+    /// `sslmode=require` with [`Tls::plaintext`](crate::Tls::plaintext).
+    ///
+    /// The check runs once, here. A Store that connected before a
+    /// migration was applied keeps the version it checked until it
+    /// reconnects. Behind a transaction-mode pooler each call may run on
+    /// another server connection, but every one of them is to the same
+    /// database, so the version holds for all of them.
+    pub async fn connect(connection: &str, options: &ConnectOptions) -> Result<Store, Error> {
+        let mut config: Config = connection.parse()?;
+        let ssl_mode = config.get_ssl_mode();
+        let mut client = if options.tls.is_plaintext() {
+            if matches!(ssl_mode, SslMode::Require) {
+                return Err(Error::InvalidConnection(
+                    "the connection string sets sslmode=require, but the Store's TLS setting \
+                     is Tls::plaintext()"
+                        .into(),
+                ));
+            }
+            config.ssl_mode(SslMode::Disable);
+            spawn_connection(config.connect(NoTls).await?)
+        } else {
+            if matches!(ssl_mode, SslMode::Disable) {
+                return Err(Error::InvalidConnection(
+                    "the connection string sets sslmode=disable, which does not turn TLS off; \
+                     connect with Tls::plaintext() to connect without TLS"
+                        .into(),
+                ));
+            }
+            // Never fall back to plain text, as libpq's default `prefer` does.
+            config.ssl_mode(SslMode::Require);
+            let tls = options
+                .tls
+                .connector()?
+                .expect("a TLS mode other than plain text has a connector");
+            spawn_connection(config.connect(tls).await?)
+        };
+        let statements = Statements::new(options.named_statements);
+        let embedding_dimension = check_schema(&mut client, &statements).await?;
         Ok(Store {
             client: Mutex::new(client),
+            statements,
             embedding_dimension,
         })
     }
@@ -133,14 +167,73 @@ impl Store {
     }
 }
 
+/// How the Store sends its parameterized statements: unnamed through
+/// `query_typed` by default, or, with named statements turned on, prepared
+/// once per connection under a name and reused.
+struct Statements {
+    named: Option<std::sync::Mutex<HashMap<&'static str, Statement>>>,
+}
+
+impl Statements {
+    fn new(named: bool) -> Statements {
+        Statements {
+            named: named.then(Default::default),
+        }
+    }
+
+    /// Runs `sql` with `params` in `tx`.
+    async fn query(
+        &self,
+        tx: &Transaction<'_>,
+        sql: &'static str,
+        params: &[(&(dyn ToSql + Sync), Type)],
+    ) -> Result<Vec<Row>, tokio_postgres::Error> {
+        let Some(named) = &self.named else {
+            return tx.query_typed(sql, params).await;
+        };
+        let cached = named.lock().unwrap().get(sql).cloned();
+        let statement = match cached {
+            Some(statement) => statement,
+            None => {
+                let types: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
+                let statement = tx.prepare_typed(sql, &types).await?;
+                named.lock().unwrap().insert(sql, statement.clone());
+                statement
+            }
+        };
+        let values: Vec<&(dyn ToSql + Sync)> = params.iter().map(|(v, _)| *v).collect();
+        tx.query(&statement, &values).await
+    }
+}
+
+/// Drives a new connection in the background and returns its client. The
+/// connection ends when the Store drops its client. An error on it surfaces
+/// on the Store's next call.
+fn spawn_connection<S, T>(
+    (client, connection): (Client, tokio_postgres::Connection<S, T>),
+) -> Client
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
 /// Reads the ledger and the embedding dimension, as an end user would, and
 /// refuses any version but the one this build expects.
-async fn check_schema(client: &mut Client) -> Result<EmbeddingDimension, Error> {
+async fn check_schema(
+    client: &mut Client,
+    statements: &Statements,
+) -> Result<EmbeddingDimension, Error> {
     let tx = client.transaction().await?;
     tx.batch_execute(&format!("set local role {}", CallerRole::User.name()))
         .await?;
-    let row = match tx
-        .query_typed(
+    let row = match statements
+        .query(
+            &tx,
             "select (select max(version) from gnomon.schema_version), gnomon.embedding_dimension()",
             &[],
         )
@@ -202,8 +295,11 @@ impl Caller<'_> {
         let tx = client.transaction().await?;
         tx.batch_execute(&format!("set local role {}", self.role.name()))
             .await?;
-        let rows = tx
-            .query_typed(
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
                 "with claims as materialized (select set_config('request.jwt.claims', $1, true)) \
                  select gnomon.call_tenant($2) from claims",
                 &[
@@ -220,8 +316,11 @@ impl Caller<'_> {
     pub async fn record_episode(&self, episode: &NewEpisode) -> Result<EpisodeId, Error> {
         let mut client = self.store.client.lock().await;
         let (tx, tenant) = self.begin(&mut client, episode.tenant).await?;
-        let rows = tx
-            .query_typed(
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
                 "select gnomon.record_episode($1, $2, $3, $4, $5)",
                 &[
                     (&tenant.0, Type::UUID),
@@ -244,8 +343,11 @@ impl Caller<'_> {
     ) -> Result<Option<Episode>, Error> {
         let mut client = self.store.client.lock().await;
         let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
-        let rows = tx
-            .query_typed(
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
                 "select tenant_id, scope, id, content, reference_time, authority, recorded_at
                  from gnomon.read_episode($1, $2)",
                 &[(&tenant.0, Type::UUID), (&id.0, Type::UUID)],
@@ -278,22 +380,25 @@ impl Caller<'_> {
         let kind_of = kind.of.sql_name();
         let mut client = self.store.client.lock().await;
         let (tx, tenant) = self.begin(&mut client, kind.tenant).await?;
-        tx.query_typed(
-            "select gnomon.register_kind($1, $2, $3, $4, $5, $6, $7, $8)",
-            &[
-                (&tenant.0, Type::UUID),
-                (&kind.name, Type::TEXT),
-                (&kind_of, Type::TEXT),
-                (&kind.parent, Type::TEXT),
-                (&kind.properties, Type::JSONB),
-                (&kind.search, Type::TEXT_ARRAY),
-                (&source, Type::TEXT_ARRAY),
-                (&target, Type::TEXT_ARRAY),
-            ],
-        )
-        .await
-        .map_err(Error::from_store)?;
-        let registered = read_kind(&tx, tenant, &kind.name).await?;
+        self.store
+            .statements
+            .query(
+                &tx,
+                "select gnomon.register_kind($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&kind.name, Type::TEXT),
+                    (&kind_of, Type::TEXT),
+                    (&kind.parent, Type::TEXT),
+                    (&kind.properties, Type::JSONB),
+                    (&kind.search, Type::TEXT_ARRAY),
+                    (&source, Type::TEXT_ARRAY),
+                    (&target, Type::TEXT_ARRAY),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        let registered = read_kind(&tx, &self.store.statements, tenant, &kind.name).await?;
         tx.commit().await?;
         Ok(registered.expect("a Kind just registered is visible to its registrant"))
     }
@@ -307,7 +412,7 @@ impl Caller<'_> {
     ) -> Result<Option<Kind>, Error> {
         let mut client = self.store.client.lock().await;
         let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
-        let kind = read_kind(&tx, tenant, name).await?;
+        let kind = read_kind(&tx, &self.store.statements, tenant, name).await?;
         tx.commit().await?;
         Ok(kind)
     }
@@ -396,8 +501,11 @@ impl Caller<'_> {
             let node = match target {
                 Target::Existing(node) => *node,
                 Target::New(new) => {
-                    let rows = tx
-                        .query_typed(
+                    let rows = self
+                        .store
+                        .statements
+                        .query(
+                            &tx,
                             "select gnomon.create_node($1, $2, $3)",
                             &[
                                 (&tenant.0, Type::UUID),
@@ -410,7 +518,10 @@ impl Caller<'_> {
                     NodeId(rows[0].get(0))
                 }
             };
-            done.push((node, write_patch(&tx, tenant, node, patch).await?));
+            done.push((
+                node,
+                write_patch(&tx, &self.store.statements, tenant, node, patch).await?,
+            ));
         }
         tx.commit().await?;
         Ok(done)
@@ -427,8 +538,11 @@ impl Caller<'_> {
     ) -> Result<Option<NodeVersion>, Error> {
         let mut client = self.store.client.lock().await;
         let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
-        let rows = tx
-            .query_typed(
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
                 "select id, node_id, scope, kind, props,
                         nullif(valid_from, '-infinity'), valid_from_precision::text,
                         nullif(valid_to, 'infinity'), valid_to_precision::text,
@@ -473,8 +587,11 @@ impl Caller<'_> {
     ) -> Result<Vec<Citation>, Error> {
         let mut client = self.store.client.lock().await;
         let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
-        let rows = tx
-            .query_typed(
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
                 "select episode_id, property, place, recorded_at, episode_recorded_at
                  from gnomon.list_citations($1, $2)",
                 &[(&tenant.0, Type::UUID), (&version.0, Type::UUID)],
@@ -496,6 +613,7 @@ impl Caller<'_> {
 
 async fn write_patch(
     tx: &Transaction<'_>,
+    statements: &Statements,
     tenant: TenantId,
     node: NodeId,
     patch: &Patch,
@@ -511,8 +629,7 @@ async fn write_patch(
                 .collect(),
         )
     });
-    let rows = tx
-        .query_typed(
+    let rows = statements.query(tx,
             "select status, recorded_at, versions from gnomon.write_node($1, $2, $3, $4, $5, $6, $7)",
             &[
                 (&tenant.0, Type::UUID),
@@ -557,11 +674,13 @@ fn bound(at: Option<DateTime<Utc>>, precision: &str) -> Bound {
 
 async fn read_kind(
     tx: &Transaction<'_>,
+    statements: &Statements,
     tenant: TenantId,
     name: &str,
 ) -> Result<Option<Kind>, Error> {
-    let rows = tx
-        .query_typed(
+    let rows = statements
+        .query(
+            tx,
             "select name, kind_of, parent, ancestors, properties, rules, search,
                     source_kinds, target_kinds
              from gnomon.read_kind($1, $2)",

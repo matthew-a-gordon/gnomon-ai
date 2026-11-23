@@ -126,7 +126,9 @@ fn as_of_reads_agree_with_an_oracle_over_the_contributions() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (db, store, tenant) = rt.block_on(async {
         let db = TestDb::migrated().await;
-        let store = Store::connect_no_tls(&db.login_url()).await.unwrap();
+        let store = Store::connect(&db.login_url(), &support::connect_options())
+            .await
+            .unwrap();
         (db, store, support::tenant())
     });
     let mut runner = TestRunner::new(Config {

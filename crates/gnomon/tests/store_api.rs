@@ -12,7 +12,7 @@ use support::TestDb;
 #[tokio::test]
 async fn the_store_accepts_a_freshly_migrated_database() {
     let db = TestDb::migrated().await;
-    Store::connect_no_tls(&db.login_url())
+    Store::connect(&db.login_url(), &support::connect_options())
         .await
         .expect("the Store connects");
 }
@@ -20,7 +20,9 @@ async fn the_store_accepts_a_freshly_migrated_database() {
 #[tokio::test]
 async fn the_store_reports_the_embedding_dimension_the_migrations_were_exported_with() {
     let db = TestDb::migrated_with_dimension(768).await;
-    let store = Store::connect_no_tls(&db.login_url()).await.unwrap();
+    let store = Store::connect(&db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
     assert_eq!(store.embedding_dimension().get(), 768);
 }
 
@@ -28,7 +30,7 @@ async fn the_store_reports_the_embedding_dimension_the_migrations_were_exported_
 async fn the_store_refuses_a_database_with_no_gnomon_schema() {
     let db = TestDb::empty_with_login().await;
 
-    match Store::connect_no_tls(&db.login_url()).await {
+    match Store::connect(&db.login_url(), &support::connect_options()).await {
         Err(Error::SchemaVersion { expected, found }) => {
             assert_eq!(expected, gnomon::migrations::SCHEMA_VERSION);
             assert_eq!(found, None);
@@ -50,7 +52,7 @@ async fn the_store_refuses_a_schema_newer_than_it_expects() {
         .await
         .unwrap();
 
-    match Store::connect_no_tls(&db.login_url()).await {
+    match Store::connect(&db.login_url(), &support::connect_options()).await {
         Err(Error::SchemaVersion { expected, found }) => {
             assert_eq!(expected, gnomon::migrations::SCHEMA_VERSION);
             assert_eq!(found, Some(next));
@@ -72,7 +74,7 @@ async fn the_store_refuses_a_half_applied_chain() {
         .await
         .unwrap();
 
-    match Store::connect_no_tls(&db.login_url()).await {
+    match Store::connect(&db.login_url(), &support::connect_options()).await {
         Err(Error::SchemaVersion { found, .. }) => assert_eq!(found, Some(last - 1)),
         Err(other) => panic!("expected a schema version error, got {other:?}"),
         Ok(_) => panic!("the Store ran against a half-applied chain"),
@@ -91,7 +93,7 @@ async fn the_store_refuses_a_schema_whose_embedding_dimension_pgvector_cannot_st
         .await
         .unwrap();
 
-    match Store::connect_no_tls(&db.login_url()).await {
+    match Store::connect(&db.login_url(), &support::connect_options()).await {
         Err(Error::InvalidEmbeddingDimension(0)) => {}
         Err(other) => panic!("expected an invalid embedding dimension, got {other:?}"),
         Ok(_) => panic!("the Store accepted embedding dimension 0"),
@@ -118,7 +120,9 @@ fn episode(tenant: TenantId, scope: &str, content: &str) -> NewEpisode {
 }
 
 async fn store(db: &TestDb) -> Store {
-    Store::connect_no_tls(&db.login_url()).await.unwrap()
+    Store::connect(&db.login_url(), &support::connect_options())
+        .await
+        .unwrap()
 }
 
 /// A call that names a Tenant its claims do not bind fails before it
@@ -485,7 +489,9 @@ async fn every_call_sends_only_unnamed_statements_inside_one_transaction_that_se
 ) {
     let db = TestDb::migrated().await;
     let (proxy, log) = wire::record(db.server_addr().await).await;
-    let store = Store::connect_no_tls(&db.login_url_through(proxy))
+    // The default statement mode, whatever GNOMON_TEST_NAMED_STATEMENTS says.
+    let options = gnomon::ConnectOptions::default().tls(gnomon::Tls::plaintext());
+    let store = Store::connect(&db.login_url_through(proxy), &options)
         .await
         .unwrap();
     let t = tenant();
@@ -539,4 +545,53 @@ async fn every_call_sends_only_unnamed_statements_inside_one_transaction_that_se
         assert_eq!(tx.len(), 3, "each call is one Store function call: {tx:#?}");
         assert!(tx[2].contains("gnomon."), "{tx:#?}");
     }
+}
+
+#[tokio::test]
+async fn with_named_statements_turned_on_each_statement_is_prepared_once_per_connection_and_reused()
+{
+    let db = TestDb::migrated().await;
+    // Straight to the server: this is what the Store sends, and a lane's
+    // pooler may not support named statements.
+    let (proxy, log) = wire::record(db.direct_server_addr().await).await;
+    let options = gnomon::ConnectOptions::default()
+        .tls(gnomon::Tls::plaintext())
+        .named_statements(true);
+    let store = Store::connect(&db.direct_login_url_through(proxy), &options)
+        .await
+        .unwrap();
+    let t = tenant();
+
+    let alice = store.as_user(user(t, &["support"]));
+    for i in 0..3 {
+        let content = format!("Call {i}.");
+        let id = alice
+            .record_episode(&episode(t, "support", &content))
+            .await
+            .unwrap();
+        let read = alice.read_episode(t, id).await.unwrap().unwrap();
+        assert_eq!(read.content, content);
+    }
+
+    let parses: Vec<(String, String)> = log
+        .sent()
+        .into_iter()
+        .filter_map(|m| match m {
+            Sent::Parse { name, sql } => Some((name, sql)),
+            _ => None,
+        })
+        .collect();
+    for (name, sql) in &parses {
+        assert!(
+            !name.is_empty(),
+            "an unnamed statement was sent for {sql:?}"
+        );
+    }
+    // The schema check, the claims, recording and reading: each prepared
+    // once, though the calls ran three times.
+    assert_eq!(parses.len(), 4, "{parses:#?}");
+    let mut sqls: Vec<_> = parses.iter().map(|(_, sql)| sql).collect();
+    sqls.sort();
+    sqls.dedup();
+    assert_eq!(sqls.len(), 4, "a statement was prepared twice: {parses:#?}");
 }

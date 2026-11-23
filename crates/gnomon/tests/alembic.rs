@@ -166,7 +166,7 @@ async fn alembic_upgrade_head_applies_a_schema_the_store_accepts() {
         .alembic(&["upgrade", "head"], Some(&url))
         .expect("alembic upgrade head");
 
-    let store = gnomon::Store::connect_no_tls(&db.login_url())
+    let store = gnomon::Store::connect(&db.login_url(), &support::connect_options())
         .await
         .expect("the Store accepts the schema Alembic applied");
     assert_eq!(store.embedding_dimension().get(), 1536);
@@ -197,7 +197,7 @@ async fn alembic_upgrade_head_applies_only_the_new_revision_after_a_release() {
     project
         .alembic(&["upgrade", "head"], Some(&url))
         .expect("the consumer's revision upgrades");
-    match gnomon::Store::connect_no_tls(&db.login_url()).await {
+    match gnomon::Store::connect(&db.login_url(), &support::connect_options()).await {
         Err(gnomon::Error::SchemaVersion { found, .. }) => {
             assert_eq!(found, Some(gnomon::migrations::SCHEMA_VERSION - 1));
         }
@@ -211,7 +211,7 @@ async fn alembic_upgrade_head_applies_only_the_new_revision_after_a_release() {
         .expect("alembic upgrade head applies the new revision");
     let current = project.alembic(&["current"], Some(&url)).unwrap();
     assert_eq!(current.split_whitespace().next(), Some(last.as_str()));
-    gnomon::Store::connect_no_tls(&db.login_url())
+    gnomon::Store::connect(&db.login_url(), &support::connect_options())
         .await
         .expect("the Store accepts the upgraded schema");
 }

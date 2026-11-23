@@ -68,8 +68,11 @@ async fn relay(client: TcpStream, server: TcpStream, log: WireLog) -> std::io::R
             let mut body = vec![0u8; len - 4];
             client_read.read_exact(&mut body).await?;
             log.push(parse(header[0], &body));
-            server_write.write_all(&header).await?;
-            server_write.write_all(&body).await?;
+            // One write per message, as a client makes: Supavisor refuses
+            // an authentication message that arrives in two reads.
+            let mut message = header.to_vec();
+            message.extend_from_slice(&body);
+            server_write.write_all(&message).await?;
         }
         #[allow(unreachable_code)]
         Ok::<(), std::io::Error>(())
@@ -94,8 +97,9 @@ async fn startup(
         client.read_exact(&mut len).await?;
         let mut body = vec![0u8; u32::from_be_bytes(len) as usize - 4];
         client.read_exact(&mut body).await?;
-        server.write_all(&len).await?;
-        server.write_all(&body).await?;
+        let mut message = len.to_vec();
+        message.extend_from_slice(&body);
+        server.write_all(&message).await?;
         let code = u32::from_be_bytes(body[0..4].try_into().unwrap());
         if code != SSL_REQUEST && code != GSSENC_REQUEST {
             return Ok(());

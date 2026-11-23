@@ -138,9 +138,12 @@ async fn the_cli_applied_every_gnomon_migration_to_the_stack_as_postgres() {
 
     // Creates the harness's login role, which the Store connects as.
     let _creates_the_login_role = support::TestDb::empty_with_login().await;
-    gnomon::Store::connect_no_tls(&support::login_url_to("postgres").await)
-        .await
-        .expect("the Store accepts the schema the CLI applied");
+    gnomon::Store::connect(
+        &support::login_url_to("postgres").await,
+        &support::connect_options(),
+    )
+    .await
+    .expect("the Store accepts the schema the CLI applied");
 }
 
 #[tokio::test]

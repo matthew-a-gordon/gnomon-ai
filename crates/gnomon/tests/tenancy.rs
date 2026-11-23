@@ -17,7 +17,9 @@ use serde_json::{json, Map, Value};
 use support::TestDb;
 
 async fn store(db: &TestDb) -> Store {
-    Store::connect_no_tls(&db.login_url()).await.unwrap()
+    Store::connect(&db.login_url(), &support::connect_options())
+        .await
+        .unwrap()
 }
 
 /// An end user's claims that bind no Tenant, as a single-tenant deployment

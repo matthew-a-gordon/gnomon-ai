@@ -37,7 +37,9 @@ struct World {
 impl World {
     async fn new() -> World {
         let db = TestDb::migrated().await;
-        let store = Store::connect_no_tls(&db.login_url()).await.unwrap();
+        let store = Store::connect(&db.login_url(), &support::connect_options())
+            .await
+            .unwrap();
         World {
             _db: db,
             store,
@@ -918,7 +920,11 @@ async fn concurrent_writes_to_one_node_all_land_in_recorded_order() {
         .await;
     let mut stores = Vec::new();
     for _ in 0..6 {
-        stores.push(Store::connect_no_tls(&w._db.login_url()).await.unwrap());
+        stores.push(
+            Store::connect(&w._db.login_url(), &support::connect_options())
+                .await
+                .unwrap(),
+        );
     }
     let writes = stores.iter().enumerate().map(|(i, store)| {
         let w = &w;

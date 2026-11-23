@@ -88,8 +88,15 @@ const IMAGES: &[TestImage] = &[
 ];
 
 pub struct Server {
-    /// A superuser on the server, with no database chosen.
+    /// A superuser on the server, with no database chosen. Setup steps
+    /// connect here, straight to the server even in a pooler lane.
     pub(super) admin: Config,
+    /// Where callers connect: the Store and raw login-role connections. The
+    /// pooler in a pooler lane, otherwise the server itself.
+    callers: (String, u16),
+    /// The user name the login role connects with: the role itself, or
+    /// `<role>.<tenant>` behind Supavisor.
+    pub(super) login_user: String,
     pub(super) migration_role: Option<String>,
     lock_path: PathBuf,
 }
@@ -113,16 +120,24 @@ impl Server {
 
     async fn start() -> Server {
         if let Ok(url) = std::env::var("GNOMON_TEST_DATABASE_URL") {
-            let admin: Config = url
+            let tests: Config = url
                 .parse()
                 .expect("GNOMON_TEST_DATABASE_URL is a Postgres connection string");
-            let migration_role = std::env::var("GNOMON_TEST_MIGRATION_ROLE")
-                .ok()
-                .filter(|r| !r.is_empty());
+            // In a pooler lane, setup goes straight to the server behind
+            // the pooler, and only callers go through it.
+            let admin: Config = match env("GNOMON_TEST_DIRECT_DATABASE_URL") {
+                Some(direct) => direct
+                    .parse()
+                    .expect("GNOMON_TEST_DIRECT_DATABASE_URL is a Postgres connection string"),
+                None => tests.clone(),
+            };
+            let migration_role = env("GNOMON_TEST_MIGRATION_ROLE");
             let (host, port) = host_port(&admin);
             let server = Server {
+                callers: host_port(&tests),
                 admin,
                 migration_role,
+                login_user: login_user(),
                 lock_path: lock_path(&format!("url-{host}-{port}")),
             };
             server.wait_ready().await;
@@ -150,8 +165,10 @@ impl Server {
             .password(PASSWORD)
             .dbname("postgres");
         let server = Server {
+            callers: host_port(&admin),
             admin,
             migration_role: image.migration_role.map(str::to_owned),
+            login_user: login_user(),
             lock_path,
         };
         server.wait_ready().await;
@@ -163,8 +180,15 @@ impl Server {
         Lock::take(&self.lock_path)
     }
 
-    pub fn host_port(&self) -> (String, u16) {
+    /// The server's own address, where setup steps connect.
+    pub fn admin_host_port(&self) -> (String, u16) {
         host_port(&self.admin)
+    }
+
+    /// Where callers connect: the pooler in a pooler lane, otherwise the
+    /// server's own address.
+    pub fn callers_host_port(&self) -> (String, u16) {
+        self.callers.clone()
     }
 
     /// Waits until the superuser can run a query. A new container accepts
@@ -198,6 +222,20 @@ impl Lock {
             .expect("open the test server's lock file");
         file.lock().expect("take the test server's lock");
         Lock(file)
+    }
+}
+
+/// An environment variable, if it is set and not empty.
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// The login role's user name: `GNOMON_TEST_POOLER_TENANT`, when set, is
+/// Supavisor's tenant, which it reads from the user name's suffix.
+fn login_user() -> String {
+    match env("GNOMON_TEST_POOLER_TENANT") {
+        Some(tenant) => format!("{}.{tenant}", super::LOGIN_ROLE),
+        None => super::LOGIN_ROLE.to_owned(),
     }
 }
 

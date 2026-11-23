@@ -62,7 +62,9 @@ struct World {
 
 async fn world() -> World {
     let db = TestDb::migrated().await;
-    let store = Store::connect_no_tls(&db.login_url()).await.unwrap();
+    let store = Store::connect(&db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
     let (t1, t2) = (Uuid::new_v4(), Uuid::new_v4());
     let record = |t: Uuid, scope: &str| {
         let store = &store;
@@ -230,7 +232,9 @@ async fn a_caller_cannot_update_or_delete_any_episode_even_its_own() {
     }
 
     // Nothing changed.
-    let store = Store::connect_no_tls(&w.db.login_url()).await.unwrap();
+    let store = Store::connect(&w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
     let read = store
         .as_worker(TenantId(w.t2), Scope::new("support"))
         .read_episode(TenantId(w.t2), EpisodeId(w.t2_support))
@@ -790,7 +794,9 @@ struct Nodes {
 
 async fn nodes() -> Nodes {
     let w = world().await;
-    let store = Store::connect_no_tls(&w.db.login_url()).await.unwrap();
+    let store = Store::connect(&w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
     let mut made = Vec::new();
     for (t, ep) in [(w.t1, w.t1_support), (w.t2, w.t2_support)] {
         let caller = store.as_worker(TenantId(t), Scope::new("support"));
@@ -1393,7 +1399,9 @@ async fn a_write_that_started_before_a_committed_write_to_the_node_fails_and_can
     let tx = as_caller(&mut early, USER, &claims(n.w.t1, &["support"])).await;
     // The early transaction's time is fixed when it starts. A write to the
     // Node then commits.
-    let store = Store::connect_no_tls(&n.w.db.login_url()).await.unwrap();
+    let store = Store::connect(&n.w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
     store
         .as_worker(TenantId(n.w.t1), Scope::new("support"))
         .write_node(
@@ -1652,7 +1660,9 @@ async fn in_multi_tenant_mode_claims_that_bind_no_tenant_reach_no_row_of_the_for
     db.grant_kind_registration("authenticated").await;
     let first = db.default_tenant().await.0;
     // A single-tenant deployment writes through the Store, naming no Tenant.
-    let store = Store::connect_no_tls(&db.login_url()).await.unwrap();
+    let store = Store::connect(&db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
     let single = store.as_worker(None, Scope::new("support"));
     let episode = single
         .record_episode(&NewEpisode {
@@ -1775,7 +1785,9 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
     let first = db.default_tenant().await.0;
     // A single-tenant deployment writes a row into every table through the
     // Store, naming no Tenant.
-    let store = Store::connect_no_tls(&db.login_url()).await.unwrap();
+    let store = Store::connect(&db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
     let single = store.as_user(
         serde_json::from_value(
             json!({ "role": "authenticated", "app_metadata": { "scopes": ["support"] } }),

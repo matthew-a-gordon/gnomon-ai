@@ -1,0 +1,54 @@
+# Lane 4's Supavisor (ADR-0020): the Supabase CLI local stack with only the
+# database and the pooler running. Everything else is off. The stack uses
+# ports 56050 to 56059 only, so it never collides with another project's
+# stack on the CLI's default ports.
+project_id = "gnomon-t5"
+
+[api]
+enabled = false
+port = 56051
+
+[db]
+port = 56052
+shadow_port = 56050
+major_version = 17
+
+# Supavisor in transaction mode. The pool size and client limit are the
+# CLI's own defaults, written out so a run records what it used.
+[db.pooler]
+enabled = true
+port = 56053
+pool_mode = "transaction"
+default_pool_size = 20
+max_client_conn = 100
+
+[db.migrations]
+enabled = false
+
+[db.seed]
+enabled = false
+
+[realtime]
+enabled = false
+
+[studio]
+enabled = false
+port = 56054
+
+[local_smtp]
+enabled = false
+port = 56055
+
+[storage]
+enabled = false
+
+[auth]
+enabled = false
+
+[edge_runtime]
+enabled = false
+inspector_port = 56057
+
+[analytics]
+enabled = false
+port = 56056
