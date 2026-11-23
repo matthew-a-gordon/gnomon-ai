@@ -71,12 +71,15 @@
 --                a quantized row by then, so none is stored for a hash no
 --                Version has.
 --
--- No trigger runs on the write path. A Version is closed by an update of its
--- Recorded-time end, which reaches its quantized row through the foreign key
--- `(tenant_id, scope, version_id, recorded_to)` with ON UPDATE CASCADE. The
--- key needs a unique index on those columns of `gnomon.version`. A Version
--- deleted by the transaction that wrote it, or by an Erasure, takes its
--- quantized row with it.
+-- The write path gains no trigger function of gnomon's. The triggers above
+-- run only when an embedding is stored. A Version is closed by an update of
+-- its Recorded-time end, which reaches its quantized row through the foreign
+-- key `(tenant_id, scope, version_id, recorded_to)` with ON UPDATE CASCADE.
+-- That key costs the write path Postgres's own referential triggers on
+-- `gnomon.version`, which look up a closed or deleted Version's quantized row
+-- by its primary key, and the unique index on those columns of
+-- `gnomon.version` the key needs. A Version deleted by the transaction that
+-- wrote it, or by an Erasure, takes its quantized row with it.
 --
 -- Erasure (ADR-0003). `gnomon.erase_version_text` now deletes the quantized
 -- rows of every Version an Erasure deletes or recomputes, then the full
@@ -85,8 +88,13 @@
 -- Version uses a full vector through its quantized row, so a full vector
 -- shared with a surviving Version stays, and one a recomputed Version alone
 -- used goes with its row. The Pipeline embeds the recomputed text afterwards.
--- No embedding row names an Episode, so `gnomon.erase_episode_rows` needs
--- nothing more. The definer may read and delete the embeddings of an Edge the
+-- A full vector is kept while a quantized row uses it, not while some
+-- Version merely has its text: a surviving Version with no quantized row yet
+-- gets its vector again when the Pipeline embeds it, and checking every
+-- Version of a Scope by text would cost an Erasure a scan of the Scope or the
+-- write path an index on the text hash. No embedding row names an Episode,
+-- and an embedding reaches its Episodes through its Version's Citations, so
+-- `gnomon.erase_episode_rows` needs nothing more. The definer may read and delete the embeddings of an Edge the
 -- running Erasure reaches in a Scope the caller cannot see (migration 0012),
 -- and read the quantized rows of that Scope that share their texts, so that
 -- it keeps a full vector another Version there still uses.

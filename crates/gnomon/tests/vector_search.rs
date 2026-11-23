@@ -11,7 +11,7 @@ use gnomon::{
 };
 use serde_json::json;
 use support::erasure::{at, World, SCOPE};
-use support::vectors::{cosine_distance, Rng};
+use support::vectors::{cosine_distance, embed_every_version, sentence_hash, Rng};
 
 fn now() -> AsOf {
     AsOf::current(at(2024, 6, 1))
@@ -338,19 +338,6 @@ async fn vector_search_honours_the_valid_at_and_known_at_instants() {
     .is_empty());
 }
 
-/// The hash of a Sentence's text, as the Store computes it.
-async fn sentence_hash(w: &World, sentence: &str) -> String {
-    w.db.admin()
-        .await
-        .query_typed(
-            "select gnomon.sentence_text_hash($1)",
-            &[(&sentence, tokio_postgres::types::Type::TEXT)],
-        )
-        .await
-        .unwrap()[0]
-        .get(0)
-}
-
 #[tokio::test]
 async fn an_edge_version_is_embedded_under_its_sentences_hash_or_its_own_and_no_other() {
     let w = World::new().await;
@@ -589,8 +576,11 @@ async fn recall_at_10_matches_prototype_5_for_a_small_scope_inside_a_large_tenan
     // Prototype 5 measured recall@10 of 1.00 for a 1,000-row Scope inside a
     // 200,000-row Tenant, at "now" and at its past known-at, with per-Version
     // quantized rows (FINDINGS.md, measurement 4), and 1.00 for 10,000
-    // visible rows. Its vectors and ours are drawn the same way; ours are
-    // fewer, and our re-rank keeps 400 where it kept 200. The tolerance is
+    // visible rows. Its vectors and ours are drawn the same way. Ours are
+    // fewer: the policy is an index condition, so the rest of the Tenant
+    // changes which rows are scanned only through the large Scope's rows near
+    // the same subtopics, which this Tenant has. Our re-rank keeps 400 where
+    // that measurement kept 200. The tolerance is
     // 0.05: synthetic clusters hold many near-equidistant neighbours, and
     // pgvector sums in single precision where the oracle sums in double.
     const PROTOTYPE_5: f64 = 1.00;
@@ -707,43 +697,15 @@ async fn the_re_rank_reads_each_candidates_full_vector_by_one_primary_key_probe(
     }
 }
 
-/// Stores an embedding for every Version of `scope`, current and closed, as
-/// that Scope's worker, one vector per text, so Versions with the same text
-/// pass the same vector. Returns the vector of each text hash.
-async fn embed_every_version(
-    w: &World,
-    scope: &str,
-    rng: &mut Rng,
-) -> std::collections::HashMap<String, Vec<f32>> {
-    let rows =
-        w.db.admin()
-            .await
-            .query_typed(
-                "select id, text_hash from gnomon.version where scope = $1 order by id",
-                &[(&scope, tokio_postgres::types::Type::TEXT)],
-            )
-            .await
-            .unwrap();
-    let mut vectors = std::collections::HashMap::new();
-    for r in rows {
-        let (id, hash): (uuid::Uuid, String) = (r.get(0), r.get(1));
-        let v = vectors
-            .entry(hash.clone())
-            .or_insert_with(|| rng.unit())
-            .clone();
-        w.worker_in(scope)
-            .store_embedding(w.tenant, gnomon::VersionId(id), &hash, &v)
-            .await
-            .unwrap();
-    }
-    vectors
-}
-
-/// Counts rows of a gnomon table past RLS.
-async fn rows(w: &World, sql: &str, hash: &str) -> i64 {
+/// How many full vectors of the text whose hash is `hash` are stored, past
+/// RLS.
+async fn full_vectors_of(w: &World, hash: &str) -> i64 {
     w.db.admin()
         .await
-        .query_typed(sql, &[(&hash, tokio_postgres::types::Type::TEXT)])
+        .query_typed(
+            "select count(*) from gnomon.embedding where text_hash = $1",
+            &[(&hash, tokio_postgres::types::Type::TEXT)],
+        )
         .await
         .unwrap()[0]
         .get(0)
@@ -803,12 +765,7 @@ async fn erasure_deletes_the_embeddings_of_erased_and_recomputed_text_and_keeps_
     let basic = w.read(v, at(2024, 1, 1)).await.unwrap().text_hash;
     assert_eq!(hash_of(y).await, shared);
     assert_eq!(
-        rows(
-            &w,
-            "select count(*) from gnomon.embedding where text_hash = $1",
-            &shared
-        )
-        .await,
+        full_vectors_of(&w, &shared).await,
         1,
         "x and y share one full vector"
     );
@@ -830,24 +787,11 @@ async fn erasure_deletes_the_embeddings_of_erased_and_recomputed_text_and_keeps_
     assert_eq!(found[0].of, Versioned::Node(y));
     assert!(found[0].distance.abs() < 1e-5);
     assert!(found.iter().all(|c| c.of != Versioned::Node(x)));
-    assert_eq!(
-        rows(
-            &w,
-            "select count(*) from gnomon.embedding where text_hash = $1",
-            &shared
-        )
-        .await,
-        1
-    );
+    assert_eq!(full_vectors_of(&w, &shared).await, 1);
     // The full vectors only E's text and v's recomputed Versions used are gone.
     for hash in [&erased_only, &erased_plan, &basic] {
         assert_eq!(
-            rows(
-                &w,
-                "select count(*) from gnomon.embedding where text_hash = $1",
-                hash
-            )
-            .await,
+            full_vectors_of(&w, hash).await,
             0,
             "the full vector of {hash} is left"
         );
@@ -944,22 +888,12 @@ async fn erasing_a_node_deletes_the_embeddings_of_its_edge_in_a_scope_the_caller
     assert!(!edges.contains(&Versioned::Edge(erased)), "{edges:?}");
     assert!(!edges.contains(&Versioned::Edge(alone)), "{edges:?}");
     assert_eq!(
-        rows(
-            &w,
-            "select count(*) from gnomon.embedding where text_hash = $1",
-            &shared
-        )
-        .await,
+        full_vectors_of(&w, &shared).await,
         1,
         "the full vector the kept Edge uses stays"
     );
     assert_eq!(
-        rows(
-            &w,
-            "select count(*) from gnomon.embedding where text_hash = $1",
-            &own
-        )
-        .await,
+        full_vectors_of(&w, &own).await,
         0,
         "the full vector only the erased Edge used is gone"
     );

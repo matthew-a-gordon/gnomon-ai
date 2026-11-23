@@ -3,6 +3,14 @@
 //! two-level clusters, so each subtopic holds many near-equidistant
 //! neighbours. Every draw is seeded, so a run is repeatable.
 
+use std::collections::HashMap;
+
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use tokio_postgres::types::Type;
+use uuid::Uuid;
+
+use super::erasure::World;
+
 /// The dimension the suites export the migrations with.
 pub const DIM: usize = super::DEFAULT_DIMENSION as usize;
 
@@ -100,10 +108,6 @@ pub fn subtopics(rng: &mut Rng, topics: usize, subs: usize) -> Vec<Vec<f32>> {
     out
 }
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
-use tokio_postgres::types::Type;
-use uuid::Uuid;
-
 /// One Version of the synthetic corpus, and which text it holds.
 #[derive(Debug, Clone)]
 pub struct SyntheticVersion {
@@ -198,11 +202,9 @@ pub async fn load(
 ) {
     let utc = |y, m, d| Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap();
     let (r_start, r_end) = (utc(2024, 1, 1), utc(2026, 11, 1));
-    let (node_ids, mut ids, mut props, mut vf, mut vt, mut rf, mut rt) =
-        (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
-    let mut node_of = vec![];
+    let (mut node_ids, mut ids, mut node_of, mut props) = (vec![], vec![], vec![], vec![]);
+    let (mut vf, mut vt, mut rf, mut rt) = (vec![], vec![], vec![], vec![]);
     let mut made = 0;
-    let mut node_ids = node_ids;
     while made < n {
         let chain = match rng.uniform() {
             x if x < 0.6 => 1,
@@ -234,12 +236,16 @@ pub async fn load(
         }
         let mut at = day(rng, r_start, r_end - Duration::days(30));
         for (i, text) in held.iter().enumerate() {
+            // Each Version but the last is closed by the next, from one to
+            // 200 days later and before the end of the range.
             let next = (i + 1 < held.len()).then(|| {
-                (at + Duration::days(1 + rng.below(200) as i64)).min(r_end - Duration::days(1))
+                let later = at + Duration::days(1 + rng.below(200) as i64);
+                if later < r_end {
+                    later
+                } else {
+                    at + Duration::hours(1)
+                }
             });
-            let next = next
-                .filter(|n| *n > at)
-                .or_else(|| (i + 1 < held.len()).then(|| at + Duration::hours(1)));
             let id = Uuid::new_v4();
             corpus.versions.push(SyntheticVersion {
                 id,
@@ -350,4 +356,49 @@ pub async fn load(
         .unwrap();
         tx.commit().await.unwrap();
     }
+}
+
+/// The hash of a Sentence's text, as the Store computes it.
+pub async fn sentence_hash(w: &World, sentence: &str) -> String {
+    w.db.admin()
+        .await
+        .query_typed(
+            "select gnomon.sentence_text_hash($1)",
+            &[(&sentence, Type::TEXT)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0)
+}
+
+/// Stores an embedding of the values of every Version of `scope`, current
+/// and closed, as that Scope's worker, one vector per text, so Versions with
+/// the same text pass the same vector. Returns the vector of each text hash.
+pub async fn embed_every_version(
+    w: &World,
+    scope: &str,
+    rng: &mut Rng,
+) -> HashMap<String, Vec<f32>> {
+    let rows =
+        w.db.admin()
+            .await
+            .query_typed(
+                "select id, text_hash from gnomon.version where scope = $1 order by id",
+                &[(&scope, Type::TEXT)],
+            )
+            .await
+            .unwrap();
+    let mut vectors = HashMap::new();
+    for r in rows {
+        let (id, hash): (Uuid, String) = (r.get(0), r.get(1));
+        let v = vectors
+            .entry(hash.clone())
+            .or_insert_with(|| rng.unit())
+            .clone();
+        w.worker_in(scope)
+            .store_embedding(w.tenant, gnomon::VersionId(id), &hash, &v)
+            .await
+            .unwrap();
+    }
+    vectors
 }

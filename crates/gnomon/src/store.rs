@@ -1166,8 +1166,8 @@ impl Caller<'_> {
     /// is larger, are re-ranked at full precision. A Version whose embedding
     /// is not stored yet is not found here; the full-text branch finds it.
     ///
-    /// A `limit` below 1, or a `query` that [`store_embedding`]
-    /// (Self::store_embedding) would refuse, fails with
+    /// A `limit` below 1, or a `query` that
+    /// [`store_embedding`](Self::store_embedding) would refuse, fails with
     /// [`Error::Database`] and SQLSTATE 22023.
     pub async fn search_vector(
         &self,
