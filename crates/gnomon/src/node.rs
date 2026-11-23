@@ -370,3 +370,13 @@ pub struct Statement {
     /// When gnomon recorded the statement: when its transaction started.
     pub recorded_at: DateTime<Utc>,
 }
+
+/// What Retract Episode recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeRetraction {
+    /// When the Retractions were recorded: when the call's transaction
+    /// started.
+    pub recorded_at: DateTime<Utc>,
+    /// The Versions retracted, each cited only by the Episode.
+    pub retracted: Vec<VersionId>,
+}

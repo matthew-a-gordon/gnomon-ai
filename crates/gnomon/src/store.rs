@@ -36,9 +36,10 @@ use crate::connect::ConnectOptions;
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Direction, EdgeId,
-    EdgeVersion, EndOfValidity, Episode, EpisodeId, Error, Kind, KindOf, MergeRule, NewEdge,
-    NewEpisode, NewKind, NewNode, NodeId, NodeVersion, Patch, Precision, Retraction, Scope,
-    StatementKind, Step, TenantId, Traversal, ValidTime, VersionId, WriteOutcome, WriteStatus,
+    EdgeVersion, EndOfValidity, Episode, EpisodeId, EpisodeRetraction, Error, Kind, KindOf,
+    MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId, NodeVersion, Patch, Precision,
+    Retraction, Scope, StatementKind, Step, TenantId, Traversal, ValidTime, VersionId,
+    WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -1077,6 +1078,60 @@ impl Caller<'_> {
             };
             tx.commit().await?;
             return Ok(write_outcome(&rows[0]));
+        }
+    }
+
+    /// Retracts an Episode: records a Retraction, made by that Episode, of
+    /// every current Version of a Node or an Edge that only that Episode
+    /// cites, and returns those Versions. A Version another Episode also
+    /// cites stays current. An As-of read at a known-at instant before the
+    /// Retraction still returns each retracted Version, because nothing the
+    /// Episode wrote is deleted: that is Erasure's job, not Retract Episode's
+    /// (ADR-0003).
+    ///
+    /// The Episode's own statements, held or in effect, stop counting, so a
+    /// held statement does not take effect if a higher-Authority Episode is
+    /// erased later (ADR-0007). A Retraction that Retract Episode makes
+    /// from a lower-Authority Episode does not end values a higher-Authority
+    /// Episode supplied where their Valid times overlap, with ranked merge
+    /// on. Retracting an Episode twice retracts nothing the second time.
+    pub async fn retract_episode(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        episode: EpisodeId,
+    ) -> Result<EpisodeRetraction, Error> {
+        let mut client = self.store.client.lock().await;
+        let mut attempt = 0;
+        let tenant = tenant.into();
+        loop {
+            let (tx, tenant) = self.begin(&mut client, tenant).await?;
+            let rows = self
+                .store
+                .statements
+                .query(
+                    &tx,
+                    "select recorded_at, versions from gnomon.retract_episode($1, $2)",
+                    &[(&tenant.0, Type::UUID), (&episode.0, Type::UUID)],
+                )
+                .await
+                .map_err(Error::from_store);
+            let rows = match rows {
+                Err(e) if attempt < WRITE_RETRIES && is_retryable(&e) => {
+                    attempt += 1;
+                    continue;
+                }
+                other => other?,
+            };
+            tx.commit().await?;
+            let row = &rows[0];
+            return Ok(EpisodeRetraction {
+                recorded_at: row.get(0),
+                retracted: row
+                    .get::<_, Vec<uuid::Uuid>>(1)
+                    .into_iter()
+                    .map(VersionId)
+                    .collect(),
+            });
         }
     }
 

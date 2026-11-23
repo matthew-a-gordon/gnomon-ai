@@ -1873,6 +1873,19 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         )
         .await
         .unwrap();
+    // Retract Episode writes a mark. An Episode nothing cites needs no
+    // Retraction.
+    let spare = single
+        .record_episode(&NewEpisode {
+            tenant: None,
+            scope: Scope::new("support"),
+            content: "retracted".into(),
+            reference_time: Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap(),
+            authority: None,
+        })
+        .await
+        .unwrap();
+    single.retract_episode(None, spare).await.unwrap();
     // An Edge from the Node to itself, and its Version's Sentence, which the
     // table's owner stores until ticket #26 adds the function that does.
     let (_, edge) = single
@@ -1910,6 +1923,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         "version",
         "bound_statement",
         "edge",
+        "episode_retraction",
         "sentence",
         "statement",
     ] {
@@ -3586,4 +3600,270 @@ async fn the_statement_functions_run_as_the_invoker_and_add_no_definer() {
             .await
             .unwrap();
     assert_eq!(definers[0].get::<_, i64>(0), 2);
+}
+
+// Retract Episode (ADR-0003, ADR-0007, ADR-0009). It runs as the invoker, so
+// a caller gets no UPDATE or DELETE right from it, deletes no committed
+// history, and cannot retract an Episode outside its Tenant and Scopes. The
+// marker that stops an Episode's statements counting is written only by it.
+
+const RETRACT_EPISODE: &str = "select versions from gnomon.retract_episode($1, $2)";
+
+#[tokio::test]
+async fn retract_episode_deletes_no_committed_row_and_closes_the_version_in_recorded_time_only() {
+    let n = nodes().await;
+    let t1 = n.w.t1;
+    let admin = n.w.db.admin().await;
+    let counts = || async {
+        admin
+            .query_typed(
+                "select (select count(*) from gnomon.version),
+                        (select count(*) from gnomon.citation),
+                        (select count(*) from gnomon.contribution),
+                        (select count(*) from gnomon.episode)",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|r| (0..4).map(|i| r.get::<_, i64>(i)).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+    let before = counts().await;
+    for role in [USER, WORKER] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        let rows = tx
+            .query_typed(
+                RETRACT_EPISODE,
+                &[(&t1, Type::UUID), (&n.w.t1_support, Type::UUID)],
+            )
+            .await
+            .unwrap();
+        let retracted: Vec<Uuid> = rows[0].get(0);
+        // The first role retracts the open Version, the second finds none.
+        assert_eq!(retracted.len(), usize::from(role == USER), "{role}");
+        tx.commit().await.unwrap();
+    }
+    let after = counts().await;
+    assert_eq!(after[0], before[0], "no Version row deleted or added");
+    assert_eq!(after[1], before[1], "no Citation deleted");
+    assert!(after[2] > before[2], "Contributions only added to");
+    assert_eq!(after[3], before[3], "the Episode stays");
+    let open = admin
+        .query_typed(
+            "select recorded_to <> 'infinity' from gnomon.version where id = $1",
+            &[(&n.open, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    assert!(open[0].get::<_, bool>(0), "closed in Recorded time");
+    // Tenant two is untouched.
+    let other = admin
+        .query_typed(
+            "select count(*) from gnomon.version where tenant_id = $1 and recorded_to = 'infinity'",
+            &[(&n.w.t2, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(other[0].get::<_, i64>(0), 1);
+}
+
+#[tokio::test]
+async fn a_caller_cannot_retract_an_episode_of_another_tenant_or_a_scope_it_cannot_see() {
+    let n = nodes().await;
+    let (t1, t2) = (n.w.t1, n.w.t2);
+    for role in [USER, WORKER] {
+        // Tenant two's Episode, named under Tenant one's claims.
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        assert_refused(
+            tx.query_typed(
+                RETRACT_EPISODE,
+                &[(&t2, Type::UUID), (&n.w.t2_support, Type::UUID)],
+            )
+            .await,
+            &format!("{role}: another Tenant's Episode by its Tenant"),
+        );
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        assert_invalid_write(
+            tx.query_typed(
+                RETRACT_EPISODE,
+                &[(&t1, Type::UUID), (&n.w.t2_support, Type::UUID)],
+            )
+            .await,
+            &format!("Episode {} is not visible to the caller", n.w.t2_support),
+        );
+        // Tenant one's Episode in a Scope the claims do not name.
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        assert_invalid_write(
+            tx.query_typed(
+                RETRACT_EPISODE,
+                &[(&t1, Type::UUID), (&n.w.t1_billing, Type::UUID)],
+            )
+            .await,
+            &format!("Episode {} is not visible to the caller", n.w.t1_billing),
+        );
+    }
+    let rows =
+        n.w.db
+            .admin()
+            .await
+            .query_typed("select count(*) from gnomon.episode_retraction", &[])
+            .await
+            .unwrap();
+    assert_eq!(rows[0].get::<_, i64>(0), 0);
+}
+
+#[tokio::test]
+async fn a_caller_cannot_mark_an_episode_retracted_without_its_retractions_or_change_or_delete_the_mark(
+) {
+    let n = nodes().await;
+    let t1 = n.w.t1;
+    for role in [USER, WORKER] {
+        // The Scope and the Recorded time are not the caller's to give.
+        for (sql, what) in [
+            (
+                "insert into gnomon.episode_retraction (tenant_id, scope, episode_id)
+                 values ($1, 'support', $2)",
+                "name the Scope",
+            ),
+            (
+                "insert into gnomon.episode_retraction (tenant_id, episode_id, recorded_at)
+                 values ($1, $2, '2000-01-01')",
+                "name the Recorded time",
+            ),
+        ] {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            let r = tx
+                .execute_typed(sql, &[(&t1, Type::UUID), (&n.w.t1_support, Type::UUID)])
+                .await;
+            assert_refused(r, &format!("{role}: {what}"));
+        }
+        // A mark written directly leaves the Version only that Episode cites
+        // current, and the commit is refused.
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        tx.execute_typed(
+            "insert into gnomon.episode_retraction (tenant_id, episode_id) values ($1, $2)",
+            &[(&t1, Type::UUID), (&n.w.t1_support, Type::UUID)],
+        )
+        .await
+        .unwrap();
+        let err = tx.commit().await.unwrap_err();
+        assert_eq!(
+            err.code().map(|c| c.code()),
+            Some("GNW01"),
+            "{role}: {err:?}"
+        );
+        assert!(
+            err.as_db_error()
+                .unwrap()
+                .message()
+                .contains("retract it with gnomon.retract_episode"),
+            "{err:?}"
+        );
+    }
+    // A mark made by the function can be neither changed nor deleted.
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    tx.query_typed(
+        RETRACT_EPISODE,
+        &[(&t1, Type::UUID), (&n.w.t1_support, Type::UUID)],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    for role in [USER, WORKER] {
+        for (sql, what) in [
+            (
+                "update gnomon.episode_retraction set episode_id = episode_id",
+                "update the mark",
+            ),
+            ("delete from gnomon.episode_retraction", "delete the mark"),
+        ] {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            assert_refused(tx.execute_typed(sql, &[]).await, &format!("{role}: {what}"));
+        }
+    }
+    let rows =
+        n.w.db
+            .admin()
+            .await
+            .query_typed(
+                "select count(*), min(scope), min(recorded_at) > '2020-01-01'
+             from gnomon.episode_retraction",
+                &[],
+            )
+            .await
+            .unwrap();
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    assert_eq!(
+        rows[0].get::<_, String>(1),
+        "support",
+        "the Episode's Scope"
+    );
+    assert!(rows[0].get::<_, bool>(2));
+}
+
+#[tokio::test]
+async fn a_caller_cannot_make_a_statement_that_retracts_its_episode_without_retracting_it() {
+    let n = nodes().await;
+    let t1 = n.w.t1;
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    // A Retraction that claims to be Retract Episode's, so that it would
+    // still count after its Episode is retracted.
+    tx.execute_typed(
+        "insert into gnomon.statement
+           (tenant_id, scope, node_id, episode_id, kind, version_id, valid_from,
+            valid_from_precision, valid_to, valid_to_precision, episode_reference_time,
+            episode_recorded_at, retracts_episode)
+         select $1, 'support', $2, $3, 'retraction', $4, '2024-03-01', 'instant',
+                'infinity', 'unknown', ep.reference_time, ep.recorded_at, true
+         from gnomon.episode ep where ep.id = $3",
+        &[
+            (&t1, Type::UUID),
+            (&n.n1, Type::UUID),
+            (&n.w.t1_support, Type::UUID),
+            (&n.open, Type::UUID),
+        ],
+    )
+    .await
+    .unwrap();
+    let err = tx.commit().await.unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{err:?}");
+    assert_eq!(
+        err.as_db_error().unwrap().message(),
+        "only Retract Episode makes a Retraction that retracts its Episode"
+    );
+
+    // Only a Retraction can carry the flag.
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    let r = tx
+        .execute_typed(
+            "insert into gnomon.statement
+               (tenant_id, scope, node_id, episode_id, kind, version_id, valid_from,
+                valid_from_precision, valid_to, valid_to_precision, episode_reference_time,
+                episode_recorded_at, retracts_episode)
+             select $1, 'support', $2, $3, 'end_of_validity', $4, '2024-03-01', 'instant',
+                    'infinity', 'unknown', ep.reference_time, ep.recorded_at, true
+             from gnomon.episode ep where ep.id = $3",
+            &[
+                (&t1, Type::UUID),
+                (&n.n1, Type::UUID),
+                (&n.w.t1_support, Type::UUID),
+                (&n.open, Type::UUID),
+            ],
+        )
+        .await;
+    match r {
+        Err(e) => assert_eq!(e.code(), Some(&SqlState::CHECK_VIOLATION), "{e:?}"),
+        Ok(v) => panic!("an End of validity carried the flag: {v:?}"),
+    }
 }
