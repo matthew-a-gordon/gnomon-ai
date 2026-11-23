@@ -111,6 +111,10 @@ create function gnomon.set_merge_rule(p_tenant_id uuid, p_kind text, p_rule text
       raise exception using errcode = 'insufficient_privilege',
         message = 'setting a merge rule may set it only in the caller''s own Tenant';
     end if;
+    -- Rule changes of a Tenant serialise, so a parent turning ranked on and a
+    -- child turning it off cannot both pass their checks.
+    perform pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended('gnomon.set_merge_rule/' || p_tenant_id::text, 0));
     if p_rule is null or p_rule not in ('recency', 'ranked') then
       raise exception using errcode = 'GNK01',
         message = 'a merge rule is recency or ranked';
