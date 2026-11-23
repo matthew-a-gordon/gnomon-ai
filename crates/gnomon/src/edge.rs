@@ -32,12 +32,18 @@ impl fmt::Display for EdgeId {
 /// Both Nodes must be in the Edge's Tenant and visible to the caller, in any
 /// of the caller's Scopes, and the Edge Kind must allow their Kinds at each
 /// end. The Store checks nothing about the Nodes' Valid times (ADR-0008).
+///
+/// An Edge of a symmetric Kind joins two different Nodes in no direction.
+/// The Store keeps one per Kind, pair of Nodes and Scope, and stores the
+/// lower Node ID as its source, so creating it from B to A after it was
+/// created from A to B addresses the same Edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewEdge {
     /// `None` names no Tenant: the default Tenant in single-tenant mode.
     pub tenant: Option<TenantId>,
     pub scope: Scope,
-    /// The root Kind [`ROOT_EDGE_KIND`](crate::ROOT_EDGE_KIND) or an Edge
+    /// The root Kind [`ROOT_EDGE_KIND`](crate::ROOT_EDGE_KIND), a reserved
+    /// Edge Kind such as [`SAME_AS_KIND`](crate::SAME_AS_KIND), or an Edge
     /// Kind the Tenant registered.
     pub kind: String,
     pub source: NodeId,
@@ -75,6 +81,11 @@ pub struct EdgeVersion {
 }
 
 /// Which Edges of a Node a traversal follows.
+///
+/// An Edge of a symmetric Kind, [`SAME_AS_KIND`](crate::SAME_AS_KIND) or
+/// [`DIFFERENT_FROM_KIND`](crate::DIFFERENT_FROM_KIND), has no direction:
+/// each of the three follows it from either of its Nodes, and
+/// [`Both`](Direction::Both) follows it once, outgoing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Edges whose source is the Node.

@@ -24,7 +24,10 @@ pub use connect::{ConnectOptions, Tls};
 pub use edge::{
     Direction, EdgeId, EdgeVersion, EpisodeErasure, GraphErasure, NewEdge, Step, Traversal,
 };
-pub use kind::{Kind, KindOf, MergeRule, NewKind, ROOT_EDGE_KIND, ROOT_NODE_KIND};
+pub use kind::{
+    Kind, KindOf, MergeRule, NewKind, DIFFERENT_FROM_KIND, ROOT_EDGE_KIND, ROOT_NODE_KIND,
+    SAME_AS_KIND,
+};
 pub use node::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, EndOfValidity,
     EpisodeRetraction, NewNode, NodeId, NodeVersion, Patch, Precision, Retraction, Statement,

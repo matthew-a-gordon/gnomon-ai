@@ -751,6 +751,12 @@ impl Caller<'_> {
     /// can see, or whose endpoint's Kind the Edge Kind does not allow, with
     /// [`Error::InvalidWrite`]. The Edge holds over the patch's Valid time,
     /// and the patch may state no property value.
+    ///
+    /// For a symmetric Kind, [`SAME_AS_KIND`](crate::SAME_AS_KIND) or
+    /// [`DIFFERENT_FROM_KIND`](crate::DIFFERENT_FROM_KIND), the call writes
+    /// the patch to the Scope's Edge of that Kind between the two Nodes when
+    /// there is one, in either order, and returns its ID. It refuses an Edge
+    /// from a Node to itself.
     pub async fn create_edge(
         &self,
         edge: &NewEdge,
@@ -1821,7 +1827,7 @@ async fn read_kind(
         .query(
             tx,
             "select name, kind_of, parent, ancestors, properties, rules, search,
-                    source_kinds, target_kinds
+                    source_kinds, target_kinds, is_symmetric
              from gnomon.read_kind($1, $2)",
             &[(&tenant.0, Type::UUID), (&name, Type::TEXT)],
         )
@@ -1854,6 +1860,7 @@ async fn read_kind(
             properties: r.get(4),
             rules,
             search: r.get(6),
+            symmetric: r.get(9),
         }
     }))
 }

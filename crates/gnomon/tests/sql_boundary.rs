@@ -3264,6 +3264,400 @@ async fn a_caller_inserting_directly_cannot_forge_the_built_in_that_says_an_edge
     }
 }
 
+// The reserved Edge Kinds `same_as` and `different_from` (ADR-0012). They
+// are ordinary Edges, so the Edge rules hold for them: endpoints of the
+// caller's Tenant that it can see, and nothing of another Tenant or Scope
+// to read or traverse. Both are symmetric, so the Store keeps one Edge of
+// each per pair of Nodes and Scope whatever order a caller gives, and no
+// caller can register, rewrite or remove either Kind, with or without the
+// grant to register Kinds.
+
+const RESERVED: [&str; 2] = [gnomon::SAME_AS_KIND, gnomon::DIFFERENT_FROM_KIND];
+
+fn assert_code(
+    result: Result<impl std::fmt::Debug, tokio_postgres::Error>,
+    code: &str,
+    what: &str,
+) {
+    match result {
+        Err(e) => assert_eq!(e.code().map(|c| c.code()), Some(code), "{what}: {e:?}"),
+        Ok(v) => panic!("{what} was allowed: {v:?}"),
+    }
+}
+
+/// A second Node of Tenant one in `support`, written as a worker.
+async fn second_support_node(e: &Edges) -> Uuid {
+    let store = Store::connect(&e.n.w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    store
+        .as_worker(TenantId(e.n.w.t1), Scope::new("support"))
+        .create_node(
+            &gnomon::NewNode {
+                tenant: Some(TenantId(e.n.w.t1)),
+                scope: Scope::new("support"),
+                kind: gnomon::ROOT_NODE_KIND.into(),
+            },
+            &gnomon::Patch::new(
+                EpisodeId(e.n.w.t1_support),
+                gnomon::ValidTime::UNKNOWN,
+                serde_json::from_value(json!({ "name": "second" })).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .0
+         .0
+}
+
+#[tokio::test]
+async fn a_caller_cannot_join_a_node_of_another_tenant_or_hidden_scope_or_a_node_to_itself_with_a_reserved_edge(
+) {
+    let e = edges().await;
+    let (t1, n1, n2) = (e.n.w.t1, e.n.n1, e.n.n2);
+    for role in [USER, WORKER] {
+        for sql in [CREATE_EDGE, INSERT_EDGE] {
+            for kind in RESERVED {
+                for (source, target, message) in [
+                    (
+                        n1,
+                        n2,
+                        format!("the target Node {n2} is not visible to the caller"),
+                    ),
+                    (
+                        n2,
+                        n1,
+                        format!("the source Node {n2} is not visible to the caller"),
+                    ),
+                    (
+                        n1,
+                        e.billing_node,
+                        format!(
+                            "the target Node {} is not visible to the caller",
+                            e.billing_node
+                        ),
+                    ),
+                    (
+                        e.billing_node,
+                        n1,
+                        format!(
+                            "the source Node {} is not visible to the caller",
+                            e.billing_node
+                        ),
+                    ),
+                    (
+                        n1,
+                        n1,
+                        format!(
+                            "an Edge of the symmetric Kind \"{kind}\" joins two different Nodes"
+                        ),
+                    ),
+                ] {
+                    let mut client = e.n.w.db.login().await;
+                    let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+                    let r = tx
+                        .execute_typed(
+                            sql,
+                            &[
+                                (&t1, Type::UUID),
+                                (&kind, Type::TEXT),
+                                (&source, Type::UUID),
+                                (&target, Type::UUID),
+                            ],
+                        )
+                        .await;
+                    assert_invalid_write(r, &message);
+                }
+            }
+        }
+    }
+    let rows: i64 =
+        e.n.w
+            .db
+            .admin()
+            .await
+            .query_typed("select count(*) from gnomon.edge", &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+    assert_eq!(rows, 2, "only the fixture's Edges exist");
+}
+
+#[tokio::test]
+async fn a_reserved_edge_is_one_edge_per_pair_and_scope_and_hidden_from_other_tenants_and_scopes() {
+    let e = edges().await;
+    let (t1, t2, n1) = (e.n.w.t1, e.n.w.t2, e.n.n1);
+    for role in [USER, WORKER] {
+        for kind in RESERVED {
+            // A pair of Nodes of its own for each round.
+            let m1 = second_support_node(&e).await;
+            let (low, high) = (n1.min(m1), n1.max(m1));
+            let mut client = e.n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support", "billing"])).await;
+            // A direct insert from the higher ID to the lower is stored the
+            // other way round.
+            let row = tx
+                .query_typed(
+                    &format!("{INSERT_EDGE} returning id, source_id, target_id"),
+                    &[
+                        (&t1, Type::UUID),
+                        (&kind, Type::TEXT),
+                        (&high, Type::UUID),
+                        (&low, Type::UUID),
+                    ],
+                )
+                .await
+                .unwrap();
+            let (support_edge, source, target): (Uuid, Uuid, Uuid) =
+                (row[0].get(0), row[0].get(1), row[0].get(2));
+            assert_eq!((source, target), (low, high), "{role} {kind}");
+            // A second one in the Scope, in either order, is refused, and the
+            // Store function returns the one there is.
+            for (s, t) in [(low, high), (high, low)] {
+                tx.batch_execute("savepoint again").await.unwrap();
+                let r = tx
+                    .execute_typed(
+                        INSERT_EDGE,
+                        &[
+                            (&t1, Type::UUID),
+                            (&kind, Type::TEXT),
+                            (&s, Type::UUID),
+                            (&t, Type::UUID),
+                        ],
+                    )
+                    .await;
+                assert_eq!(
+                    r.unwrap_err().code(),
+                    Some(&SqlState::UNIQUE_VIOLATION),
+                    "{role} inserted a second {kind} Edge"
+                );
+                tx.batch_execute("rollback to savepoint again")
+                    .await
+                    .unwrap();
+                let id: Uuid = tx
+                    .query_typed(
+                        CREATE_EDGE,
+                        &[
+                            (&t1, Type::UUID),
+                            (&kind, Type::TEXT),
+                            (&s, Type::UUID),
+                            (&t, Type::UUID),
+                        ],
+                    )
+                    .await
+                    .unwrap()[0]
+                    .get(0);
+                assert_eq!(id, support_edge, "{role} {kind}");
+            }
+            // The same pair in billing is an Edge of its own.
+            let billing_edge: Uuid = tx
+                .query_typed(
+                    "select gnomon.create_edge($1, 'billing', $2, $3, $4)",
+                    &[
+                        (&t1, Type::UUID),
+                        (&kind, Type::TEXT),
+                        (&low, Type::UUID),
+                        (&high, Type::UUID),
+                    ],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+            assert_ne!(billing_edge, support_edge);
+            // Both hold, each citing an Episode of its own Scope.
+            for (edge, episode) in [
+                (support_edge, e.n.w.t1_support),
+                (billing_edge, e.n.w.t1_billing),
+            ] {
+                tx.execute_typed(
+                    "select gnomon.write_edge($1, $2, $3, null, null, null, null, null, null)",
+                    &[
+                        (&t1, Type::UUID),
+                        (&edge, Type::UUID),
+                        (&episode, Type::UUID),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+
+            // A caller of support alone neither sees the billing Edge nor
+            // collides with it: its Edges of the pair are support's.
+            let mut client = e.n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            let id: Uuid = tx
+                .query_typed(
+                    CREATE_EDGE,
+                    &[
+                        (&t1, Type::UUID),
+                        (&kind, Type::TEXT),
+                        (&high, Type::UUID),
+                        (&low, Type::UUID),
+                    ],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+            assert_eq!(id, support_edge, "{role} {kind}");
+            let seen = visible_ids(
+                &tx,
+                "select id from gnomon.edge where kind = $1 and $2 in (source_id, target_id)",
+                &[(&kind, Type::TEXT), (&m1, Type::UUID)],
+            )
+            .await;
+            assert_eq!(seen, vec![support_edge], "{role} saw billing's {kind} Edge");
+            // Traversed from the round's own Node, which no earlier round's
+            // Edge joins.
+            let traversed = visible_ids(
+                &tx,
+                "select edge_id from gnomon.traverse($1, $2, now(), null, 'both', array[$3])",
+                &[(&t1, Type::UUID), (&m1, Type::UUID), (&kind, Type::TEXT)],
+            )
+            .await;
+            assert_eq!(
+                traversed,
+                vec![support_edge],
+                "{role} traversed billing's {kind} Edge"
+            );
+            tx.rollback().await.unwrap();
+
+            // Tenant two reads neither, by ID or by table, and addresses
+            // neither by naming Tenant one's Nodes.
+            let mut client = e.n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t2, &["support", "billing"])).await;
+            let seen = visible_ids(
+                &tx,
+                "select id from gnomon.edge where id = any($1)",
+                &[(&vec![support_edge, billing_edge], Type::UUID_ARRAY)],
+            )
+            .await;
+            assert!(seen.is_empty(), "{role} of Tenant two saw {seen:?}");
+            let r = tx
+                .execute_typed(
+                    CREATE_EDGE,
+                    &[
+                        (&t2, Type::UUID),
+                        (&kind, Type::TEXT),
+                        (&low, Type::UUID),
+                        (&high, Type::UUID),
+                    ],
+                )
+                .await;
+            assert_invalid_write(
+                r,
+                &format!("the source Node {low} is not visible to the caller"),
+            );
+            tx.rollback().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_caller_can_register_rewrite_or_remove_a_reserved_kind_even_with_the_grant() {
+    let w = world().await;
+    w.db.grant_kind_registration(USER).await;
+    let before = kind_rows(&w.db, w.t1).await;
+    for kind in RESERVED {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, USER, &claims(w.t1, &["support"])).await;
+        for (sql, what) in [
+            (
+                "select gnomon.register_kind($1, $2, 'edge', null, '{}', '{}', null, null)",
+                "register it",
+            ),
+            (
+                "select gnomon.register_kind($1, $2, 'edge', 'edge', '{\"properties\": {\"weight\": {\"type\": \"number\"}}}', '{}', '{node}', '{node}')",
+                "redefine it",
+            ),
+            (
+                "select gnomon.register_kind($1, $2, 'node', null, '{}', '{}', null, null)",
+                "reuse its name for a Node Kind",
+            ),
+            (
+                "select gnomon.register_kind($1, 'duplicate_of', 'edge', $2, '{}', '{}', null, null)",
+                "specialize it",
+            ),
+            ("select gnomon.set_merge_rule($1, $2, 'ranked')", "set its merge rule"),
+        ] {
+            tx.batch_execute("savepoint attempt").await.unwrap();
+            let r = tx
+                .execute_typed(sql, &[(&w.t1, Type::UUID), (&kind, Type::TEXT)])
+                .await;
+            assert_code(r, gnomon::INVALID_KIND, &format!("{what}: {kind}"));
+            tx.batch_execute("rollback to savepoint attempt").await.unwrap();
+        }
+        for (sql, what) in [
+            (
+                "insert into gnomon.kind (tenant_id, name, kind_of, parent, ancestors, properties, search,
+                   source_kinds, target_kinds, definition)
+                 values ($1, $2, 'edge', 'edge', '{edge}', '{}', '{}', '{node}', '{node}', '{}')",
+                "insert it",
+            ),
+            ("delete from gnomon.kind where tenant_id = $1 and name = $2", "delete it"),
+            (
+                "update gnomon.kind set name = $2 where tenant_id = $1",
+                "rename a Kind to it",
+            ),
+            (
+                "insert into gnomon.kind_merge (tenant_id, kind, merge_rule) values ($1, $2, 'ranked')",
+                "give it a merge rule",
+            ),
+        ] {
+            tx.batch_execute("savepoint attempt").await.unwrap();
+            let r = tx
+                .execute_typed(sql, &[(&w.t1, Type::UUID), (&kind, Type::TEXT)])
+                .await;
+            assert_refused(r, &format!("{what}: {kind}"));
+            tx.batch_execute("rollback to savepoint attempt").await.unwrap();
+        }
+        // The trigger that refuses the names stays on.
+        let r = tx
+            .execute_typed(
+                "alter table gnomon.kind disable trigger kind_check_reserved_name",
+                &[],
+            )
+            .await;
+        assert_refused(r, "turning the reserved-name check off");
+        drop(tx);
+
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, USER, &claims(w.t1, &["support"])).await;
+        let row = tx
+            .query_typed(
+                "select kind_of, parent, source_kinds, target_kinds, is_symmetric
+                 from gnomon.read_kind($1, $2)",
+                &[(&w.t1, Type::UUID), (&kind, Type::TEXT)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.len(), 1, "{kind}");
+        let read: (String, String, Vec<String>, Vec<String>, bool) = (
+            row[0].get(0),
+            row[0].get(1),
+            row[0].get(2),
+            row[0].get(3),
+            row[0].get(4),
+        );
+        assert_eq!(
+            read,
+            (
+                "edge".into(),
+                "edge".into(),
+                vec!["node".into()],
+                vec!["node".into()],
+                true
+            ),
+            "{kind}"
+        );
+    }
+    assert_eq!(
+        kind_rows(&w.db, w.t1).await,
+        before,
+        "a refused call wrote a Kind"
+    );
+}
+
 // Correction, End of validity and Retraction (ADR-0007, ADR-0009). A
 // statement is held like a Contribution: callers read and insert it, and
 // change or delete nothing. The merge reads a statement only through the

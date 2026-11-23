@@ -16,6 +16,16 @@ pub const ROOT_NODE_KIND: &str = "node";
 /// The root Kind for Edges, which every Ontology has.
 pub const ROOT_EDGE_KIND: &str = "edge";
 
+/// The reserved Edge Kind that records that two Nodes are one thing
+/// (ADR-0012). Every Ontology has it below [`ROOT_EDGE_KIND`], joining any
+/// Node to any other Node, and it is symmetric. No consumer can register,
+/// redefine or specialize it.
+pub const SAME_AS_KIND: &str = "same_as";
+
+/// The reserved Edge Kind that records that two Nodes are not one thing
+/// (ADR-0012), as [`SAME_AS_KIND`] is for one that is.
+pub const DIFFERENT_FROM_KIND: &str = "different_from";
+
 /// Whether a Kind classes Nodes or Edges, and for an Edge Kind, which Node
 /// Kinds it may join.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,12 +90,13 @@ pub struct NewKind {
     /// `None` names no Tenant: the default Tenant in single-tenant mode.
     pub tenant: Option<TenantId>,
     /// A letter followed by at most 62 letters, digits or underscores. `node`
-    /// and `edge` are the root Kinds and cannot be registered.
+    /// and `edge` are the root Kinds, and `same_as` and `different_from` the
+    /// reserved Edge Kinds, which cannot be registered.
     pub name: String,
     pub of: KindOf,
     /// The Kind this one specializes, a Kind of Node for a Kind of Node and
     /// of Edge for a Kind of Edge. `None` is the root Kind, [`ROOT_NODE_KIND`]
-    /// or [`ROOT_EDGE_KIND`].
+    /// or [`ROOT_EDGE_KIND`]. A reserved Edge Kind cannot be specialized.
     pub parent: Option<String>,
     /// The Kind's own properties, as a JSON Schema object:
     /// `{"type": "object", "properties": {...}, "required": [...]}`.
@@ -122,6 +133,11 @@ pub struct Kind {
     pub rules: BTreeMap<String, String>,
     /// Everything that feeds Search, inherited marks first.
     pub search: Vec<String>,
+    /// Whether an Edge of this Kind joins its two Nodes in no direction:
+    /// true only for [`SAME_AS_KIND`] and [`DIFFERENT_FROM_KIND`]. An Edge
+    /// from A to B and one from B to A are then the same Edge, and a
+    /// traversal follows it from either Node in either direction.
+    pub symmetric: bool,
 }
 
 impl Kind {

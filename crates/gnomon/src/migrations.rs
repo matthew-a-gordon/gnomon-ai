@@ -95,6 +95,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0014_stage_records",
         template: include_str!("../migrations/0014_stage_records.sql"),
     },
+    Migration {
+        version: 15,
+        name: "0015_reserved_edge_kinds",
+        template: include_str!("../migrations/0015_reserved_edge_kinds.sql"),
+    },
 ];
 
 /// The schema version this build of the Store expects: the last migration's.
