@@ -6407,7 +6407,7 @@ async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_c
 /// The Graph fixture with a committed Summary of `n1` in support and one in
 /// billing, a Summary of billing's Node in billing, and a Community of
 /// support holding `n1`, each citing its own Scope's Episode.
-struct Derived {
+struct Summarized {
     g: Graph,
     support_summary: Uuid,
     billing_summary: Uuid,
@@ -6415,7 +6415,7 @@ struct Derived {
     community: Uuid,
 }
 
-async fn derived() -> Derived {
+async fn summarized() -> Summarized {
     let g = graph().await;
     let store = Store::connect(&g.n.w.db.login_url(), &support::connect_options())
         .await
@@ -6464,7 +6464,7 @@ async fn derived() -> Derived {
         .await
         .unwrap()
         .0;
-    Derived {
+    Summarized {
         support_summary: ids[0],
         billing_summary: ids[1],
         billing_node_summary: ids[2],
@@ -6474,7 +6474,7 @@ async fn derived() -> Derived {
 }
 
 /// Every row of the five tables, counted past RLS.
-async fn derived_rows(db: &TestDb) -> Vec<i64> {
+async fn summary_and_community_rows(db: &TestDb) -> Vec<i64> {
     let admin = db.admin().await;
     let mut counts = Vec::new();
     for t in [
@@ -6498,9 +6498,9 @@ async fn derived_rows(db: &TestDb) -> Vec<i64> {
 #[tokio::test]
 async fn a_caller_cannot_rewrite_or_delete_a_committed_summary_or_community_or_what_it_cites_or_holds(
 ) {
-    let d = derived().await;
+    let d = summarized().await;
     let t1 = d.g.n.w.t1;
-    let before = derived_rows(&d.g.n.w.db).await;
+    let before = summary_and_community_rows(&d.g.n.w.db).await;
     let s = d.support_summary;
     let k = d.community;
     for role in [USER, WORKER] {
@@ -6561,16 +6561,16 @@ async fn a_caller_cannot_rewrite_or_delete_a_committed_summary_or_community_or_w
             assert_refused(r, &format!("{role} {what}"));
         }
     }
-    assert_eq!(derived_rows(&d.g.n.w.db).await, before);
+    assert_eq!(summary_and_community_rows(&d.g.n.w.db).await, before);
 }
 
 #[tokio::test]
 async fn a_caller_inserting_directly_cannot_choose_the_recorded_time_or_skip_the_scope_and_citation_checks(
 ) {
-    let d = derived().await;
+    let d = summarized().await;
     let w = &d.g.n.w;
     let (t1, n1) = (w.t1, d.g.n.n1);
-    let before = derived_rows(&w.db).await;
+    let before = summary_and_community_rows(&w.db).await;
     let insert_summary =
         "insert into gnomon.summary (tenant_id, scope, node_id, content, as_of_valid)
                           values ($1, $2, $3, 'direct', '2024-06-01') returning id";
@@ -6776,12 +6776,12 @@ async fn a_caller_inserting_directly_cannot_choose_the_recorded_time_or_skip_the
     );
     tx.rollback().await.unwrap();
 
-    assert_eq!(derived_rows(&w.db).await, before);
+    assert_eq!(summary_and_community_rows(&w.db).await, before);
 }
 
 #[tokio::test]
 async fn a_caller_sees_and_writes_no_summary_or_community_of_another_tenant_or_scope() {
-    let d = derived().await;
+    let d = summarized().await;
     let w = &d.g.n.w;
     // Each caller sees the Summaries of its own Scopes, and reads only those
     // of n1 through the read function, which takes the Tenant it is given
@@ -6865,7 +6865,7 @@ async fn a_caller_sees_and_writes_no_summary_or_community_of_another_tenant_or_s
 #[tokio::test]
 async fn no_caller_reaches_a_summary_through_the_erasure_reach_and_an_erasure_reaches_only_its_nodes_summaries(
 ) {
-    let d = derived().await;
+    let d = summarized().await;
     let w = &d.g.n.w;
     let t1 = w.t1;
     for role in [USER, WORKER] {
@@ -6937,4 +6937,63 @@ async fn no_caller_reaches_a_summary_through_the_erasure_reach_and_an_erasure_re
         .unwrap()[0]
         .get(0);
     assert_eq!(cited, 1, "the unlisted Summary lost its Citation");
+}
+
+#[tokio::test]
+async fn the_definers_summary_reach_covers_only_the_summaries_of_a_node_its_own_transaction_listed()
+{
+    let d = summarized().await;
+    let w = &d.g.n.w;
+    // The definer role as an Erasure runs, under the claims of a caller of
+    // support alone. The server's superuser switches to it, which no caller
+    // role can, because the definer has no members.
+    let mut admin = w.db.admin().await;
+    let mut tx = admin.transaction().await.unwrap();
+    tx.batch_execute("set local role gnomon_definer")
+        .await
+        .unwrap();
+    tx.query_typed(
+        "select set_config('request.jwt.claims', $1, true)",
+        &[(&claims(w.t1, &["support"]), Type::TEXT)],
+    )
+    .await
+    .unwrap();
+    const SUMMARIES: &str = "select id from gnomon.summary where scope = 'billing' order by id";
+    const CITED: &str =
+        "select summary_id from gnomon.summary_citation where scope = 'billing' order by 1";
+    // With nothing listed, the definer sees no Summary of billing.
+    assert!(visible_ids(&tx, SUMMARIES, &[]).await.is_empty());
+    assert!(visible_ids(&tx, CITED, &[]).await.is_empty());
+    // It cannot list a Node under another Tenant.
+    let sp = tx.savepoint("other_tenant").await.unwrap();
+    let r = sp
+        .query_typed(
+            "insert into gnomon.erasure_reach (tenant_id, id) values ($1, $2)",
+            &[(&w.t2, Type::UUID), (&d.g.billing_node, Type::UUID)],
+        )
+        .await;
+    assert_refused(r, "listing a Node under another Tenant");
+    sp.rollback().await.unwrap();
+    // With n1 listed, it reaches n1's Summary in billing and its Citation,
+    // and not the Summary of billing's own Node, which nothing listed.
+    tx.query_typed(
+        "insert into gnomon.erasure_reach (tenant_id, id) values ($1, $2)",
+        &[(&w.t1, Type::UUID), (&d.g.n.n1, Type::UUID)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        visible_ids(&tx, SUMMARIES, &[]).await,
+        vec![d.billing_summary]
+    );
+    assert_eq!(visible_ids(&tx, CITED, &[]).await, vec![d.billing_summary]);
+    let deleted = tx
+        .execute_typed(
+            "delete from gnomon.summary_citation where scope = 'billing'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1, "the reach deleted beyond n1's Summary");
+    tx.rollback().await.unwrap();
 }

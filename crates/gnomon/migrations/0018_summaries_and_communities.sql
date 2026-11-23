@@ -26,8 +26,10 @@
 -- nothing is deleted and a read at an earlier known-at instant still finds
 -- the old row. A Node has at most one current Summary in each Scope. A new
 -- Community names the current Communities it replaces, which it closes.
--- Replacing a row the current transaction wrote deletes it instead, as a
--- second write to a Node in one transaction replaces the first (ADR-0008).
+-- Replacing a row the current transaction wrote deletes it instead, as for
+-- Versions (ADR-0015): closing a row at the instant it opened would leave it
+-- an empty Recorded time, so a second write in one transaction replaces the
+-- first (ADR-0008, ADR-0009). No committed row is deleted.
 --
 -- Who writes (ADR-0009). Callers write through `gnomon.write_summary` and
 -- `gnomon.write_community`, invokers under RLS with an empty search path. No
@@ -452,7 +454,7 @@ create function gnomon.derived_citations(
   $$;
 
 -- The Tenant and Scope of a write, checked before anything is read.
-create function gnomon.derived_check_scope(p_tenant_id uuid, p_scope text) returns void
+create function gnomon.check_write_scope(p_tenant_id uuid, p_scope text) returns void
   language plpgsql stable security invoker set search_path = ''
   as $$
   begin
@@ -489,7 +491,7 @@ create function gnomon.write_summary(
     v_old record;
     v_id uuid;
   begin
-    perform gnomon.derived_check_scope(p_tenant_id, p_scope);
+    perform gnomon.check_write_scope(p_tenant_id, p_scope);
     perform from gnomon.lock_for_write(p_tenant_id, p_node_id, false);
     select s.id, s.recorded_from, s.written_in into v_old
       from gnomon.summary s
@@ -542,14 +544,15 @@ create function gnomon.write_community(
   as $$
   declare
     t constant timestamptz := transaction_timestamp();
-    v_members uuid[] := array(select distinct m from unnest(p_members) m order by m);
+    v_members uuid[] := array(select distinct m from pg_catalog.unnest(p_members) m order by m);
     v_member uuid;
     v_member_scope text;
     v_old record;
     v_id uuid;
   begin
-    perform gnomon.derived_check_scope(p_tenant_id, p_scope);
-    if cardinality(v_members) = 0 or array_position(v_members, null) is not null then
+    perform gnomon.check_write_scope(p_tenant_id, p_scope);
+    if pg_catalog.cardinality(v_members) = 0
+       or pg_catalog.array_position(v_members, null) is not null then
       raise exception using errcode = 'GNW01',
         message = 'a Community holds at least one Node, and names each';
     end if;
@@ -565,7 +568,7 @@ create function gnomon.write_community(
     end loop;
     for v_old in
       select r.id, c.recorded_from, c.recorded_to, c.written_in
-      from (select distinct x as id from unnest(p_replaces) x where x is not null) r
+      from (select distinct x as id from pg_catalog.unnest(p_replaces) x where x is not null) r
       left join gnomon.community c
         on c.tenant_id = p_tenant_id and c.scope = p_scope and c.id = r.id
       order by r.id
@@ -600,7 +603,7 @@ create function gnomon.write_community(
       values (p_tenant_id, p_scope, p_content, p_as_of_valid)
       returning id into v_id;
     insert into gnomon.community_member (tenant_id, scope, community_id, node_id)
-      select p_tenant_id, p_scope, v_id, m from unnest(v_members) m;
+      select p_tenant_id, p_scope, v_id, m from pg_catalog.unnest(v_members) m;
     insert into gnomon.community_citation
         (tenant_id, scope, community_id, episode_id, property, place,
          episode_reference_time, episode_recorded_at)
@@ -639,9 +642,9 @@ create function gnomon.read_summaries(
            coalesce(c.episodes, '{}'), coalesce(c.properties, '{}'), coalesce(c.places, '{}')
     from gnomon.summary s
     cross join lateral (
-      select array_agg(x.episode_id order by x.episode_id, x.property, x.place) as episodes,
-             array_agg(x.property order by x.episode_id, x.property, x.place) as properties,
-             array_agg(x.place order by x.episode_id, x.property, x.place) as places
+      select pg_catalog.array_agg(x.episode_id order by x.episode_id, x.property, x.place) as episodes,
+             pg_catalog.array_agg(x.property order by x.episode_id, x.property, x.place) as properties,
+             pg_catalog.array_agg(x.place order by x.episode_id, x.property, x.place) as places
       from gnomon.summary_citation x
       where x.tenant_id = s.tenant_id and x.scope = s.scope and x.summary_id = s.id
     ) c
@@ -685,9 +688,9 @@ create function gnomon.read_communities(
     join gnomon.community k
       on k.tenant_id = h.tenant_id and k.scope = h.scope and k.id = h.community_id
     cross join lateral (
-      select array_agg(x.episode_id order by x.episode_id, x.property, x.place) as episodes,
-             array_agg(x.property order by x.episode_id, x.property, x.place) as properties,
-             array_agg(x.place order by x.episode_id, x.property, x.place) as places
+      select pg_catalog.array_agg(x.episode_id order by x.episode_id, x.property, x.place) as episodes,
+             pg_catalog.array_agg(x.property order by x.episode_id, x.property, x.place) as properties,
+             pg_catalog.array_agg(x.place order by x.episode_id, x.property, x.place) as places
       from gnomon.community_citation x
       where x.tenant_id = k.tenant_id and x.scope = k.scope and x.community_id = k.id
     ) c
@@ -817,7 +820,7 @@ begin
       'gnomon.derived_check_complete()'::regprocedure,
       'gnomon.derived_guard_update()'::regprocedure,
       'gnomon.derived_citations(uuid, text, uuid[], text[], text[])'::regprocedure,
-      'gnomon.derived_check_scope(uuid, text)'::regprocedure,
+      'gnomon.check_write_scope(uuid, text)'::regprocedure,
       'gnomon.write_summary(uuid, text, uuid, text, timestamptz, uuid[], text[], text[])'::regprocedure,
       'gnomon.write_community(uuid, text, uuid[], uuid[], text, timestamptz, uuid[], text[], text[])'::regprocedure,
       'gnomon.read_summaries(uuid, uuid, timestamptz, timestamptz)'::regprocedure,
@@ -842,7 +845,7 @@ begin
   revoke all on function gnomon.derived_check_complete() from public;
   revoke all on function gnomon.derived_guard_update() from public;
   revoke all on function gnomon.derived_citations(uuid, text, uuid[], text[], text[]) from public;
-  revoke all on function gnomon.derived_check_scope(uuid, text) from public;
+  revoke all on function gnomon.check_write_scope(uuid, text) from public;
   revoke all on function gnomon.write_summary(
     uuid, text, uuid, text, timestamptz, uuid[], text[], text[]) from public;
   revoke all on function gnomon.write_community(
@@ -875,7 +878,7 @@ grant insert (tenant_id, scope, community_id, node_id) on gnomon.community_membe
 grant update (recorded_to) on gnomon.summary, gnomon.community to authenticated, gnomon_worker;
 grant execute on function gnomon.derived_citations(uuid, text, uuid[], text[], text[])
   to authenticated, gnomon_worker;
-grant execute on function gnomon.derived_check_scope(uuid, text) to authenticated, gnomon_worker;
+grant execute on function gnomon.check_write_scope(uuid, text) to authenticated, gnomon_worker;
 grant execute on function gnomon.write_summary(
   uuid, text, uuid, text, timestamptz, uuid[], text[], text[]) to authenticated, gnomon_worker;
 grant execute on function gnomon.write_community(

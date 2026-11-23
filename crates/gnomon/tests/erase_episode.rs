@@ -196,7 +196,7 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .write_summary(w.tenant, &summarize("a is on basic".into(), vec![f]))
         .await
         .unwrap();
-    let group =
+    let community =
         |members: Vec<gnomon::NodeId>, content: String, cites: Vec<EpisodeId>| NewCommunity {
             scope: Scope::new(SCOPE),
             replaces: vec![],
@@ -205,17 +205,17 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
             as_of_valid: at(2024, 4, 1),
             citations: cites.into_iter().map(DerivedCitation::of).collect(),
         };
-    let e_group = w
+    let e_community = w
         .caller()
         .write_community(
             w.tenant,
-            &group(vec![a, c], format!("{MARKER}: a and Acme"), vec![f, e]),
+            &community(vec![a, c], format!("{MARKER}: a and Acme"), vec![f, e]),
         )
         .await
         .unwrap();
-    let f_group = w
+    let f_community = w
         .caller()
-        .write_community(w.tenant, &group(vec![c], "Acme".into(), vec![f]))
+        .write_community(w.tenant, &community(vec![c], "Acme".into(), vec![f]))
         .await
         .unwrap();
     // Last, E is retracted, which marks it and retracts what only it cites.
@@ -302,19 +302,19 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .is_none());
     // The Summary and Community that cite E are gone with their members, and
     // those that cite F alone stand.
-    for (table, id) in [("summary", e_summary.0), ("community", e_group.0)] {
+    for (table, id) in [("summary", e_summary.0), ("community", e_community.0)] {
         assert!(
             !w.exists(table, id).await,
             "{table} {id} cites E and stands"
         );
     }
-    for (table, id) in [("summary", f_summary.0), ("community", f_group.0)] {
+    for (table, id) in [("summary", f_summary.0), ("community", f_community.0)] {
         assert!(w.exists(table, id).await, "{table} {id} cites F alone");
     }
     let members: i64 = admin
         .query_typed(
             "select count(*) from gnomon.community_member where community_id = $1",
-            &[(&e_group.0, Type::UUID)],
+            &[(&e_community.0, Type::UUID)],
         )
         .await
         .unwrap()[0]

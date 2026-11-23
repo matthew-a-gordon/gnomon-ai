@@ -4,7 +4,7 @@
 //! their Citations, regenerating one by closing the old row, the one-Scope
 //! rule, Tenant and Scope isolation, and Erasure of an Episode, a Node and a
 //! Scope. The adversarial cases live in sql_boundary.rs, and the no-residue
-//! test in erase_episode.rs covers both tables.
+//! test in erase_episode.rs covers all five tables.
 
 mod support;
 
@@ -301,7 +301,11 @@ async fn another_tenant_and_another_scope_read_no_summary_or_community() {
         )
         .await;
     write_summary(&w, &summary(SCOPE, a, "support's", &[f])).await;
-    write_community(&w, &community(SCOPE, &[a], "support's group", &[f], &[])).await;
+    write_community(
+        &w,
+        &community(SCOPE, &[a], "support's Community", &[f], &[]),
+    )
+    .await;
     assert_eq!(current_summaries(&w, a).await.len(), 1);
     assert_eq!(current_communities(&w, a).await.len(), 1);
 
@@ -537,10 +541,14 @@ async fn erase_episode_removes_every_summary_and_community_closed_or_open_that_c
     let closed = write_summary(&w, &summary(SCOPE, a, "cites e", &[f, e])).await;
     let open = write_summary(&w, &summary(SCOPE, a, "cites f", &[f])).await;
     let c_summary = write_summary(&w, &summary(SCOPE, c, "c cites e", &[e])).await;
-    let closed_group = write_community(&w, &community(SCOPE, &[a, c], "e's", &[e], &[])).await;
-    let open_group =
-        write_community(&w, &community(SCOPE, &[a, c], "f's", &[f], &[closed_group])).await;
-    let other_group = write_community(&w, &community(SCOPE, &[c], "e and f", &[f, e], &[])).await;
+    let closed_community = write_community(&w, &community(SCOPE, &[a, c], "e's", &[e], &[])).await;
+    let open_community = write_community(
+        &w,
+        &community(SCOPE, &[a, c], "f's", &[f], &[closed_community]),
+    )
+    .await;
+    let other_community =
+        write_community(&w, &community(SCOPE, &[c], "e and f", &[f, e], &[])).await;
     w.caller().retract_episode(w.tenant, e).await.unwrap();
 
     let erasure = w.erase(e).await;
@@ -548,8 +556,8 @@ async fn erase_episode_removes_every_summary_and_community_closed_or_open_that_c
     for (table, id) in [
         ("summary", closed.0),
         ("summary", c_summary.0),
-        ("community", closed_group.0),
-        ("community", other_group.0),
+        ("community", closed_community.0),
+        ("community", other_community.0),
     ] {
         assert!(
             !w.exists(table, id).await,
@@ -559,10 +567,10 @@ async fn erase_episode_removes_every_summary_and_community_closed_or_open_that_c
     for (table, column, id) in [
         ("summary_citation", "summary_id", closed.0),
         ("summary_citation", "summary_id", c_summary.0),
-        ("community_citation", "community_id", closed_group.0),
-        ("community_member", "community_id", closed_group.0),
-        ("community_citation", "community_id", other_group.0),
-        ("community_member", "community_id", other_group.0),
+        ("community_citation", "community_id", closed_community.0),
+        ("community_member", "community_id", closed_community.0),
+        ("community_citation", "community_id", other_community.0),
+        ("community_member", "community_id", other_community.0),
         ("summary_citation", "episode_id", e.0),
         ("community_citation", "episode_id", e.0),
     ] {
@@ -574,18 +582,18 @@ async fn erase_episode_removes_every_summary_and_community_closed_or_open_that_c
     }
     // What cites F alone stands, and is current.
     assert!(w.exists("summary", open.0).await);
-    assert!(w.exists("community", open_group.0).await);
+    assert!(w.exists("community", open_community.0).await);
     assert_eq!(current_summaries(&w, a).await[0].id, open);
     assert!(
         current_summaries(&w, c).await.is_empty(),
         "c's Summary goes"
     );
-    let groups: Vec<CommunityId> = current_communities(&w, c)
+    let communities: Vec<CommunityId> = current_communities(&w, c)
         .await
         .into_iter()
         .map(|k| k.id)
         .collect();
-    assert_eq!(groups, vec![open_group]);
+    assert_eq!(communities, vec![open_community]);
     for table in [
         "gnomon.summary",
         "gnomon.summary_citation",
@@ -641,7 +649,8 @@ async fn erasing_a_node_removes_its_summaries_in_every_scope_even_one_the_caller
     let y_support = write_summary(&w, &summary(SCOPE, y, "y in support", &[f])).await;
     let xy = write_community(&w, &community(SCOPE, &[x, y], "x and y", &[f], &[])).await;
     let just_y = write_community(&w, &community(SCOPE, &[y], "y", &[f], &[])).await;
-    let billing_group = write_community(&w, &community(BILLING, &[acme], "Acme", &[b], &[])).await;
+    let billing_community =
+        write_community(&w, &community(BILLING, &[acme], "Acme", &[b], &[])).await;
 
     // The worker of support erases x. It cannot see billing.
     let erasure = w.erase_node(x).await;
@@ -667,7 +676,7 @@ async fn erasing_a_node_removes_its_summaries_in_every_scope_even_one_the_caller
         ("summary", y_billing.0),
         ("summary", y_support.0),
         ("community", just_y.0),
-        ("community", billing_group.0),
+        ("community", billing_community.0),
     ] {
         assert!(w.exists(table, id).await, "{table} {id} went with x");
     }
@@ -723,11 +732,12 @@ async fn erasing_a_scope_removes_its_summaries_and_communities_and_the_summaries
     // nothing to hr.
     let in_hr = write_summary(&w, &summary("hr", person, "in hr", &[h])).await;
     let a_in_hr = write_summary(&w, &summary("hr", a, "a seen from hr", &[h])).await;
-    let hr_group = write_community(&w, &community("hr", &[person], "hr", &[h], &[])).await;
+    let hr_community = write_community(&w, &community("hr", &[person], "hr", &[h], &[])).await;
     let person_in_billing = write_summary(&w, &summary(BILLING, person, "in billing", &[b])).await;
     let acme_in_billing = write_summary(&w, &summary(BILLING, acme, "Acme", &[b])).await;
     let a_in_support = write_summary(&w, &summary(SCOPE, a, "a", &[f])).await;
-    let billing_group = write_community(&w, &community(BILLING, &[acme], "Acme", &[b], &[])).await;
+    let billing_community =
+        write_community(&w, &community(BILLING, &[acme], "Acme", &[b], &[])).await;
 
     // The worker of hr erases hr. It cannot see billing or support.
     w.erase_scope("hr").await;
@@ -735,7 +745,7 @@ async fn erasing_a_scope_removes_its_summaries_and_communities_and_the_summaries
     for (table, id) in [
         ("summary", in_hr.0),
         ("summary", a_in_hr.0),
-        ("community", hr_group.0),
+        ("community", hr_community.0),
         ("summary", person_in_billing.0),
     ] {
         assert!(!w.exists(table, id).await, "{table} {id} stands");
@@ -743,7 +753,7 @@ async fn erasing_a_scope_removes_its_summaries_and_communities_and_the_summaries
     for (table, id) in [
         ("summary", acme_in_billing.0),
         ("summary", a_in_support.0),
-        ("community", billing_group.0),
+        ("community", billing_community.0),
     ] {
         assert!(w.exists(table, id).await, "{table} {id} went with hr");
     }
