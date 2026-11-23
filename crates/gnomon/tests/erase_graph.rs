@@ -176,8 +176,21 @@ async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_t
     let untouched = w
         .edge_in("billing", other, acme, billing, json!({ "share": 6 }))
         .await;
+    // An Edge of support, which the worker sees, joining x to a support
+    // company that keeps its Versions.
+    let initech = w
+        .node(
+            "company",
+            e,
+            ValidTime::UNKNOWN,
+            json!({ "name": "Initech" }),
+        )
+        .await;
+    let seen = w
+        .edge(x, initech, g, ValidTime::UNKNOWN, json!({ "share": 7 }))
+        .await;
 
-    let mut edges = vec![hidden, to_hr, to_support];
+    let mut edges = vec![hidden, to_hr, to_support, seen];
     edges.sort();
     let mut ids: Vec<Uuid> = edges.iter().map(|e| e.0).collect();
     ids.push(x.0);
@@ -187,7 +200,12 @@ async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_t
 
     let erasure = w.erase_node(x).await;
 
-    assert_eq!(erasure.erased_edges, edges);
+    // Every Edge that joined x is gone, but the result names only the one the
+    // worker sees, so it learns no ID of billing or hr.
+    assert_eq!(erasure.erased_edges, vec![seen]);
+    for edge in &edges {
+        assert!(!w.exists("edge", edge.0).await, "{edge} still joins x");
+    }
     let mut nodes = vec![x, support_bare];
     nodes.sort();
     assert_eq!(erasure.erased_nodes, nodes);
@@ -196,7 +214,7 @@ async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_t
         &admin,
         &Residue {
             nodes: &[x.0, support_bare.0],
-            edges: &ids[..3],
+            edges: &ids[..4],
             versions: &versions,
             markers: &[MARKER],
             ..Residue::default()
@@ -210,6 +228,7 @@ async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_t
     // The bare company of hr stays: the worker cannot see hr.
     assert!(w.exists("node", hr_bare.0).await);
     assert!(w.exists("node", acme.0).await);
+    assert!(w.exists("node", initech.0).await);
     assert!(w.exists("edge", untouched.0).await);
     for episode in [e, g] {
         assert!(w
@@ -308,7 +327,7 @@ async fn erasing_a_scope_removes_every_row_in_it_and_every_edge_that_joins_its_n
     episodes.sort_by_key(|e| e.0);
     let mut nodes = vec![acme, acct, support_bare];
     nodes.sort();
-    let mut edges = vec![inside, from_support, from_hr, to_support, to_hr];
+    let mut edges = [inside, from_support, from_hr, to_support, to_hr];
     edges.sort();
     let edge_ids: Vec<Uuid> = edges.iter().map(|e| e.0).collect();
     let versions = w
@@ -325,7 +344,12 @@ async fn erasing_a_scope_removes_every_row_in_it_and_every_edge_that_joins_its_n
 
     assert_eq!(erasure.erased_episodes, episodes);
     assert_eq!(erasure.erased_nodes, nodes);
-    assert_eq!(erasure.erased_edges, edges);
+    // The result names the erased Edges of billing and support, which the
+    // user sees, and not hr's.
+    let mut seen: Vec<_> = edges.iter().copied().filter(|e| *e != from_hr).collect();
+    seen.sort();
+    assert_eq!(erasure.erased_edges, seen);
+    assert!(!w.exists("edge", from_hr.0).await);
     // No table holds a row of billing.
     let tables = tables_with_a_scope(&admin).await;
     for expected in [
@@ -617,4 +641,32 @@ async fn without_the_grant_no_erasure_runs_and_what_is_erased_cannot_be_erased_a
     w.erase_scope(SCOPE).await;
     let empty = w.erase_scope(SCOPE).await;
     assert!(empty.erased_episodes.is_empty() && empty.erased_nodes.is_empty());
+}
+
+#[tokio::test]
+async fn erasing_an_edge_leaves_a_bare_endpoint_in_a_scope_the_caller_cannot_see() {
+    let w = World::new().await;
+    let e = w.episode(at(2024, 1, 1), None).await;
+    // Two bare endpoints: an account of support, and a company of hr, which
+    // the support worker cannot see.
+    let account = w.bare_node_in(SCOPE, "account").await;
+    let hr_bare = w.bare_node_in("hr", "company").await;
+    let edge = w
+        .edge_in(SCOPE, account, hr_bare, e, json!({ "share": 9 }))
+        .await;
+
+    let erasure = w.erase_edge(edge).await;
+
+    assert_eq!(erasure.erased_edges, vec![edge]);
+    assert_eq!(
+        erasure.erased_nodes,
+        vec![account],
+        "only the visible one goes"
+    );
+    assert!(!w.exists("edge", edge.0).await);
+    assert!(!w.exists("node", account.0).await);
+    assert!(
+        w.exists("node", hr_bare.0).await,
+        "a bare Node of a Scope the caller cannot see stays"
+    );
 }

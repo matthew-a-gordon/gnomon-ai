@@ -172,8 +172,10 @@ pub struct GraphErasure {
     /// Scope named, and each endpoint of an erased Edge that was left with
     /// nothing, that no Edge joins and that is in a Scope the caller sees.
     pub erased_nodes: Vec<NodeId>,
-    /// The Edges erased, in order of ID: the Edge named, or every Edge that
-    /// joins an erased Node, whatever its Scope, and every Edge of the Scope
-    /// named.
+    /// The Edges erased that are in a Scope the caller sees, in order of ID:
+    /// the Edge named, or each Edge that joins an erased Node, and every Edge
+    /// of the Scope named. An Edge of a Scope the caller cannot see that
+    /// joins an erased Node is erased too, but not named, so the caller
+    /// learns no ID of that Scope.
     pub erased_edges: Vec<EdgeId>,
 }

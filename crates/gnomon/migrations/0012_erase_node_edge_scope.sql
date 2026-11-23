@@ -19,12 +19,12 @@
 -- only when it is in a Scope the caller can see. One in a Scope the caller
 -- cannot see stays as a bare identity, as it does after Erase Episode.
 --
--- None of them recomputes anything. A Contribution, statement or Citation
--- names an Episode of its own Node's or Edge's Scope, so no Version of a Node
--- or Edge that survives was derived from what these erase: an Episode a Scope's
--- Erasure deletes touched only that Scope's Nodes and Edges, and a Node's
--- Versions owe nothing to its Edges. The Episodes that wrote an erased Node or
--- Edge stay, apart from a Scope's own. A statement of another Episode about an
+-- None of them recomputes anything, because no Version that survives was
+-- derived from what they erase. A Contribution, statement or Citation names an
+-- Episode of its own Node's or Edge's Scope. So an Episode that a Scope's
+-- Erasure deletes touched only that Scope's Nodes and Edges. A Node's Versions
+-- owe nothing to its Edges. The Episodes that wrote an erased Node or Edge
+-- stay, apart from a Scope's own. A statement of another Episode about an
 -- erased Node or Edge is that Node's or Edge's, so it goes with it.
 --
 -- An Edge lives in one Scope and may join a Node in any Scope of the Tenant
@@ -69,6 +69,17 @@
 -- come after the Nodes' locks. Each advisory lock is an entry in the shared
 -- lock table, as migration 0011's header says: an Erasure that needs more
 -- than the table has free fails with SQLSTATE 53200 and erases nothing.
+--
+-- An Erasure tells the caller only of what it can see. Its result names the
+-- Edges it erased in the caller's Scopes, and not those of other Scopes, so a
+-- caller learns no ID from a Scope it cannot see. Every Node it names is in
+-- the caller's Scopes already.
+--
+-- Unlike Erase Episode, these Erasures run in any transaction and need no
+-- check that a later transaction wrote first. They replay nothing and keep no
+-- history of what they erase: every row of it goes, whoever wrote it and
+-- whenever. A write that still holds a lock commits first, and the Erasure
+-- then erases what it wrote too.
 --
 -- Copies of the erased bytes stay in dead tuples and index pages until the
 -- tables are vacuumed (ADR-0003), and so do the dead rows of
@@ -213,9 +224,12 @@ create function gnomon.erase_graph(
     v_edges uuid[];
     v_lock uuid[];
     v_locked uuid[] := '{}';
-    v_rows_locked boolean := p_scope is null;
+    -- Whether the Episodes' rows are locked. An Erasure of a Node or an Edge
+    -- erases no Episode, so it has none to lock.
+    v_episodes_locked boolean := p_scope is null;
     v_candidates uuid[];
     v_bare uuid[] := '{}';
+    v_seen_edges uuid[];
     v_id uuid;
   begin
     if not gnomon.running_as_definer() then
@@ -275,16 +289,16 @@ create function gnomon.erase_graph(
         ) l
         where l.id <> all (v_locked)
         order by l.id);
-      exit when cardinality(v_lock) = 0 and v_rows_locked;
+      exit when cardinality(v_lock) = 0 and v_episodes_locked;
       foreach v_id in array v_lock loop
         perform pg_catalog.pg_advisory_xact_lock(gnomon.node_lock_key(p_tenant_id, v_id));
       end loop;
       v_locked := v_locked || v_lock;
-      if not v_rows_locked then
+      if not v_episodes_locked then
         perform from gnomon.episode e
           where e.tenant_id = p_tenant_id and e.id = any(v_episodes)
           for update;
-        v_rows_locked := true;
+        v_episodes_locked := true;
       end if;
       if p_scope is not null and exists (
         select from gnomon.episode e
@@ -296,8 +310,14 @@ create function gnomon.erase_graph(
       end if;
     end loop;
 
-    -- The endpoints the erased Edges may leave with nothing, read before the
+    -- The erased Edges the caller can see, which are all it is told of, and
+    -- the endpoints the erased Edges may leave with nothing, read before the
     -- Edges go.
+    v_seen_edges := array(
+      select e.id from gnomon.edge e
+      where e.tenant_id = p_tenant_id and e.id = any(v_edges)
+        and e.scope = any(gnomon.allowed_scopes())
+      order by e.id);
     v_candidates := array(
       select distinct x.id from (
         select e.source_id as id from gnomon.edge e
@@ -317,7 +337,8 @@ create function gnomon.erase_graph(
     delete from gnomon.node n where n.tenant_id = p_tenant_id and n.id = any(v_nodes);
 
     -- Each endpoint left with nothing, one at a time, as Erase Episode erases
-    -- one: a Node in a Scope the caller cannot see is not visible to the
+    -- one. This repeats migration 0011's loop, which a released migration
+    -- cannot share: a Node in a Scope the caller cannot see is not visible to the
     -- delete and stays, and one that an Edge in such a Scope still joins
     -- fails the foreign key and stays.
     foreach v_id in array v_candidates loop
@@ -349,7 +370,7 @@ create function gnomon.erase_graph(
     erased_at := transaction_timestamp();
     erased_episodes := v_episodes;
     erased_nodes := array(select u.id from unnest(v_nodes || v_bare) u(id) order by u.id);
-    erased_edges := v_edges;
+    erased_edges := v_seen_edges;
     return next;
   end
   $$;

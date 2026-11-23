@@ -4632,7 +4632,11 @@ async fn no_caller_reaches_the_erasure_list_or_its_parts_and_an_erasure_widens_n
         .await
         .unwrap()[0]
         .get(0);
-    assert_eq!(edges, vec![g.crossing_edge]);
+    // The Edge went, and the result does not name it: it is billing's.
+    assert!(
+        edges.is_empty(),
+        "the result names billing's Edge {edges:?}"
+    );
     for table in ["edge", "contribution", "version", "citation", "node"] {
         let n: i64 = tx
             .query_typed(
@@ -4647,7 +4651,9 @@ async fn no_caller_reaches_the_erasure_list_or_its_parts_and_an_erasure_widens_n
             "the worker sees billing's {table} rows after an Erasure"
         );
     }
-    let r = tx
+    let mut tx = tx;
+    let attempt = tx.savepoint("attempt").await.unwrap();
+    let r = attempt
         .query_typed(
             ERASE_EDGE,
             &[(&t1, Type::UUID), (&g.billing_edge, Type::UUID)],
@@ -4657,7 +4663,10 @@ async fn no_caller_reaches_the_erasure_list_or_its_parts_and_an_erasure_widens_n
         Err(e) => assert_eq!(e.code().map(|c| c.code()), Some("GNW01"), "{e:?}"),
         Ok(v) => panic!("an Erasure widened what the caller may erase: {v:?}"),
     }
-    drop(tx);
+    attempt.rollback().await.unwrap();
+    // Once the Erasure commits, its list is empty and billing's Edge that
+    // joined n1 is gone.
+    tx.commit().await.unwrap();
     let left: i64 =
         g.n.w
             .db
@@ -4668,6 +4677,19 @@ async fn no_caller_reaches_the_erasure_list_or_its_parts_and_an_erasure_widens_n
             .unwrap()[0]
             .get(0);
     assert_eq!(left, 0, "an Erasure left its list behind");
+    let crossing: i64 =
+        g.n.w
+            .db
+            .admin()
+            .await
+            .query_typed(
+                "select count(*) from gnomon.edge where id = $1",
+                &[(&g.crossing_edge, Type::UUID)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+    assert_eq!(crossing, 0, "the Edge of billing that joined n1 stands");
     assert!(
         version_rows(&g.n.w.db, g.billing_node).await.0 > 0,
         "billing's Node keeps its Versions"

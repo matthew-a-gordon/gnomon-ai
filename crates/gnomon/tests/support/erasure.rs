@@ -10,7 +10,7 @@ use gnomon::{
 };
 use serde_json::{json, Map, Value};
 use tokio_postgres::types::Type;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, GenericClient};
 use uuid::Uuid;
 
 use super::TestDb;
@@ -41,7 +41,8 @@ pub struct World {
 impl World {
     /// A Tenant with the Node Kinds `account`, which declares `plan`, and
     /// `company`, and the Edge Kind `owns`, which declares `share`. The
-    /// worker may register Kinds and erase Episodes.
+    /// worker may register Kinds and erase Episodes, Nodes, Edges and
+    /// Scopes.
     pub async fn new() -> World {
         let db = TestDb::migrated().await;
         db.grant_kind_registration("gnomon_worker").await;
@@ -505,11 +506,11 @@ pub async fn tables_derived_from_version_text(admin: &Client) -> Vec<String> {
         .collect()
 }
 
-/// Every row of every gnomon table the caller sees, as text.
-pub async fn snapshot(tx: &tokio_postgres::Transaction<'_>, tables: &[String]) -> Vec<String> {
+/// Every row of these gnomon tables that the client sees, as text, sorted.
+pub async fn rows_of(client: &impl GenericClient, tables: &[String]) -> Vec<String> {
     let mut rows = Vec::new();
     for table in tables {
-        for r in tx
+        for r in client
             .query_typed(
                 &format!("select '{table} ' || to_jsonb(x)::text from gnomon.{table} x"),
                 &[],
@@ -522,6 +523,11 @@ pub async fn snapshot(tx: &tokio_postgres::Transaction<'_>, tables: &[String]) -
     }
     rows.sort();
     rows
+}
+
+/// Every row of every gnomon table the caller sees, as text.
+pub async fn snapshot(tx: &tokio_postgres::Transaction<'_>, tables: &[String]) -> Vec<String> {
+    rows_of(tx, tables).await
 }
 
 /// The columns of gnomon tables that name a row of `gnomon.{table}` by its
@@ -646,24 +652,12 @@ pub async fn assert_no_residue(admin: &Client, residue: &Residue<'_>) {
 /// Every row of every gnomon table, read past RLS, as text, but for the two
 /// tables no Erasure touches.
 pub async fn every_row(admin: &Client) -> Vec<String> {
-    let mut rows = Vec::new();
-    for table in gnomon_tables(admin).await {
-        if table == "schema_version" || table == "tenancy" {
-            continue;
-        }
-        for r in admin
-            .query_typed(
-                &format!("select '{table} ' || to_jsonb(x)::text from gnomon.{table} x"),
-                &[],
-            )
-            .await
-            .unwrap()
-        {
-            rows.push(r.get(0));
-        }
-    }
-    rows.sort();
-    rows
+    let tables: Vec<String> = gnomon_tables(admin)
+        .await
+        .into_iter()
+        .filter(|t| t != "schema_version" && t != "tenancy")
+        .collect();
+    rows_of(admin, &tables).await
 }
 
 /// Checks that an Erasure removed exactly the rows that name one of `ids` in

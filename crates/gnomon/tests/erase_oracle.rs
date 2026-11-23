@@ -36,10 +36,34 @@ const RANKED_KIND: &str = "ranked_person";
 /// The Scope of each Node, by index.
 const NODE_SCOPES: [usize; 3] = [0, 0, 1];
 
-/// Each Edge: its Scope, its source Node and its target Node, by index. The
-/// first crosses from support to billing's Node, the second from billing to
-/// support's, and the third stays in support.
-const EDGES: [(usize, usize, usize); 3] = [(0, 0, 2), (1, 2, 1), (0, 0, 1)];
+/// An Edge of the case: its Scope, its source Node and its target Node, each
+/// by index.
+#[derive(Debug, Clone, Copy)]
+struct EdgeAt {
+    scope: usize,
+    source: usize,
+    target: usize,
+}
+
+/// The first Edge crosses from support to billing's Node, the second from
+/// billing to support's, and the third stays in support.
+const EDGES: [EdgeAt; 3] = [
+    EdgeAt {
+        scope: 0,
+        source: 0,
+        target: 2,
+    },
+    EdgeAt {
+        scope: 1,
+        source: 2,
+        target: 1,
+    },
+    EdgeAt {
+        scope: 0,
+        source: 0,
+        target: 1,
+    },
+];
 
 /// Day `d` of the Valid-time axis, which may be fractional.
 fn at(d: f64) -> DateTime<Utc> {
@@ -116,23 +140,27 @@ struct Erased {
 }
 
 impl Erased {
-    fn episode(&self, case: &Case, e: usize) -> bool {
+    fn is_episode_erased(&self, case: &Case, e: usize) -> bool {
         self.episodes.contains(&e) || self.scopes.contains(&case.episodes[e].scope)
     }
 
-    fn node(&self, n: usize) -> bool {
+    fn is_node_erased(&self, n: usize) -> bool {
         self.nodes.contains(&n) || self.scopes.contains(&NODE_SCOPES[n])
     }
 
     /// Whether the Edge is gone: erased, its Scope erased, an endpoint
     /// erased, or the Episode that wrote it erased.
-    fn edge(&self, case: &Case, k: usize) -> bool {
-        let (scope, source, target) = EDGES[k];
+    fn is_edge_erased(&self, case: &Case, k: usize) -> bool {
+        let EdgeAt {
+            scope,
+            source,
+            target,
+        } = EDGES[k];
         self.edges.contains(&k)
             || self.scopes.contains(&scope)
-            || self.node(source)
-            || self.node(target)
-            || self.episode(case, first_episode(case, scope))
+            || self.is_node_erased(source)
+            || self.is_node_erased(target)
+            || self.is_episode_erased(case, first_episode(case, scope))
     }
 }
 
@@ -236,7 +264,7 @@ fn oracle(
     erased: &Erased,
     d: f64,
 ) -> Option<Map<String, Value>> {
-    if erased.node(node) {
+    if erased.is_node_erased(node) {
         return None;
     }
     let mut out = Map::new();
@@ -248,7 +276,9 @@ fn oracle(
             .iter()
             .enumerate()
             .flat_map(|(t, tx)| tx.iter().enumerate().map(move |(i, w)| (t, i, w)))
-            .filter(|(_, _, w)| w.node == node && !erased.episode(case, w.episode) && w.covers(d))
+            .filter(|(_, _, w)| {
+                w.node == node && !erased.is_episode_erased(case, w.episode) && w.covers(d)
+            })
             .filter_map(|(t, i, w)| {
                 let s = case.episodes[w.episode];
                 let authority = if case.ranked { s.authority } else { 0 };
@@ -326,7 +356,7 @@ fn as_of_reads_after_every_erasure_agree_with_an_oracle_over_the_remaining_contr
 }
 
 /// A user of both Scopes, who writes and reads every Node and Edge.
-fn both(store: &Store, tenant: TenantId) -> gnomon::Caller<'_> {
+fn user_of_both_scopes(store: &Store, tenant: TenantId) -> gnomon::Caller<'_> {
     let claims = json!({
         "role": "authenticated",
         "app_metadata": { "tenant_id": tenant.0.to_string(), "scopes": SCOPES }
@@ -360,7 +390,7 @@ async fn check(
     tenant: TenantId,
     case: &Case,
 ) -> (Vec<String>, usize, [usize; 4]) {
-    let writer = both(store, tenant);
+    let writer = user_of_both_scopes(store, tenant);
     let mut episodes: Vec<EpisodeId> = Vec::new();
     for (i, s) in case.episodes.iter().enumerate() {
         episodes.push(
@@ -418,7 +448,12 @@ async fn check(
     }
     tx.commit().await.unwrap();
     let mut edges: Vec<EdgeId> = Vec::new();
-    for (scope, source, target) in EDGES {
+    for EdgeAt {
+        scope,
+        source,
+        target,
+    } in EDGES
+    {
         edges.push(
             writer
                 .create_edge(
@@ -471,7 +506,7 @@ async fn check(
         // found it gone would skip it.
         match erasure {
             Erasure::Episode(e) => {
-                if erased.episode(case, e) {
+                if erased.is_episode_erased(case, e) {
                     continue;
                 }
                 let scope = Scope::new(SCOPES[case.episodes[e].scope]);
@@ -500,7 +535,7 @@ async fn check(
                     continue;
                 }
                 store
-                    .as_worker(tenant, Scope::new(SCOPES[EDGES[k].0]))
+                    .as_worker(tenant, Scope::new(SCOPES[EDGES[k].scope]))
                     .erase_edge(tenant, edges[k])
                     .await
                     .unwrap();
@@ -522,7 +557,7 @@ async fn check(
             }
         }
         for (k, edge) in edges.iter().enumerate() {
-            let expected = !erased.edge(case, k);
+            let expected = !erased.is_edge_erased(case, k);
             if exists(db, "edge", edge.0).await != expected {
                 wrong.push(format!("{erased:?}: Edge {k} exists is not {expected}"));
             }
