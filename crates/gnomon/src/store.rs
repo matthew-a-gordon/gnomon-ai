@@ -440,15 +440,20 @@ pub struct Caller<'s> {
 
 impl<'s> Caller<'s> {
     /// Returns a Caller, with this one's role and claims, whose next call
-    /// that commits also writes `writes`, in the same transaction and before
-    /// the commit (ADR-0011). The stage's output and its record then commit
-    /// or fail together: a refused write fails the call, and a call that
-    /// fails writes no record. The records are written once, by the first
-    /// call that commits; a call that fails leaves them for the next.
+    /// that can hold a stage's output also writes `writes`, in the same
+    /// transaction and before the commit (ADR-0011). Those calls are the
+    /// graph writes (creating and writing Nodes and Edges), the statements
+    /// (bounds, Corrections, Ends of validity and Retractions), recording an
+    /// Episode and [`write_stages`](Self::write_stages). Reads, claims, Kind
+    /// calls, Retract Episode and Erasure write none and leave them for that
+    /// call.
     ///
-    /// A finish refused because another claim took the record fails the
-    /// call with [`Error::StageClaimLost`], and its output rolls back with
-    /// it.
+    /// The stage's output and its records commit or fail together, and the
+    /// records go with the call either way: a call that fails writes none,
+    /// and a later call on this Caller writes none either. A stage that
+    /// retries its output records again with a new `recording`. A finish
+    /// refused because another claim took the record fails the call with
+    /// [`Error::StageClaimLost`], and the output rolls back with it.
     pub fn recording(&self, writes: Vec<StageWrite>) -> Caller<'s> {
         Caller {
             store: self.store,
@@ -491,22 +496,35 @@ impl Caller<'_> {
         Ok((tx, TenantId(rows[0].get(0))))
     }
 
-    /// Writes the stage records this Caller is [`recording`](Self::recording)
-    /// in `tx`, then commits it.
-    async fn commit(&self, tx: Transaction<'_>, tenant: TenantId) -> Result<(), Error> {
-        let writes = self.stages.lock().unwrap().clone();
-        for write in &writes {
+    /// Takes the stage records this Caller is [`recording`](Self::recording),
+    /// once, for the call that holds the stage's output. The call writes
+    /// them in each attempt of its transaction with [`commit_with`]
+    /// (Self::commit_with), and they go with it whether it commits or fails.
+    fn take_stages(&self) -> Vec<StageWrite> {
+        std::mem::take(&mut *self.stages.lock().unwrap())
+    }
+
+    /// Writes `stages` in `tx`, then commits it. Every Store call that can
+    /// hold a stage's output commits this way: the graph writes, the
+    /// statements, Episode recording and [`write_stages`](Self::write_stages).
+    /// A later call that stores a stage's output, such as a Sentence or an
+    /// embedding, must too.
+    async fn commit_with(
+        &self,
+        tx: Transaction<'_>,
+        tenant: TenantId,
+        stages: &[StageWrite],
+    ) -> Result<(), Error> {
+        for write in stages {
             write_stage(&tx, &self.store.statements, tenant, write).await?;
         }
         tx.commit().await?;
-        if !writes.is_empty() {
-            self.stages.lock().unwrap().clear();
-        }
         Ok(())
     }
 
     /// Records an Episode and returns its new ID, a UUID v7.
     pub async fn record_episode(&self, episode: &NewEpisode) -> Result<EpisodeId, Error> {
+        let stages = self.take_stages();
         let mut client = self.store.client.lock().await;
         let (tx, tenant) = self.begin(&mut client, episode.tenant).await?;
         let rows = self
@@ -524,7 +542,7 @@ impl Caller<'_> {
                 ],
             )
             .await?;
-        self.commit(tx, tenant).await?;
+        self.commit_with(tx, tenant, &stages).await?;
         Ok(EpisodeId(rows[0].get(0)))
     }
 
@@ -546,7 +564,7 @@ impl Caller<'_> {
                 &[(&tenant.0, Type::UUID), (&id.0, Type::UUID)],
             )
             .await?;
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(rows.first().map(|r| Episode {
             tenant: TenantId(r.get(0)),
             scope: Scope::new(r.get::<_, String>(1)),
@@ -592,7 +610,7 @@ impl Caller<'_> {
             .await
             .map_err(Error::from_store)?;
         let registered = read_kind(&tx, &self.store.statements, tenant, &kind.name).await?;
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(registered.expect("a Kind just registered is visible to its registrant"))
     }
 
@@ -625,7 +643,7 @@ impl Caller<'_> {
             )
             .await
             .map_err(Error::from_store)?;
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -647,7 +665,7 @@ impl Caller<'_> {
                 &[(&tenant.0, Type::UUID), (&kind, Type::TEXT)],
             )
             .await?;
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(MergeRule::from_sql(rows[0].get(0)))
     }
 
@@ -661,7 +679,7 @@ impl Caller<'_> {
         let mut client = self.store.client.lock().await;
         let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
         let kind = read_kind(&tx, &self.store.statements, tenant, name).await?;
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(kind)
     }
 }
@@ -791,10 +809,14 @@ impl Caller<'_> {
         writes: &[(Target<'_>, &Patch)],
         correct: bool,
     ) -> Result<Vec<(Versioned, WriteOutcome)>, Error> {
+        let stages = self.take_stages();
         let mut client = self.store.client.lock().await;
         let mut attempt = 0;
         loop {
-            match self.try_writes(&mut client, tenant, writes, correct).await {
+            match self
+                .try_writes(&mut client, tenant, writes, correct, &stages)
+                .await
+            {
                 Err(e) if attempt < WRITE_RETRIES && is_retryable(&e) => attempt += 1,
                 done => return done,
             }
@@ -807,6 +829,7 @@ impl Caller<'_> {
         tenant: Option<TenantId>,
         writes: &[(Target<'_>, &Patch)],
         correct: bool,
+        stages: &[StageWrite],
     ) -> Result<Vec<(Versioned, WriteOutcome)>, Error> {
         let (tx, tenant) = self.begin(client, tenant).await?;
         let statements = &self.store.statements;
@@ -853,7 +876,7 @@ impl Caller<'_> {
                 write_patch(&tx, statements, tenant, of, patch, correct).await?,
             ));
         }
-        self.commit(tx, tenant).await?;
+        self.commit_with(tx, tenant, stages).await?;
         Ok(done)
     }
 
@@ -887,7 +910,7 @@ impl Caller<'_> {
                 ],
             )
             .await?;
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(rows.first().map(|r| node_version(r, 0)))
     }
 
@@ -923,7 +946,7 @@ impl Caller<'_> {
                 ],
             )
             .await?;
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(rows.iter().map(|r| node_version(r, 0)).collect())
     }
 
@@ -957,7 +980,7 @@ impl Caller<'_> {
                 ],
             )
             .await?;
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(rows.first().map(|r| edge_version(r, 0)))
     }
 
@@ -1010,7 +1033,7 @@ impl Caller<'_> {
                 ],
             )
             .await?;
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(rows
             .iter()
             .map(|r| Step {
@@ -1066,6 +1089,7 @@ impl Caller<'_> {
             BoundSide::End => "to",
         };
         let sql = of.state_bound_sql();
+        let stages = self.take_stages();
         let mut client = self.store.client.lock().await;
         let mut attempt = 0;
         loop {
@@ -1095,7 +1119,7 @@ impl Caller<'_> {
                 }
                 other => other?,
             };
-            self.commit(tx, tenant).await?;
+            self.commit_with(tx, tenant, &stages).await?;
             let r = &rows[0];
             let change = match r.get::<_, &str>(0) {
                 "refinement" => BoundChange::Refinement,
@@ -1216,6 +1240,7 @@ impl Caller<'_> {
     ) -> Result<WriteOutcome, Error> {
         let id = of.id();
         let is_edge = of.is_edge();
+        let stages = self.take_stages();
         let mut client = self.store.client.lock().await;
         let mut attempt = 0;
         loop {
@@ -1266,7 +1291,7 @@ impl Caller<'_> {
                 }
                 other => other?,
             };
-            self.commit(tx, tenant).await?;
+            self.commit_with(tx, tenant, &stages).await?;
             return Ok(write_outcome(&rows[0]));
         }
     }
@@ -1312,7 +1337,7 @@ impl Caller<'_> {
                 }
                 other => other?,
             };
-            self.commit(tx, tenant).await?;
+            tx.commit().await?;
             let row = &rows[0];
             return Ok(EpisodeRetraction {
                 recorded_at: row.get(0),
@@ -1368,7 +1393,7 @@ impl Caller<'_> {
                 other => other?,
             };
             let touched_tables = touched_tables(&self.store.statements, &tx).await?;
-            self.commit(tx, tenant).await?;
+            tx.commit().await?;
             let row = &rows[0];
             let ids = |i: usize| row.get::<_, Vec<uuid::Uuid>>(i);
             return Ok(EpisodeErasure {
@@ -1479,7 +1504,7 @@ impl Caller<'_> {
                 other => other?,
             };
             let touched_tables = touched_tables(&self.store.statements, &tx).await?;
-            self.commit(tx, tenant).await?;
+            tx.commit().await?;
             let row = &rows[0];
             let ids = |i: usize| row.get::<_, Vec<uuid::Uuid>>(i);
             return Ok(GraphErasure {
@@ -1533,7 +1558,7 @@ impl Caller<'_> {
                 &[(&tenant.0, Type::UUID), (&id, Type::UUID)],
             )
             .await?;
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(rows
             .iter()
             .map(|r| crate::Statement {
@@ -1573,7 +1598,7 @@ impl Caller<'_> {
                 &[(&tenant.0, Type::UUID), (&version.0, Type::UUID)],
             )
             .await?;
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(rows
             .iter()
             .map(|r| Citation {
@@ -1845,12 +1870,13 @@ impl Caller<'_> {
         tenant: impl Into<Option<TenantId>>,
         writes: &[StageWrite],
     ) -> Result<(), Error> {
+        let stages = self.take_stages();
         let mut client = self.store.client.lock().await;
         let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
         for write in writes {
             write_stage(&tx, &self.store.statements, tenant, write).await?;
         }
-        self.commit(tx, tenant).await?;
+        self.commit_with(tx, tenant, &stages).await?;
         Ok(())
     }
 
@@ -1893,8 +1919,6 @@ impl Caller<'_> {
                 let episode = EpisodeId(row.get(2));
                 let usage = read_stage_usage(&tx, statements, tenant, episode).await?;
                 Some(stage_record(
-                    TenantId(row.get(0)),
-                    episode,
                     row,
                     usage
                         .get(&row.get::<_, String>(3))
@@ -1903,7 +1927,7 @@ impl Caller<'_> {
                 ))
             }
         };
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(claimed)
     }
 
@@ -1921,7 +1945,7 @@ impl Caller<'_> {
         let rows = statements
             .query(
                 &tx,
-                "select null::uuid, scope, null::uuid, stage, status::text, attempts,
+                "select tenant_id, scope, episode_id, stage, status::text, attempts,
                         last_error_code, last_error_status, retry_at, lease_until, created_at,
                         updated_at
                  from gnomon.read_stage_records($1, $2)",
@@ -1929,12 +1953,12 @@ impl Caller<'_> {
             )
             .await?;
         let mut usage = read_stage_usage(&tx, statements, tenant, episode).await?;
-        self.commit(tx, tenant).await?;
+        tx.commit().await?;
         Ok(rows
             .iter()
             .map(|row| {
                 let of_stage = usage.remove(&row.get::<_, String>(3)).unwrap_or_default();
-                stage_record(tenant, episode, row, of_stage)
+                stage_record(row, of_stage)
             })
             .collect())
     }
@@ -1942,21 +1966,16 @@ impl Caller<'_> {
 
 /// A stage record from a row of `tenant_id, scope, episode_id, stage,
 /// status, attempts, last_error_code, last_error_status, retry_at,
-/// lease_until, created_at, updated_at`. The Tenant and the Episode come from
-/// the caller, which a read does not return.
-fn stage_record(
-    tenant: TenantId,
-    episode: EpisodeId,
-    row: &Row,
-    usage: Vec<StageUsage>,
-) -> StageRecord {
+/// lease_until, created_at, updated_at`, as `gnomon.claim_stage` and
+/// `gnomon.read_stage_records` return them.
+fn stage_record(row: &Row, usage: Vec<StageUsage>) -> StageRecord {
     let code: Option<String> = row.get(6);
     StageRecord {
-        tenant,
+        tenant: TenantId(row.get(0)),
         scope: Scope::new(row.get::<_, String>(1)),
-        episode,
+        episode: EpisodeId(row.get(2)),
         stage: row.get(3),
-        status: StageStatus::parse(row.get(4)),
+        status: StageStatus::from_sql(row.get(4)),
         attempts: row.get(5),
         last_error: code.map(|code| StageError {
             code,
@@ -2045,7 +2064,7 @@ async fn write_stage(
                         (&episode.0, Type::UUID),
                         (stage, Type::TEXT),
                         (attempt, Type::INT4),
-                        (&status.as_str(), Type::TEXT),
+                        (&status.as_sql(), Type::TEXT),
                         (&error.map(|e| e.code.as_str()), Type::TEXT),
                         (&error.and_then(|e| e.status), Type::INT4),
                         (&retry_after, Type::FLOAT8),

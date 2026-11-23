@@ -72,7 +72,8 @@ impl World {
 }
 
 #[tokio::test]
-async fn a_stage_record_written_with_a_store_call_commits_with_the_stages_output_once() {
+async fn a_stage_record_written_with_a_store_call_commits_with_the_stages_output_and_no_read_writes_it(
+) {
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
     w.pending(e, "graph").await;
@@ -98,6 +99,9 @@ async fn a_stage_record_written_with_a_store_call_commits_with_the_stages_output
         ),
         StageWrite::pending(e, "sentences"),
     ]);
+    // A read holds no stage output, so it writes no record.
+    caller.read_episode(w.tenant, e).await.unwrap();
+    assert_eq!(w.stages(e).await[0].status, StageStatus::Running);
     let (node, _) = caller
         .create_node(
             &gnomon::NewNode {
@@ -137,7 +141,7 @@ async fn a_stage_record_written_with_a_store_call_commits_with_the_stages_output
     );
     assert!(records[1].usage.is_empty());
 
-    // The records went with the call that committed, and not again.
+    // The records went with the call that held the output, and not again.
     caller
         .read_node(w.tenant, node, gnomon::AsOf::current(at(2024, 1, 1)))
         .await
@@ -179,6 +183,17 @@ async fn a_store_call_that_fails_writes_no_stage_record_and_a_refused_stage_reco
     };
     assert_eq!(graph.status, StageStatus::Running);
     assert!(graph.usage.is_empty());
+    // The records went with the call that failed, so the next call on the
+    // same Caller writes none.
+    caller
+        .write_node(
+            w.tenant,
+            node,
+            &Patch::new(e, ValidTime::UNKNOWN, values(json!({ "plan": "basic" }))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(w.stages(e).await[0].status, StageStatus::Running);
 
     // The stage record is refused, so the output rolls back with it: its
     // lease expired and another claim took it.
@@ -187,7 +202,13 @@ async fn a_store_call_that_fails_writes_no_stage_record_and_a_refused_stage_reco
         .await
         .expect("the expired lease is claimable");
     assert_eq!(retaken.attempts, 2);
-    let lost = caller
+    let lost = w
+        .caller()
+        .recording(vec![StageWrite::finish(
+            &claim,
+            StageOutcome::Succeeded,
+            vec![usage("claude-sonnet-5-5", 1, 10, 10, None)],
+        )])
         .write_node(
             w.tenant,
             node,
@@ -390,21 +411,25 @@ async fn a_claim_skips_the_record_another_claimer_holds_and_never_waits_for_it()
             .await
             .unwrap()
     });
-    // Without SKIP LOCKED it would wait for the held lock. If it does, let
-    // the first claimer commit, so that the test ends and shows what the
-    // waiting claim then returns.
+    // Without SKIP LOCKED it waits for the held lock, until the holder ends.
+    // So the claim either returns, or is seen waiting on a lock, which fails
+    // the test once the holder commits and the waiting claim returns too.
     let admin = w.db.admin().await;
-    let claimed = loop {
+    let (claimed, waited) = loop {
         tokio::select! {
-            done = &mut other => break done.unwrap(),
+            done = &mut other => break (done.unwrap(), false),
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 if waiting_on_a_lock(&admin, &w.db.name).await {
                     held.take().unwrap().commit().await.unwrap();
-                    break (&mut other).await.unwrap();
+                    break ((&mut other).await.unwrap(), true);
                 }
             }
         }
     };
+    assert!(
+        !waited,
+        "the claim waited for the record another claimer holds, and then returned {claimed:?}"
+    );
     let claimed = claimed.expect("the other record is due");
     assert_ne!(
         claimed.episode.0, held_episode,
@@ -560,8 +585,8 @@ const TEXTLESS_TYPES: &[&str] = &[
 /// Every column of the stage tables that could hold model output or
 /// Episode text, read from the catalog: a column of a type outside
 /// [`TEXTLESS_TYPES`], gnomon's enums and a numeric with a fixed precision,
-/// or a text column that accepts a value with a space or one of 300
-/// characters. A text column that is part of a foreign key to the Episode
+/// or a text column that accepts a value with a space or one of 129
+/// characters, one more than the longest identifier the stage tables allow. A text column that is part of a foreign key to the Episode
 /// holds the Episode's own key, its Scope, and is not counted. Each probe
 /// runs in a savepoint of `tx` and is rolled back.
 async fn columns_that_can_hold_text(tx: &mut tokio_postgres::Transaction<'_>) -> Vec<String> {
@@ -600,7 +625,7 @@ async fn columns_that_can_hold_text(tx: &mut tokio_postgres::Transaction<'_>) ->
         if episode_key {
             continue;
         }
-        for probe in ["two words".to_owned(), "a".repeat(300)] {
+        for probe in ["two words".to_owned(), "a".repeat(129)] {
             let sp = tx.savepoint("probe").await.unwrap();
             let refused = sp
                 .execute_typed(
@@ -666,9 +691,11 @@ async fn no_column_of_the_stage_tables_can_hold_model_output_or_episode_text() {
         Vec::<String>::new()
     );
 
-    // The check fails when a column that can hold text is added.
+    // The check fails when a column that can hold text is added, a long
+    // identifier among them.
     tx.batch_execute(
         "alter table gnomon.stage_record add column note text;
+         alter table gnomon.stage_record add column tag text check (tag ~ '^[a-z]{0,200}$');
          alter table gnomon.stage_usage add column output jsonb;
          alter table gnomon.stage_usage add column reply varchar(200);",
     )
@@ -678,6 +705,7 @@ async fn no_column_of_the_stage_tables_can_hold_model_output_or_episode_text() {
         columns_that_can_hold_text(&mut tx).await,
         vec![
             "stage_record.note text holds \"two words\"".to_owned(),
+            "stage_record.tag text holds \"aaaaaaaaa\"".to_owned(),
             "stage_usage.output jsonb".to_owned(),
             "stage_usage.reply character varying(200) holds \"two words\"".to_owned(),
         ]

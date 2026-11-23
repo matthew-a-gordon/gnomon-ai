@@ -387,7 +387,7 @@ impl World {
     /// Writes what the Pipeline would for an Episode of `scope` (ADR-0011):
     /// its graph stage claimed and finished with `model`'s usage, and its
     /// sentences stage pending. Returns the Episode's stage records.
-    pub async fn stage_records(
+    pub async fn write_stage_records(
         &self,
         scope: &str,
         episode: EpisodeId,

@@ -139,7 +139,8 @@ async fn an_episode_written_everywhere(w: &World) -> gnomon::EpisodeId {
         )
         .await
         .unwrap();
-    w.stage_records(SCOPE, e, &format!("{MARKER}-model")).await;
+    w.write_stage_records(SCOPE, e, &format!("{MARKER}-model"))
+        .await;
     e
 }
 
@@ -371,7 +372,7 @@ async fn the_call_refuses_and_vacuums_nothing_when_a_table_lacks_maintain() {
 }
 
 #[tokio::test]
-async fn the_stage_tables_are_vacuumed_because_migration_0014_grants_maintain_on_them() {
+async fn the_call_refuses_without_maintain_on_a_stage_table_and_vacuums_the_stage_tables_with_it() {
     let w = World::new().await;
     let admin = w.db.admin().await;
     hold_dead_tuples(&admin).await;

@@ -10,7 +10,7 @@
 //! A stage record holds no model output and no text (ADR-0011). Its stage
 //! name, model names and error code are identifiers, which the database
 //! refuses unless they match a fixed pattern with no spaces and a fixed
-//! maximum length. An error is a code and an optional number, never a
+//! maximum length of at most 128 characters. An error is a code and an optional number, never a
 //! message, because a provider's or a parser's message often quotes its
 //! input or the model's output.
 
@@ -36,7 +36,7 @@ pub enum StageStatus {
 }
 
 impl StageStatus {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) fn as_sql(self) -> &'static str {
         match self {
             StageStatus::Pending => "pending",
             StageStatus::Running => "running",
@@ -46,7 +46,7 @@ impl StageStatus {
         }
     }
 
-    pub(crate) fn parse(s: &str) -> StageStatus {
+    pub(crate) fn from_sql(s: &str) -> StageStatus {
         match s {
             "pending" => StageStatus::Pending,
             "running" => StageStatus::Running,
@@ -79,7 +79,9 @@ pub struct StageUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
     /// The cost in US dollars the provider reported, or `None` when it
-    /// reported none. Writing usage adds it to the record's total.
+    /// reported none. Writing usage adds it to the record's total, which is
+    /// the sum of the costs reported: a call without one adds nothing, so a
+    /// total is `None` only when no call of the model reported a cost.
     pub cost_usd: Option<f64>,
 }
 

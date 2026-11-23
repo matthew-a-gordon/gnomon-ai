@@ -197,7 +197,7 @@ async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_t
     let versions = w.versions_of(&ids).await;
     // The stage records of the Episode that wrote x, which stay with the
     // Episode (ADR-0011).
-    let e_stages = w.stage_records(SCOPE, e, "claude-sonnet-5-5").await;
+    let e_stages = w.write_stage_records(SCOPE, e, "claude-sonnet-5-5").await;
     let admin = w.db.admin().await;
     let before = every_row(&admin).await;
 
@@ -339,9 +339,9 @@ async fn erasing_a_scope_removes_every_row_in_it_and_every_edge_that_joins_its_n
         .await;
     // Stage records of a billing Episode, which go with the Scope, and of a
     // support Episode, which stay (ADR-0011).
-    w.stage_records("billing", b1, &format!("{MARKER}-model"))
+    w.write_stage_records("billing", b1, &format!("{MARKER}-model"))
         .await;
-    let s1_stages = w.stage_records(SCOPE, s1, "claude-sonnet-5-5").await;
+    let s1_stages = w.write_stage_records(SCOPE, s1, "claude-sonnet-5-5").await;
     let admin = w.db.admin().await;
     let before = every_row(&admin).await;
 

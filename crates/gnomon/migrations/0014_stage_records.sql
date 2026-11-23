@@ -106,7 +106,8 @@ create table gnomon.stage_usage (
   calls integer not null check (calls >= 0),
   input_tokens bigint not null check (input_tokens >= 0),
   output_tokens bigint not null check (output_tokens >= 0),
-  -- US dollars, as the provider reports it, or null when no call reported one.
+  -- The sum of the costs in US dollars the provider reported, or null when no
+  -- call reported one. A call without a reported cost adds nothing to it.
   cost_usd numeric(20, 10) check (cost_usd >= 0),
   primary key (tenant_id, episode_id, stage, model),
   foreign key (tenant_id, episode_id, stage)
@@ -208,9 +209,10 @@ create function gnomon.finish_stage(
       raise exception using errcode = 'GNW01',
         message = 'a claimed stage finishes as succeeded, retry or failed';
     end if;
-    if (p_status = 'succeeded') <> (p_error_code is null) then
+    if (p_status = 'succeeded') <> (p_error_code is null)
+       or (p_error_code is null and p_error_status is not null) then
       raise exception using errcode = 'GNW01',
-        message = 'a stage that fails records an error code, and one that succeeds records none';
+        message = 'a stage that fails records an error code, and one that succeeds records no error';
     end if;
     if (p_status = 'retry') <> (p_retry_after is not null) or p_retry_after < interval '0' then
       raise exception using errcode = 'GNW01',
@@ -273,7 +275,9 @@ create function gnomon.add_stage_usage(
 -- Every stage record of an Episode the caller sees, in the order written.
 create function gnomon.read_stage_records(p_tenant_id uuid, p_episode_id uuid)
   returns table (
+    tenant_id uuid,
     scope text,
+    episode_id uuid,
     stage text,
     status gnomon.stage_status,
     attempts integer,
@@ -286,7 +290,8 @@ create function gnomon.read_stage_records(p_tenant_id uuid, p_episode_id uuid)
   )
   language sql stable security invoker set search_path = ''
   as $$
-    select r.scope, r.stage, r.status, r.attempts, r.last_error_code, r.last_error_status,
+    select r.tenant_id, r.scope, r.episode_id, r.stage, r.status, r.attempts,
+           r.last_error_code, r.last_error_status,
            r.retry_at, r.lease_until, r.created_at, r.updated_at
     from gnomon.stage_record r
     where r.tenant_id = p_tenant_id and r.episode_id = p_episode_id

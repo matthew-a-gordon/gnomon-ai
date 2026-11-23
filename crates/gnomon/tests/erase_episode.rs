@@ -145,8 +145,9 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .await;
     // Stage records and usage counts the Pipeline would have written, for E
     // and for F (ADR-0011). Only E's go.
-    w.stage_records(SCOPE, e, &format!("{MARKER}-model")).await;
-    let f_stages = w.stage_records(SCOPE, f, "claude-sonnet-5-5").await;
+    w.write_stage_records(SCOPE, e, &format!("{MARKER}-model"))
+        .await;
+    let f_stages = w.write_stage_records(SCOPE, f, "claude-sonnet-5-5").await;
     // Last, E is retracted, which marks it and retracts what only it cites.
     w.caller().retract_episode(w.tenant, e).await.unwrap();
 
