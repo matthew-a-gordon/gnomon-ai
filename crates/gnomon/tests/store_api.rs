@@ -595,3 +595,119 @@ async fn with_named_statements_turned_on_each_statement_is_prepared_once_per_con
     sqls.dedup();
     assert_eq!(sqls.len(), 4, "a statement was prepared twice: {parses:#?}");
 }
+
+/// The statements of each Store call of a recorded run, after the
+/// connect-time schema check.
+fn calls_after_connect(sent: &[Sent]) -> Vec<Vec<String>> {
+    let txs = transactions(sent);
+    txs[1..].to_vec()
+}
+
+#[tokio::test]
+async fn a_batch_as_of_read_of_many_nodes_and_a_traversal_are_each_one_call_whatever_the_number_of_nodes(
+) {
+    let db = TestDb::migrated().await;
+    let t = tenant();
+    let scope = "support";
+    // The graph is written without the proxy: fifty Nodes, each joined to the
+    // first by an Edge.
+    let writer = store(&db).await;
+    let w = writer.as_worker(t, Scope::new(scope));
+    let ep = w
+        .record_episode(&episode(t, scope, "Fifty Nodes."))
+        .await
+        .unwrap();
+    let mut nodes = Vec::new();
+    for i in 0..50 {
+        let (node, _) = w
+            .create_node(
+                &gnomon::NewNode {
+                    tenant: Some(t),
+                    scope: Scope::new(scope),
+                    kind: gnomon::ROOT_NODE_KIND.into(),
+                },
+                &gnomon::Patch::new(
+                    ep,
+                    gnomon::ValidTime::UNKNOWN,
+                    serde_json::from_value(serde_json::json!({ "name": format!("node {i}") }))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        nodes.push(node);
+    }
+    for node in &nodes[1..] {
+        w.create_edge(
+            &gnomon::NewEdge {
+                tenant: Some(t),
+                scope: Scope::new(scope),
+                kind: gnomon::ROOT_EDGE_KIND.into(),
+                source: nodes[0],
+                target: *node,
+            },
+            &gnomon::Patch::new(ep, gnomon::ValidTime::UNKNOWN, Map::new()),
+        )
+        .await
+        .unwrap();
+    }
+
+    let (proxy, log) = wire::record(db.server_addr().await).await;
+    let options = gnomon::ConnectOptions::default().tls(gnomon::Tls::plaintext());
+    let reader = Store::connect(&db.login_url_through(proxy), &options)
+        .await
+        .unwrap();
+    let r = reader.as_worker(t, Scope::new(scope));
+    let now = gnomon::AsOf::current(Utc::now());
+    let one = r.read_nodes(t, &nodes[..1], now).await.unwrap();
+    let all = r.read_nodes(t, &nodes, now).await.unwrap();
+    let steps = r
+        .traverse(t, nodes[0], now, &gnomon::Traversal::all())
+        .await
+        .unwrap();
+    assert_eq!((one.len(), all.len(), steps.len()), (1, 50, 49));
+
+    let sent = log.sent();
+    let calls = calls_after_connect(&sent);
+    assert_eq!(calls.len(), 3, "{calls:#?}");
+    for (call, function) in calls.iter().zip([
+        "gnomon.read_nodes(",
+        "gnomon.read_nodes(",
+        "gnomon.traverse(",
+    ]) {
+        assert_eq!(call[0], "set local role gnomon_worker", "{call:#?}");
+        assert_eq!(
+            call.len(),
+            3,
+            "the call is one Store function call: {call:#?}"
+        );
+        assert!(call[2].contains(function), "{call:#?}");
+    }
+    // Reading fifty Nodes sends exactly what reading one does: the same
+    // statements and the same number of messages, so the same round trips.
+    assert_eq!(calls[0], calls[1]);
+    let per_call: Vec<usize> = {
+        let mut counts = Vec::new();
+        let mut n = 0;
+        let mut open = false;
+        for m in &sent {
+            match m {
+                Sent::Query(q) if q.trim().eq_ignore_ascii_case("begin") => {
+                    open = true;
+                    n = 0;
+                }
+                Sent::Query(q) if q.trim().eq_ignore_ascii_case("commit") => {
+                    open = false;
+                    counts.push(n);
+                }
+                _ if open => n += 1,
+                _ => {}
+            }
+        }
+        counts
+    };
+    assert_eq!(
+        per_call[1], per_call[2],
+        "messages sent per call: {per_call:?}"
+    );
+}

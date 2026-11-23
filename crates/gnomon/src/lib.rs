@@ -6,6 +6,7 @@
 //! the Store expects into a consumer's migration chain.
 
 mod connect;
+mod edge;
 mod kind;
 pub mod migrations;
 mod node;
@@ -18,6 +19,7 @@ use tokio_postgres::error::SqlState;
 use uuid::Uuid;
 
 pub use connect::{ConnectOptions, Tls};
+pub use edge::{Direction, EdgeId, EdgeVersion, NewEdge, Step, Traversal};
 pub use kind::{Kind, KindOf, MergeRule, NewKind, ROOT_EDGE_KIND, ROOT_NODE_KIND};
 pub use node::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, NewNode, NodeId,
@@ -148,8 +150,9 @@ pub enum Error {
     #[error("Kind conflict: {0}")]
     KindConflict(String),
     /// The Store refused a write: it cites no Episode, its Valid time is
-    /// empty, a value does not satisfy the Node's Kind, or the Node or the
-    /// Episode is not visible to the caller. The message says which.
+    /// empty, a value does not satisfy the Kind of the Node or Edge, an Edge
+    /// Kind does not allow an endpoint's Kind, or a Node, Edge or Episode is
+    /// not visible to the caller. The message says which.
     #[error("invalid write: {0}")]
     InvalidWrite(String),
     /// The call named no Tenant, and the deployment is multi-tenant, so it

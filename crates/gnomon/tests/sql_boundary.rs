@@ -446,6 +446,12 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
         "gnomon.set_merge_rule(",
         "gnomon.kind_merge_rule(",
         "gnomon.read_node(",
+        "gnomon.read_nodes(",
+        "gnomon.create_edge(",
+        "gnomon.write_edge(",
+        "gnomon.state_edge_bound(",
+        "gnomon.read_edge(",
+        "gnomon.traverse(",
         "gnomon.list_citations(",
         "gnomon.default_tenant()",
         "gnomon.call_tenant(",
@@ -1854,8 +1860,31 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         )
         .await
         .unwrap();
+    // An Edge from the Node to itself, and its Version's Sentence, which the
+    // table's owner stores until ticket #26 adds the function that does.
+    let (_, edge) = single
+        .create_edge(
+            &gnomon::NewEdge {
+                tenant: None,
+                scope: Scope::new("support"),
+                kind: gnomon::ROOT_EDGE_KIND.into(),
+                source: node,
+                target: node,
+            },
+            &gnomon::Patch::new(episode, gnomon::ValidTime::UNKNOWN, serde_json::Map::new()),
+        )
+        .await
+        .unwrap();
 
     let operator = db.operator().await;
+    operator
+        .execute_typed(
+            "insert into gnomon.sentence (tenant_id, scope, version_id, sentence)
+             values ($1, 'support', $2, 'Ada knows herself.')",
+            &[(&first, Type::UUID), (&edge.opened[0].0, Type::UUID)],
+        )
+        .await
+        .unwrap();
     let tables = tenant_tables(&operator).await;
     for expected in [
         "citation",
@@ -1867,6 +1896,8 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         "node",
         "version",
         "bound_statement",
+        "edge",
+        "sentence",
     ] {
         assert!(
             tables.iter().any(|t| t == expected),
@@ -2572,4 +2603,444 @@ async fn a_caller_cannot_change_an_episodes_authority() {
             .map(|r| r.get(0))
             .collect();
     assert_eq!(after, before);
+}
+
+// Edges (ADR-0005, ADR-0008, ADR-0009). An Edge's endpoints are Nodes of its
+// own Tenant that the caller can see, of Kinds its Edge Kind allows. Edge
+// Versions are Versions: the guard triggers, the grants and RLS that keep a
+// Node's history keep an Edge's, and no caller gets a new right to change
+// them or to store a Sentence.
+
+/// The Nodes of `nodes`, an Edge in each Tenant's `support` Scope from its
+/// Node to itself, written once, and a Node of Tenant one in `billing`.
+struct Edges {
+    n: Nodes,
+    e1: Uuid,
+    e1_open: Uuid,
+    e2: Uuid,
+    billing_node: Uuid,
+}
+
+async fn edges() -> Edges {
+    let n = nodes().await;
+    let store = Store::connect(&n.w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let mut made = Vec::new();
+    for (t, ep, node) in [
+        (n.w.t1, n.w.t1_support, n.n1),
+        (n.w.t2, n.w.t2_support, n.n2),
+    ] {
+        let (edge, written) = store
+            .as_worker(TenantId(t), Scope::new("support"))
+            .create_edge(
+                &gnomon::NewEdge {
+                    tenant: Some(TenantId(t)),
+                    scope: Scope::new("support"),
+                    kind: gnomon::ROOT_EDGE_KIND.into(),
+                    source: gnomon::NodeId(node),
+                    target: gnomon::NodeId(node),
+                },
+                &gnomon::Patch::new(
+                    EpisodeId(ep),
+                    gnomon::ValidTime::UNKNOWN,
+                    Default::default(),
+                ),
+            )
+            .await
+            .unwrap();
+        made.push((edge.0, written.opened[0].0));
+    }
+    let (billing_node, _) = store
+        .as_worker(TenantId(n.w.t1), Scope::new("billing"))
+        .create_node(
+            &gnomon::NewNode {
+                tenant: Some(TenantId(n.w.t1)),
+                scope: Scope::new("billing"),
+                kind: gnomon::ROOT_NODE_KIND.into(),
+            },
+            &gnomon::Patch::new(
+                EpisodeId(n.w.t1_billing),
+                gnomon::ValidTime::UNKNOWN,
+                serde_json::from_value(json!({ "name": "billing" })).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    Edges {
+        e1: made[0].0,
+        e1_open: made[0].1,
+        e2: made[1].0,
+        billing_node: billing_node.0,
+        n,
+    }
+}
+
+fn assert_invalid_write(
+    result: Result<impl std::fmt::Debug, tokio_postgres::Error>,
+    message: &str,
+) {
+    match result {
+        Err(e) => {
+            assert_eq!(
+                e.code().map(|c| c.code()),
+                Some(gnomon::INVALID_WRITE),
+                "{message}: {e:?}"
+            );
+            assert_eq!(e.as_db_error().unwrap().message(), message);
+        }
+        Ok(v) => panic!("allowed, expected {message:?}: {v:?}"),
+    }
+}
+
+const CREATE_EDGE: &str = "select gnomon.create_edge($1, 'support', $2, $3, $4)";
+const INSERT_EDGE: &str = "insert into gnomon.edge (tenant_id, scope, kind, source_id, target_id)
+     values ($1, 'support', $2, $3, $4)";
+
+#[tokio::test]
+async fn a_caller_cannot_join_a_node_in_another_tenant_or_a_scope_it_cannot_see_with_an_edge() {
+    let e = edges().await;
+    let (t1, n1, n2) = (e.n.w.t1, e.n.n1, e.n.n2);
+    for role in [USER, WORKER] {
+        for sql in [CREATE_EDGE, INSERT_EDGE] {
+            for (source, target, side, other) in [
+                (n1, n2, "target", n2),
+                (n2, n1, "source", n2),
+                (n1, e.billing_node, "target", e.billing_node),
+                (e.billing_node, n1, "source", e.billing_node),
+            ] {
+                let mut client = e.n.w.db.login().await;
+                let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+                let r = tx
+                    .execute_typed(
+                        sql,
+                        &[
+                            (&t1, Type::UUID),
+                            (&"edge", Type::TEXT),
+                            (&source, Type::UUID),
+                            (&target, Type::UUID),
+                        ],
+                    )
+                    .await;
+                assert_invalid_write(
+                    r,
+                    &format!("the {side} Node {other} is not visible to the caller"),
+                );
+            }
+        }
+        // An Edge filed under the other Tenant, to that Tenant's Node, finds
+        // no Node the caller can see, before RLS refuses the row itself.
+        let mut client = e.n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        let r = tx
+            .execute_typed(
+                INSERT_EDGE,
+                &[
+                    (&e.n.w.t2, Type::UUID),
+                    (&"edge", Type::TEXT),
+                    (&n2, Type::UUID),
+                    (&n2, Type::UUID),
+                ],
+            )
+            .await;
+        assert_invalid_write(
+            r,
+            &format!("the source Node {n2} is not visible to the caller"),
+        );
+    }
+
+    // Under the trigger, the foreign keys refuse a cross-Tenant endpoint
+    // whatever RLS allows: here the owner, who bypasses RLS, inserts one with
+    // the trigger turned off for its own transaction.
+    let mut operator = e.n.w.db.operator().await;
+    let tx = operator.transaction().await.unwrap();
+    tx.batch_execute("alter table gnomon.edge disable trigger edge_check_insert")
+        .await
+        .unwrap();
+    let err = tx
+        .execute_typed(
+            INSERT_EDGE,
+            &[
+                (&t1, Type::UUID),
+                (&"edge", Type::TEXT),
+                (&n1, Type::UUID),
+                (&n2, Type::UUID),
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some(&SqlState::FOREIGN_KEY_VIOLATION),
+        "{err:?}"
+    );
+    drop(tx);
+
+    let rows: i64 =
+        e.n.w
+            .db
+            .admin()
+            .await
+            .query_typed("select count(*) from gnomon.edge", &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+    assert_eq!(rows, 2, "only the fixture's Edges exist");
+}
+
+#[tokio::test]
+async fn a_caller_inserting_an_edge_directly_cannot_skip_its_kinds_endpoint_rules() {
+    let e = edges().await;
+    let t1 = e.n.w.t1;
+    e.n.w.db.grant_kind_registration(USER).await;
+    let mut client = e.n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(t1, &["support"])).await;
+    tx.batch_execute(&format!(
+        "select gnomon.register_kind('{t1}', 'company', 'node', null, '{{}}', '{{}}', null, null);
+         select gnomon.register_kind('{t1}', 'owns', 'edge', null, '{{}}', '{{}}', '{{company}}', '{{company}}')"
+    ))
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    for (kind, message) in [
+        (
+            "owns",
+            "Edge Kind \"owns\" may not start at a Node of Kind \"node\"; it allows company",
+        ),
+        ("company", "\"company\" is not an Edge Kind of the Tenant"),
+        ("node", "\"node\" is not an Edge Kind of the Tenant"),
+    ] {
+        let mut client = e.n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+        let r = tx
+            .execute_typed(
+                INSERT_EDGE,
+                &[
+                    (&t1, Type::UUID),
+                    (&kind, Type::TEXT),
+                    (&e.n.n1, Type::UUID),
+                    (&e.n.n1, Type::UUID),
+                ],
+            )
+            .await;
+        assert_invalid_write(r, message);
+    }
+}
+
+#[tokio::test]
+async fn a_caller_cannot_read_or_traverse_another_tenants_or_scopes_edges() {
+    let e = edges().await;
+    let (t1, t2) = (e.n.w.t1, e.n.w.t2);
+    for role in [USER, WORKER] {
+        let mut client = e.n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        for table in ["edge", "sentence"] {
+            let other: i64 = tx
+                .query_typed(
+                    &format!("select count(*) from gnomon.{table} where tenant_id <> $1"),
+                    &[(&t1, Type::UUID)],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+            assert_eq!(other, 0, "{role} saw another Tenant's {table} rows");
+        }
+        for (sql, id) in [
+            ("select id from gnomon.read_edge($1, $2, now(), null)", e.e2),
+            (
+                "select id from gnomon.traverse($1, $2, now(), null, 'both', null)",
+                e.n.n2,
+            ),
+            (
+                "select id from gnomon.read_nodes($1, array[$2::uuid], now(), null)",
+                e.n.n2,
+            ),
+        ] {
+            for tenant in [t1, t2] {
+                let rows = tx
+                    .query_typed(sql, &[(&tenant, Type::UUID), (&id, Type::UUID)])
+                    .await
+                    .unwrap();
+                assert!(rows.is_empty(), "{role} read Tenant two through {sql}");
+            }
+        }
+        // Tenant one's own Node in billing is out of this caller's Scopes.
+        let rows = tx
+            .query_typed(
+                "select id from gnomon.read_nodes($1, array[$2::uuid, $3::uuid], now(), null)",
+                &[
+                    (&t1, Type::UUID),
+                    (&e.billing_node, Type::UUID),
+                    (&e.n.n1, Type::UUID),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{role} read a Node outside its Scopes");
+    }
+}
+
+#[tokio::test]
+async fn a_caller_cannot_write_another_tenants_edge_or_change_an_edge_or_store_a_sentence() {
+    let e = edges().await;
+    let t1 = e.n.w.t1;
+    for role in [USER, WORKER] {
+        let attempts: [(&str, Vec<Uuid>, &str); 8] = [
+            (
+                "select gnomon.write_edge($1, $2, $3, null, null, null, null, null, null)",
+                vec![e.n.w.t2, e.e2, e.n.w.t2_support],
+                "writing another Tenant's Edge",
+            ),
+            (
+                "update gnomon.edge set target_id = $2 where id = $3 and $1::uuid is not null",
+                vec![t1, e.n.n1, e.e1],
+                "moving an Edge's endpoint",
+            ),
+            (
+                "delete from gnomon.edge where id = $2 and $1::uuid is not null and $3::uuid is not null",
+                vec![t1, e.e1, e.e1],
+                "deleting an Edge",
+            ),
+            (
+                "insert into gnomon.edge (tenant_id, scope, kind, source_id, target_id, created_at)
+                 values ($1, 'support', 'edge', $2, $3, '2000-01-01')",
+                vec![t1, e.n.n1, e.n.n1],
+                "choosing an Edge's creation time",
+            ),
+            (
+                "insert into gnomon.sentence (tenant_id, scope, version_id, sentence)
+                 select $1, 'support', $2, 'A forged Sentence.' where $3::uuid is not null",
+                vec![t1, e.e1_open, e.e1_open],
+                "storing a Sentence",
+            ),
+            (
+                "delete from gnomon.version where id = $2 and $1::uuid is not null and $3::uuid is not null",
+                vec![t1, e.e1_open, e.e1_open],
+                "deleting a committed Edge Version",
+            ),
+            (
+                "update gnomon.version set props = '{\"forged\": true}' where id = $2
+                 and $1::uuid is not null and $3::uuid is not null",
+                vec![t1, e.e1_open, e.e1_open],
+                "rewriting an Edge Version's values",
+            ),
+            (
+                "update gnomon.version set recorded_to = '2000-01-01' where id = $2
+                 and $1::uuid is not null and $3::uuid is not null",
+                vec![t1, e.e1_open, e.e1_open],
+                "rewriting an Edge Version's Recorded time",
+            ),
+        ];
+        for (sql, params, what) in attempts {
+            let mut client = e.n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            let r = tx
+                .execute_typed(
+                    sql,
+                    &[
+                        (&params[0], Type::UUID),
+                        (&params[1], Type::UUID),
+                        (&params[2], Type::UUID),
+                    ],
+                )
+                .await;
+            assert_refused(r, &format!("{role} {what}"));
+        }
+    }
+    let rows =
+        e.n.w
+            .db
+            .admin()
+            .await
+            .query_typed(
+                "select (select count(*) from gnomon.version where edge_id = any($1)),
+                    (select count(*) from gnomon.sentence),
+                    (select count(*) from gnomon.edge)",
+                &[(&vec![e.e1, e.e2], Type::UUID_ARRAY)],
+            )
+            .await
+            .unwrap();
+    assert_eq!(
+        (
+            rows[0].get::<_, i64>(0),
+            rows[0].get::<_, i64>(1),
+            rows[0].get::<_, i64>(2)
+        ),
+        (2, 0, 2),
+        "the Edges and their Versions are untouched"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_inserting_directly_cannot_forge_the_built_in_that_says_an_edge_holds() {
+    let e = edges().await;
+    let t1 = e.n.w.t1;
+    let contribution =
+        "insert into gnomon.contribution (tenant_id, scope, edge_id, episode_id, property,
+           value, valid_from, valid_from_precision, valid_to, valid_to_precision,
+           episode_reference_time, episode_recorded_at)
+         select $1, 'support', $2, $3, 'holds', $4, '-infinity', 'unknown', 'infinity', 'unknown',
+                ep.reference_time, ep.recorded_at
+         from gnomon.episode ep where ep.id = $3";
+    for value in [json!(false), json!("yes"), json!(1)] {
+        let mut client = e.n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+        let r = tx
+            .execute_typed(
+                contribution,
+                &[
+                    (&t1, Type::UUID),
+                    (&e.e1, Type::UUID),
+                    (&e.n.w.t1_support, Type::UUID),
+                    (&value, Type::JSONB),
+                ],
+            )
+            .await;
+        assert_invalid_write(
+            r,
+            &format!("the value {value} of property \"holds\" does not satisfy Kind \"edge\""),
+        );
+    }
+
+    // A Version inserted directly never holds the built-in among its values,
+    // and names one Node or one Edge.
+    for (node, edge, props, check) in [
+        (None, Some(e.e1), json!({ "holds": true }), None),
+        (
+            Some(e.n.n1),
+            Some(e.e1),
+            json!({ "name": "both" }),
+            Some(SqlState::CHECK_VIOLATION),
+        ),
+        (
+            None,
+            None,
+            json!({ "name": "neither" }),
+            Some(SqlState::CHECK_VIOLATION),
+        ),
+    ] {
+        let mut client = e.n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+        let r = tx
+            .execute_typed(
+                "insert into gnomon.version (tenant_id, scope, node_id, edge_id, props, valid_from,
+                   valid_from_precision, valid_to, valid_to_precision, merge_rule)
+                 values ($1, 'support', $2, $3, $4, '2030-01-01', 'instant', '2030-01-02', 'instant', 'recency')",
+                &[
+                    (&t1, Type::UUID),
+                    (&node, Type::UUID),
+                    (&edge, Type::UUID),
+                    (&props, Type::JSONB),
+                ],
+            )
+            .await;
+        match check {
+            None => assert_invalid_write(
+                r,
+                "an Edge Version's values never hold the built-in property \"holds\"",
+            ),
+            Some(code) => assert_eq!(r.unwrap_err().code(), Some(&code), "{props}"),
+        }
+    }
 }

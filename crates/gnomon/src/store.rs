@@ -35,9 +35,10 @@ use tokio_postgres::{Client, Config, NoTls, Row, Statement, Transaction};
 use crate::connect::ConnectOptions;
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
-    AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Episode,
-    EpisodeId, Error, Kind, KindOf, MergeRule, NewEpisode, NewKind, NewNode, NodeId, NodeVersion,
-    Patch, Precision, Scope, TenantId, ValidTime, VersionId, WriteOutcome, WriteStatus,
+    AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Direction, EdgeId,
+    EdgeVersion, Episode, EpisodeId, Error, Kind, KindOf, MergeRule, NewEdge, NewEpisode, NewKind,
+    NewNode, NodeId, NodeVersion, Patch, Precision, Scope, Step, TenantId, Traversal, ValidTime,
+    VersionId, WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -474,11 +475,13 @@ impl Caller<'_> {
     }
 }
 
-/// One write of a batch: to a new Node, or to an existing one. Every write
-/// of a batch is in the batch's one Tenant.
+/// One write of a batch: to a new Node or Edge, or to an existing one. Every
+/// write of a batch is in the batch's one Tenant.
 enum Target<'a> {
-    New(&'a NewNode),
-    Existing(NodeId),
+    NewNode(&'a NewNode),
+    Node(NodeId),
+    NewEdge(&'a NewEdge),
+    Edge(EdgeId),
 }
 
 impl Caller<'_> {
@@ -488,10 +491,11 @@ impl Caller<'_> {
         node: &NewNode,
         patch: &Patch,
     ) -> Result<(NodeId, WriteOutcome), Error> {
-        let mut done = self
-            .run_writes(node.tenant, &[(Target::New(node), patch)])
-            .await?;
-        Ok(done.remove(0))
+        let (id, outcome) = self
+            .run_writes(node.tenant, &[(Target::NewNode(node), patch)])
+            .await?
+            .remove(0);
+        Ok((NodeId(id), outcome))
     }
 
     /// Writes a patch of property values for a Node, citing the patch's
@@ -503,7 +507,7 @@ impl Caller<'_> {
         patch: &Patch,
     ) -> Result<WriteOutcome, Error> {
         let mut done = self
-            .run_writes(tenant.into(), &[(Target::Existing(node), patch)])
+            .run_writes(tenant.into(), &[(Target::Node(node), patch)])
             .await?;
         Ok(done.remove(0).1)
     }
@@ -518,7 +522,61 @@ impl Caller<'_> {
     ) -> Result<Vec<WriteOutcome>, Error> {
         let targets: Vec<_> = writes
             .iter()
-            .map(|(node, patch)| (Target::Existing(*node), patch))
+            .map(|(node, patch)| (Target::Node(*node), patch))
+            .collect();
+        Ok(self
+            .run_writes(tenant.into(), &targets)
+            .await?
+            .into_iter()
+            .map(|(_, outcome)| outcome)
+            .collect())
+    }
+
+    /// Creates an Edge and writes its first patch, in one transaction.
+    ///
+    /// The Store refuses an Edge whose Kind is not an Edge Kind of the
+    /// Tenant, whose endpoint is not a Node of the Tenant that the caller
+    /// can see, or whose endpoint's Kind the Edge Kind does not allow, with
+    /// [`Error::InvalidWrite`]. The Edge holds over the patch's Valid time,
+    /// and the patch may state no property value.
+    pub async fn create_edge(
+        &self,
+        edge: &NewEdge,
+        patch: &Patch,
+    ) -> Result<(EdgeId, WriteOutcome), Error> {
+        let (id, outcome) = self
+            .run_writes(edge.tenant, &[(Target::NewEdge(edge), patch)])
+            .await?
+            .remove(0);
+        Ok((EdgeId(id), outcome))
+    }
+
+    /// Writes a patch of property values for an Edge, citing the patch's
+    /// Episode, states that the Edge holds over the patch's Valid time, and
+    /// recomputes the Edge's Versions over it. The patch may state no
+    /// property value, and never states `holds`, which is built in.
+    pub async fn write_edge(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        edge: EdgeId,
+        patch: &Patch,
+    ) -> Result<WriteOutcome, Error> {
+        let mut done = self
+            .run_writes(tenant.into(), &[(Target::Edge(edge), patch)])
+            .await?;
+        Ok(done.remove(0).1)
+    }
+
+    /// Writes several patches to Edges in one transaction, in order, as
+    /// [`write_nodes`](Self::write_nodes) does for Nodes.
+    pub async fn write_edges(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        writes: &[(EdgeId, Patch)],
+    ) -> Result<Vec<WriteOutcome>, Error> {
+        let targets: Vec<_> = writes
+            .iter()
+            .map(|(edge, patch)| (Target::Edge(*edge), patch))
             .collect();
         Ok(self
             .run_writes(tenant.into(), &targets)
@@ -534,7 +592,7 @@ impl Caller<'_> {
         &self,
         tenant: Option<TenantId>,
         writes: &[(Target<'_>, &Patch)],
-    ) -> Result<Vec<(NodeId, WriteOutcome)>, Error> {
+    ) -> Result<Vec<(uuid::Uuid, WriteOutcome)>, Error> {
         let mut client = self.store.client.lock().await;
         let mut attempt = 0;
         loop {
@@ -550,16 +608,16 @@ impl Caller<'_> {
         client: &mut Client,
         tenant: Option<TenantId>,
         writes: &[(Target<'_>, &Patch)],
-    ) -> Result<Vec<(NodeId, WriteOutcome)>, Error> {
+    ) -> Result<Vec<(uuid::Uuid, WriteOutcome)>, Error> {
         let (tx, tenant) = self.begin(client, tenant).await?;
+        let statements = &self.store.statements;
         let mut done = Vec::with_capacity(writes.len());
         for (target, patch) in writes {
-            let node = match target {
-                Target::Existing(node) => *node,
-                Target::New(new) => {
-                    let rows = self
-                        .store
-                        .statements
+            let (id, of) = match target {
+                Target::Node(node) => (node.0, Versioned::Node),
+                Target::Edge(edge) => (edge.0, Versioned::Edge),
+                Target::NewNode(new) => {
+                    let rows = statements
                         .query(
                             &tx,
                             "select gnomon.create_node($1, $2, $3)",
@@ -571,12 +629,29 @@ impl Caller<'_> {
                         )
                         .await
                         .map_err(Error::from_store)?;
-                    NodeId(rows[0].get(0))
+                    (rows[0].get(0), Versioned::Node)
+                }
+                Target::NewEdge(new) => {
+                    let rows = statements
+                        .query(
+                            &tx,
+                            "select gnomon.create_edge($1, $2, $3, $4, $5)",
+                            &[
+                                (&tenant.0, Type::UUID),
+                                (&new.scope.as_str(), Type::TEXT),
+                                (&new.kind, Type::TEXT),
+                                (&new.source.0, Type::UUID),
+                                (&new.target.0, Type::UUID),
+                            ],
+                        )
+                        .await
+                        .map_err(Error::from_store)?;
+                    (rows[0].get(0), Versioned::Edge)
                 }
             };
             done.push((
-                node,
-                write_patch(&tx, &self.store.statements, tenant, node, patch).await?,
+                id,
+                write_patch(&tx, statements, tenant, of, id, patch).await?,
             ));
         }
         tx.commit().await?;
@@ -614,28 +689,140 @@ impl Caller<'_> {
             )
             .await?;
         tx.commit().await?;
-        Ok(rows.first().map(|r| {
-            let values = match r.get::<_, Value>(4) {
-                Value::Object(m) => m,
-                other => panic!("gnomon.read_node returned values {other}"),
-            };
-            NodeVersion {
-                id: VersionId(r.get(0)),
-                node: NodeId(r.get(1)),
-                scope: Scope::new(r.get::<_, String>(2)),
-                kind: r.get(3),
-                values,
-                valid_time: ValidTime {
-                    from: bound(r.get(5), r.get(6)),
-                    to: bound(r.get(7), r.get(8)),
-                },
-                recorded_from: r.get(9),
-                recorded_to: r.get(10),
-                uncertain: r.get(11),
-                text_hash: r.get(12),
-                merge_rule: MergeRule::from_sql(r.get(13)),
-            }
-        }))
+        Ok(rows.first().map(|r| node_version(r, 0)))
+    }
+
+    /// Reads many Nodes As-of one valid-at and one known-at instant, in one
+    /// call and one round trip: the Version of each Node that held then, in
+    /// the order the Nodes are given, each Node once. A Node that held no
+    /// Version then, or that the caller cannot see, has no entry.
+    pub async fn read_nodes(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        nodes: &[NodeId],
+        as_of: AsOf,
+    ) -> Result<Vec<NodeVersion>, Error> {
+        let ids: Vec<uuid::Uuid> = nodes.iter().map(|n| n.0).collect();
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
+                "select id, node_id, scope, kind, props,
+                        nullif(valid_from, '-infinity'), valid_from_precision::text,
+                        nullif(valid_to, 'infinity'), valid_to_precision::text,
+                        recorded_from, nullif(recorded_to, 'infinity'), uncertain, text_hash,
+                        merge_rule::text
+                 from gnomon.read_nodes($1, $2, $3, $4)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&ids, Type::UUID_ARRAY),
+                    (&as_of.valid_at, Type::TIMESTAMPTZ),
+                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(|r| node_version(r, 0)).collect())
+    }
+
+    /// Reads an Edge As-of a valid-at and a known-at instant: the Version
+    /// that held then, with its Sentence if one is stored, or `None` if none
+    /// held or the caller cannot see the Edge.
+    pub async fn read_edge(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        edge: EdgeId,
+        as_of: AsOf,
+    ) -> Result<Option<EdgeVersion>, Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
+                "select id, edge_id, scope, kind, source_id, target_id, props,
+                        nullif(valid_from, '-infinity'), valid_from_precision::text,
+                        nullif(valid_to, 'infinity'), valid_to_precision::text,
+                        recorded_from, nullif(recorded_to, 'infinity'), uncertain, text_hash,
+                        merge_rule::text, sentence
+                 from gnomon.read_edge($1, $2, $3, $4)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&edge.0, Type::UUID),
+                    (&as_of.valid_at, Type::TIMESTAMPTZ),
+                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(rows.first().map(|r| edge_version(r, 0)))
+    }
+
+    /// Traverses the Edges of a Node As-of a valid-at and a known-at
+    /// instant, in one call: each Edge the traversal follows that held a
+    /// Version then, with the Node at its other end and that Node's Version
+    /// then, if it held one. The steps come in Edge ID order.
+    ///
+    /// Only what the caller can see is returned. An Edge whose other end is
+    /// a Node the caller cannot see is left out, and a Node the caller cannot
+    /// see has no steps.
+    pub async fn traverse(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        node: NodeId,
+        as_of: AsOf,
+        traversal: &Traversal,
+    ) -> Result<Vec<Step>, Error> {
+        let kinds = (!traversal.kinds.is_empty()).then_some(&traversal.kinds);
+        let direction = traversal.direction.as_sql();
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
+                "select id, edge_id, scope, kind, source_id, target_id, props,
+                        nullif(valid_from, '-infinity'), valid_from_precision::text,
+                        nullif(valid_to, 'infinity'), valid_to_precision::text,
+                        recorded_from, nullif(recorded_to, 'infinity'), uncertain, text_hash,
+                        merge_rule::text, sentence,
+                        neighbour_version_id, neighbour_id, neighbour_scope, neighbour_kind,
+                        neighbour_props,
+                        nullif(neighbour_valid_from, '-infinity'),
+                        neighbour_valid_from_precision::text,
+                        nullif(neighbour_valid_to, 'infinity'),
+                        neighbour_valid_to_precision::text,
+                        neighbour_recorded_from, nullif(neighbour_recorded_to, 'infinity'),
+                        neighbour_uncertain, neighbour_text_hash, neighbour_merge_rule::text,
+                        direction
+                 from gnomon.traverse($1, $2, $3, $4, $5, $6)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&node.0, Type::UUID),
+                    (&as_of.valid_at, Type::TIMESTAMPTZ),
+                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&direction, Type::TEXT),
+                    (&kinds, Type::TEXT_ARRAY),
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|r| Step {
+                direction: Direction::from_sql(r.get(31)),
+                edge: edge_version(r, 0),
+                neighbour: NodeId(r.get(18)),
+                neighbour_version: r
+                    .get::<_, Option<uuid::Uuid>>(17)
+                    .map(|_| node_version(r, 17)),
+            })
+            .collect())
     }
 
     /// States a bound of a current Version's Valid time, citing the
@@ -650,12 +837,45 @@ impl Caller<'_> {
         node: NodeId,
         statement: &BoundStatement,
     ) -> Result<BoundOutcome, Error> {
+        self.state_bound_of(tenant.into(), Versioned::Node, node.0, statement)
+            .await
+    }
+
+    /// States a bound of an Edge's current Version, as
+    /// [`state_bound`](Self::state_bound) does for a Node. The Edge holds
+    /// over the stated bound.
+    pub async fn state_edge_bound(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        edge: EdgeId,
+        statement: &BoundStatement,
+    ) -> Result<BoundOutcome, Error> {
+        self.state_bound_of(tenant.into(), Versioned::Edge, edge.0, statement)
+            .await
+    }
+
+    async fn state_bound_of(
+        &self,
+        tenant: Option<TenantId>,
+        of: Versioned,
+        id: uuid::Uuid,
+        statement: &BoundStatement,
+    ) -> Result<BoundOutcome, Error> {
         let (at, precision) = statement.bound.parts();
         let side = match statement.side {
             BoundSide::Start => "from",
             BoundSide::End => "to",
         };
-        let tenant = tenant.into();
+        let sql = match of {
+            Versioned::Node => {
+                "select change, recorded_at, versions
+                 from gnomon.state_bound($1, $2, $3, $4, $5, $6, $7)"
+            }
+            Versioned::Edge => {
+                "select change, recorded_at, versions
+                 from gnomon.state_edge_bound($1, $2, $3, $4, $5, $6, $7)"
+            }
+        };
         let mut client = self.store.client.lock().await;
         let mut attempt = 0;
         loop {
@@ -665,11 +885,10 @@ impl Caller<'_> {
                 .statements
                 .query(
                     &tx,
-                    "select change, recorded_at, versions
-                     from gnomon.state_bound($1, $2, $3, $4, $5, $6, $7)",
+                    sql,
                     &[
                         (&tenant.0, Type::UUID),
-                        (&node.0, Type::UUID),
+                        (&id, Type::UUID),
                         (&statement.episode.0, Type::UUID),
                         (&statement.version.0, Type::UUID),
                         (&side, Type::TEXT),
@@ -736,11 +955,19 @@ impl Caller<'_> {
     }
 }
 
+/// Whether a write or a statement is about a Node or an Edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Versioned {
+    Node,
+    Edge,
+}
+
 async fn write_patch(
     tx: &Transaction<'_>,
     statements: &Statements,
     tenant: TenantId,
-    node: NodeId,
+    of: Versioned,
+    id: uuid::Uuid,
     patch: &Patch,
 ) -> Result<WriteOutcome, Error> {
     let (from, to) = patch.valid_time.bounds();
@@ -755,14 +982,23 @@ async fn write_patch(
                 .collect(),
         )
     });
+    let sql = match of {
+        Versioned::Node => {
+            "select status, recorded_at, versions
+             from gnomon.write_node($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+        }
+        Versioned::Edge => {
+            "select status, recorded_at, versions
+             from gnomon.write_edge($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+        }
+    };
     let rows = statements
         .query(
             tx,
-            "select status, recorded_at, versions
-             from gnomon.write_node($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            sql,
             &[
                 (&tenant.0, Type::UUID),
-                (&node.0, Type::UUID),
+                (&id, Type::UUID),
                 (&patch.episode.0, Type::UUID),
                 (&from, Type::TIMESTAMPTZ),
                 (&from_precision, Type::TEXT),
@@ -778,7 +1014,7 @@ async fn write_patch(
     let status = match r.get::<_, &str>(0) {
         "written" => WriteStatus::Written,
         "unchanged" => WriteStatus::Unchanged,
-        other => panic!("gnomon.write_node returned status {other:?}"),
+        other => panic!("the Store's write returned status {other:?}"),
     };
     let opened: Vec<uuid::Uuid> = r.get(2);
     Ok(WriteOutcome {
@@ -786,6 +1022,61 @@ async fn write_patch(
         recorded_at: r.get(1),
         opened: opened.into_iter().map(VersionId).collect(),
     })
+}
+
+/// A Node Version from the 14 columns of `row` from `at` on: ID, Node,
+/// Scope, Kind, values, the four bounds with their precisions, the two
+/// Recorded-time bounds, the `uncertain` marker, the text hash and the merge
+/// rule, with open bounds as nulls.
+fn node_version(row: &Row, at: usize) -> NodeVersion {
+    NodeVersion {
+        id: VersionId(row.get(at)),
+        node: NodeId(row.get(at + 1)),
+        scope: Scope::new(row.get::<_, String>(at + 2)),
+        kind: row.get(at + 3),
+        values: object(row.get(at + 4)),
+        valid_time: ValidTime {
+            from: bound(row.get(at + 5), row.get(at + 6)),
+            to: bound(row.get(at + 7), row.get(at + 8)),
+        },
+        recorded_from: row.get(at + 9),
+        recorded_to: row.get(at + 10),
+        uncertain: row.get(at + 11),
+        text_hash: row.get(at + 12),
+        merge_rule: MergeRule::from_sql(row.get(at + 13)),
+    }
+}
+
+/// An Edge Version from the 17 columns of `row` from `at` on: ID, Edge,
+/// Scope, Kind, source, target, then as [`node_version`] from the values on,
+/// and last the Sentence.
+fn edge_version(row: &Row, at: usize) -> EdgeVersion {
+    EdgeVersion {
+        id: VersionId(row.get(at)),
+        edge: EdgeId(row.get(at + 1)),
+        scope: Scope::new(row.get::<_, String>(at + 2)),
+        kind: row.get(at + 3),
+        source: NodeId(row.get(at + 4)),
+        target: NodeId(row.get(at + 5)),
+        values: object(row.get(at + 6)),
+        valid_time: ValidTime {
+            from: bound(row.get(at + 7), row.get(at + 8)),
+            to: bound(row.get(at + 9), row.get(at + 10)),
+        },
+        recorded_from: row.get(at + 11),
+        recorded_to: row.get(at + 12),
+        uncertain: row.get(at + 13),
+        text_hash: row.get(at + 14),
+        merge_rule: MergeRule::from_sql(row.get(at + 15)),
+        sentence: row.get(at + 16),
+    }
+}
+
+fn object(values: Value) -> Map<String, Value> {
+    match values {
+        Value::Object(m) => m,
+        other => panic!("the Store returned values {other}"),
+    }
 }
 
 fn is_retryable(e: &Error) -> bool {

@@ -60,6 +60,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0007_ranked_merge",
         template: include_str!("../migrations/0007_ranked_merge.sql"),
     },
+    Migration {
+        version: 8,
+        name: "0008_edges",
+        template: include_str!("../migrations/0008_edges.sql"),
+    },
 ];
 
 /// The schema version this build of the Store expects: the last migration's.

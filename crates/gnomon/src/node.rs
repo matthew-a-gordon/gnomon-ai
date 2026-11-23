@@ -152,17 +152,21 @@ pub struct NewNode {
     pub kind: String,
 }
 
-/// What one Episode states about one Node over one Valid time: a value for
-/// each of some properties.
+/// What one Episode states about one Node or Edge over one Valid time: a
+/// value for each of some properties.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Patch {
-    /// The Episode the write cites. It must be in the Node's Scope.
+    /// The Episode the write cites. It must be in the Scope of the Node or
+    /// Edge.
     pub episode: EpisodeId,
     pub valid_time: ValidTime,
     /// `{property: value}`. A JSON null ends the property over the Valid
     /// time. Every other value must satisfy the Kind's rule for its
     /// property. Every Node also has `name`, a string, and `aliases`, a list
-    /// of strings.
+    /// of strings, and a write to a Node states at least one value. A write
+    /// to an Edge may state none: it always states that the Edge holds over
+    /// the Valid time, through the built-in `holds`, which the patch never
+    /// names.
     pub values: Map<String, Value>,
     /// Where in the Episode each value was stated, for the properties whose
     /// place the consumer knows, in the consumer's own terms. The Citations
