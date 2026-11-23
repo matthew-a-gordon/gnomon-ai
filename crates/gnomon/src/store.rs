@@ -412,10 +412,17 @@ fn is_missing_schema(e: &tokio_postgres::Error) -> bool {
 /// rows in, which an Erasure leaves dead tuples in, from the transaction's
 /// own statistics. They count the rows a trigger or a foreign key changed
 /// too, so a table a later migration adds is never missed.
+///
+/// Full-text Search's BM25 counts change at commit, by a deferred trigger
+/// (migration 0016). The call fires it now, so the counts change in this
+/// transaction before its statistics are read, in the same order as at
+/// commit, and the count tables are named among those touched.
 async fn touched_tables(
     statements: &Statements,
     tx: &Transaction<'_>,
 ) -> Result<Vec<String>, Error> {
+    tx.batch_execute("set constraints gnomon.search_count_delta_apply immediate")
+        .await?;
     let rows = statements
         .query(
             tx,
