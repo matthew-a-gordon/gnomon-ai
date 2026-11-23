@@ -17,6 +17,24 @@ The name fits on both counts. A gnomon tells the time by the shadow it casts, an
 
 Early design. The data model, packaging and client languages are still being decided, and there is nothing to install yet.
 
+## Exporting the migrations
+
+gnomon never changes your schema itself. You export its numbered migrations into your own migration chain, and your tooling applies them like any other migration.
+
+```sh
+gnomon migrations export --target supabase --embedding-dimension 1536 --out supabase/migrations
+gnomon migrations export --target alembic  --embedding-dimension 1536 --out alembic/versions
+gnomon migrations export --target plain    --embedding-dimension 1536 --out migrations/gnomon
+```
+
+- `supabase` writes `<timestamp>_gnomon_<name>.sql` files for the Supabase CLI. It creates pgvector in the `extensions` schema, which PostgREST does not expose.
+- `alembic` writes `gnomon_<name>.py` revisions. The first follows your chain's head, and each later one follows the one before. A chain with several heads is refused: merge them first.
+- `plain` writes `<number>_<name>.sql` files to apply in name order, each in one transaction.
+
+Run the same command again after you upgrade gnomon. It adds only the new migrations, after everything already in your chain, and never rewrites one it exported before. It refuses to run if a released migration in your chain differs from what this release would write, for example because it was exported with another embedding dimension.
+
+Every gnomon object lives in the `gnomon` schema. Keep that schema out of PostgREST's exposed schemas, so clients reach the Store only through gnomon.
+
 ## Development
 
 `docs/testing.md` explains how to run the test suites. They need Docker and start their own Postgres containers.

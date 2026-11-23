@@ -12,10 +12,16 @@
 //!   `GNOMON_TEST_MIGRATION_ROLE` optionally names the role that applies the
 //!   migrations, when it is not that superuser.
 //!
+//! `GNOMON_TEST_TARGET` picks the export target whose own tooling applies
+//! the migrations to the template: `plain` (the default) applies each file in
+//! one transaction, `supabase` runs `supabase migration up` through `npx`,
+//! and `alembic` runs `alembic upgrade head` through `uvx`. See [`Target`].
+//!
 //! The same tests run against every server. Nothing here assumes a port.
 
 #![allow(dead_code)] // Each test binary uses a different part of the harness.
 
+pub mod alembic;
 pub mod server;
 pub mod wire;
 
@@ -80,14 +86,14 @@ async fn connect(config: &Config) -> Client {
 
 /// Writes the migrations with the `gnomon` binary, as a consumer would.
 pub fn export_plain(dimension: u32, out: &Path) {
+    export_to(Target::Plain, dimension, out)
+}
+
+/// Writes the migrations for `target` into `out` with the `gnomon` binary.
+pub fn export_to(target: Target, dimension: u32, out: &Path) {
     let run = Command::new(env!("CARGO_BIN_EXE_gnomon"))
-        .args([
-            "migrations",
-            "export",
-            "--target",
-            "plain",
-            "--embedding-dimension",
-        ])
+        .args(["migrations", "export", "--target", target.name()])
+        .arg("--embedding-dimension")
         .arg(dimension.to_string())
         .arg("--out")
         .arg(out)
@@ -118,7 +124,116 @@ pub fn exported(dimension: u32) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The Supabase CLI the suite runs, pinned so every run applies migrations
+/// the same way.
+pub const SUPABASE_CLI: &str = "supabase@3.2.0";
+
+/// The export target whose tooling applies the migrations to a template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Plain,
+    Supabase,
+    Alembic,
+}
+
+impl Target {
+    /// The target `GNOMON_TEST_TARGET` names, `plain` by default.
+    pub fn from_env() -> Target {
+        match std::env::var("GNOMON_TEST_TARGET").as_deref() {
+            Err(_) | Ok("") | Ok("plain") => Target::Plain,
+            Ok("supabase") => Target::Supabase,
+            Ok("alembic") => Target::Alembic,
+            Ok(other) => panic!(
+                "GNOMON_TEST_TARGET={other:?} is not a target the suite knows: use plain, supabase or alembic"
+            ),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Target::Plain => "plain",
+            Target::Supabase => "supabase",
+            Target::Alembic => "alembic",
+        }
+    }
+}
+
 impl Server {
+    /// A URL for the role that applies the migrations, connected to `db`,
+    /// for the tools of the supabase and alembic targets. Its password is
+    /// `GNOMON_TEST_MIGRATION_PASSWORD`, or the superuser's when that is
+    /// unset, as on the Supabase CLI stack and the test images.
+    fn migration_url(&self, scheme: &str, db: &str) -> String {
+        let (host, port) = self.host_port();
+        let user = self
+            .migration_role
+            .clone()
+            .or_else(|| self.admin.get_user().map(str::to_owned))
+            .expect("the server names its superuser");
+        let password = std::env::var("GNOMON_TEST_MIGRATION_PASSWORD").unwrap_or_else(|_| {
+            String::from_utf8(self.admin.get_password().unwrap_or_default().to_vec()).unwrap()
+        });
+        format!(
+            "{scheme}://{}:{}@{host}:{port}/{db}",
+            percent_encode(&user),
+            percent_encode(&password)
+        )
+    }
+
+    /// Applies the migrations exported for `target` to database `db`, with
+    /// that target's own tooling.
+    async fn apply(&self, target: Target, dimension: u32, db: &str) {
+        match target {
+            Target::Plain => {
+                let mut client = self.admin(db).await;
+                if let Some(role) = &self.migration_role {
+                    client
+                        .batch_execute(&format!("set role {}", quote_ident(role)))
+                        .await
+                        .expect("switch to the migration role");
+                }
+                for (file, sql) in &exported(dimension) {
+                    let tx = client.transaction().await.unwrap();
+                    tx.batch_execute(sql)
+                        .await
+                        .unwrap_or_else(|e| panic!("apply {file}: {e:?}"));
+                    tx.commit().await.unwrap();
+                }
+            }
+            Target::Supabase => {
+                let workdir = tempfile::tempdir().unwrap();
+                export_to(
+                    target,
+                    dimension,
+                    &workdir.path().join("supabase/migrations"),
+                );
+                let run = Command::new("npx")
+                    .args(["--yes", SUPABASE_CLI, "migration", "up", "--yes"])
+                    .arg("--workdir")
+                    .arg(workdir.path())
+                    .arg(format!("--remote={}", self.migration_url("postgresql", db)))
+                    .output()
+                    .expect("npx runs; see docs/testing.md");
+                assert!(
+                    run.status.success(),
+                    "supabase migration up failed: {}{}",
+                    String::from_utf8_lossy(&run.stdout),
+                    String::from_utf8_lossy(&run.stderr)
+                );
+            }
+            Target::Alembic => {
+                let project = alembic::Project::new();
+                export_to(target, dimension, &project.versions());
+                project
+                    .alembic(
+                        &["upgrade", "head"],
+                        Some(&self.migration_url("postgresql+psycopg", db)),
+                    )
+                    .unwrap_or_else(|e| panic!("alembic upgrade head failed: {e}"));
+            }
+        }
+    }
+
     /// The superuser's connection to database `db`.
     fn admin_config(&self, db: &str) -> Config {
         let mut c = self.admin.clone();
@@ -142,10 +257,19 @@ impl Server {
     /// `dimension`, built once per server and migration set. Every process
     /// takes the server's lock first, so two never build one at once.
     async fn template(&self, dimension: u32) -> String {
-        let files = exported(dimension);
+        // The plain export names the migration set. A supabase export's
+        // file names change with its clock, so they cannot.
+        let target = Target::from_env();
         let mut h = DefaultHasher::new();
-        files.hash(&mut h);
-        let name = format!("gnomon_template_{dimension}_{:016x}", h.finish());
+        exported(dimension).hash(&mut h);
+        let name = match target {
+            Target::Plain => format!("gnomon_template_{dimension}_{:016x}", h.finish()),
+            _ => format!(
+                "gnomon_template_{}_{dimension}_{:016x}",
+                target.name(),
+                h.finish()
+            ),
+        };
 
         let _lock = self.lock();
         let server = self.admin("postgres").await;
@@ -177,22 +301,7 @@ impl Server {
             ))
             .await
             .expect("create the template database");
-        {
-            let mut client = self.admin(&building).await;
-            if let Some(role) = &self.migration_role {
-                client
-                    .batch_execute(&format!("set role {}", quote_ident(role)))
-                    .await
-                    .expect("switch to the migration role");
-            }
-            for (file, sql) in &files {
-                let tx = client.transaction().await.unwrap();
-                tx.batch_execute(sql)
-                    .await
-                    .unwrap_or_else(|e| panic!("apply {file}: {e:?}"));
-                tx.commit().await.unwrap();
-            }
-        }
+        self.apply(target, dimension, &building).await;
         server
             .batch_execute(&format!("alter database {building} rename to {name}"))
             .await
@@ -318,6 +427,12 @@ impl TestDb {
             .expect("switch to multi-tenant mode");
     }
 
+    /// This database's URL for the role that applies the migrations, with
+    /// `scheme`, for a target's own migration tool.
+    pub fn migration_url(&self, scheme: &str) -> String {
+        self.server.migration_url(scheme, &self.name)
+    }
+
     /// A raw connection as the login role, for the SQL-boundary suite.
     pub async fn login(&self) -> Client {
         connect(&self.login_config()).await
@@ -342,10 +457,7 @@ impl TestDb {
     }
 
     fn login_url_at(&self, host: &str, port: u16) -> String {
-        format!(
-            "host={host} port={port} dbname={} user={LOGIN_ROLE} password={LOGIN_PASSWORD}",
-            self.name
-        )
+        login_url(host, port, &self.name)
     }
 
     /// The server's TCP address, for a proxy to forward to.
@@ -380,6 +492,28 @@ impl Drop for TestDb {
         })
         .join();
     }
+}
+
+/// The login role's connection string for database `db` on the server.
+pub async fn login_url_to(db: &str) -> String {
+    let (host, port) = Server::get().await.host_port();
+    login_url(&host, port, db)
+}
+
+fn login_url(host: &str, port: u16, db: &str) -> String {
+    format!("host={host} port={port} dbname={db} user={LOGIN_ROLE} password={LOGIN_PASSWORD}")
+}
+
+/// `s` with every byte but unreserved URL characters percent-encoded.
+fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 pub fn quote_ident(s: &str) -> String {
