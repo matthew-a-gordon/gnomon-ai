@@ -174,19 +174,11 @@ async fn a_read_inside_an_imprecise_bounds_period_is_uncertain_and_a_read_outsid
 
     let uncertain = |v: Option<NodeVersion>| v.expect("the Version holds").uncertain;
     // Inside March 2024: the start is not pinned down.
-    assert!(uncertain(
-        w.read(node, AsOf::current(at(2024, 3, 1, 0))).await
-    ));
-    assert!(uncertain(
-        w.read(node, AsOf::current(at(2024, 3, 31, 23))).await
-    ));
+    assert!(uncertain(w.read(node, AsOf::current(at(2024, 3, 1, 0))).await));
+    assert!(uncertain(w.read(node, AsOf::current(at(2024, 3, 31, 23))).await));
     // From April 2024 the Version certainly holds.
-    assert!(!uncertain(
-        w.read(node, AsOf::current(at(2024, 4, 1, 0))).await
-    ));
-    assert!(!uncertain(
-        w.read(node, AsOf::current(at(2025, 6, 1, 0))).await
-    ));
+    assert!(!uncertain(w.read(node, AsOf::current(at(2024, 4, 1, 0))).await));
+    assert!(!uncertain(w.read(node, AsOf::current(at(2025, 6, 1, 0))).await));
     // Before the period there is no Version at all, certain or not.
     assert_eq!(w.read(node, AsOf::current(at(2024, 2, 28, 23))).await, None);
 }
@@ -195,10 +187,7 @@ async fn a_read_inside_an_imprecise_bounds_period_is_uncertain_and_a_read_outsid
 async fn a_bound_at_the_precision_of_an_instant_is_never_uncertain() {
     let w = World::new().await;
     let (node, _) = w
-        .node(
-            "Acme",
-            ValidTime::between(at(2024, 3, 1, 0), at(2024, 4, 1, 0)),
-        )
+        .node("Acme", ValidTime::between(at(2024, 3, 1, 0), at(2024, 4, 1, 0)))
         .await;
     for when in [at(2024, 3, 1, 0), at(2024, 3, 15, 0), at(2024, 3, 31, 23)] {
         assert!(!w.read(node, AsOf::current(when)).await.unwrap().uncertain);
@@ -239,23 +228,14 @@ async fn stating_an_unknown_start_is_a_refinement_that_keeps_the_text_hash_and_t
             to: Bound::Unknown
         }
     );
-    assert!(
-        now.uncertain,
-        "March 15 is inside the month the start names"
-    );
+    assert!(now.uncertain, "March 15 is inside the month the start names");
     // The Refinement states no new text: its Version shares the earlier
     // Version's text hash, so one embedding serves both (ADR-0007).
     assert_eq!(now.text_hash, earlier.text_hash);
     assert!(!now.text_hash.is_empty());
     let other = w.node("Other", ValidTime::UNKNOWN).await.0;
-    let other = w
-        .read(other, AsOf::current(at(2024, 3, 15, 0)))
-        .await
-        .unwrap();
-    assert_ne!(
-        other.text_hash, now.text_hash,
-        "different text, different hash"
-    );
+    let other = w.read(other, AsOf::current(at(2024, 3, 15, 0))).await.unwrap();
+    assert_ne!(other.text_hash, now.text_hash, "different text, different hash");
 
     // Before the Refinement the earlier Version is still what gnomon knew:
     // it was incomplete, not wrong, and it is not rewritten.
@@ -275,10 +255,7 @@ async fn stating_an_unknown_start_is_a_refinement_that_keeps_the_text_hash_and_t
 async fn narrowing_a_precision_within_the_same_period_is_a_refinement() {
     let w = World::new().await;
     let (node, first) = w
-        .node(
-            "Acme",
-            ValidTime::since_bound(period(Precision::Year, at(2024, 1, 1, 0))),
-        )
+        .node("Acme", ValidTime::since_bound(period(Precision::Year, at(2024, 1, 1, 0))))
         .await;
     let to_month = w
         .state(
@@ -302,45 +279,23 @@ async fn narrowing_a_precision_within_the_same_period_is_a_refinement() {
         .read(node, AsOf::current(at(2024, 3, 14, 12)))
         .await
         .unwrap();
-    assert_eq!(
-        read.valid_time.from,
-        period(Precision::Day, at(2024, 3, 14, 0))
-    );
+    assert_eq!(read.valid_time.from, period(Precision::Day, at(2024, 3, 14, 0)));
     assert!(read.uncertain);
-    assert!(
-        !w.read(node, AsOf::current(at(2024, 3, 15, 0)))
-            .await
-            .unwrap()
-            .uncertain
-    );
+    assert!(!w.read(node, AsOf::current(at(2024, 3, 15, 0))).await.unwrap().uncertain);
 }
 
 #[tokio::test]
 async fn an_end_that_was_unknown_can_be_refined_too() {
     let w = World::new().await;
     let (node, first) = w
-        .node(
-            "Acme",
-            ValidTime::since_bound(period(Precision::Instant, at(2020, 1, 1, 0))),
-        )
+        .node("Acme", ValidTime::since_bound(period(Precision::Instant, at(2020, 1, 1, 0))))
         .await;
     let outcome = w
-        .state(
-            node,
-            first.opened[0],
-            BoundSide::End,
-            period(Precision::Year, at(2024, 6, 1, 0)),
-        )
+        .state(node, first.opened[0], BoundSide::End, period(Precision::Year, at(2024, 6, 1, 0)))
         .await;
     assert_eq!(outcome.change, BoundChange::Refinement);
-    let read = w
-        .read(node, AsOf::current(at(2023, 12, 31, 0)))
-        .await
-        .unwrap();
-    assert_eq!(
-        read.valid_time.to,
-        period(Precision::Year, at(2024, 1, 1, 0))
-    );
+    let read = w.read(node, AsOf::current(at(2023, 12, 31, 0))).await.unwrap();
+    assert_eq!(read.valid_time.to, period(Precision::Year, at(2024, 1, 1, 0)));
     assert_eq!(w.read(node, AsOf::current(at(2024, 1, 1, 0))).await, None);
 }
 
@@ -348,10 +303,7 @@ async fn an_end_that_was_unknown_can_be_refined_too() {
 async fn a_bound_outside_the_earlier_period_is_recorded_as_a_correction_not_a_refinement() {
     let w = World::new().await;
     let (node, first) = w
-        .node(
-            "Acme",
-            ValidTime::since_bound(period(Precision::Month, at(2024, 3, 1, 0))),
-        )
+        .node("Acme", ValidTime::since_bound(period(Precision::Month, at(2024, 3, 1, 0))))
         .await;
     // April is not within March: the source contradicts the earlier Version.
     let outcome = w
@@ -372,28 +324,14 @@ async fn a_bound_outside_the_earlier_period_is_recorded_as_a_correction_not_a_re
         .await
         .expect("the earlier belief is still readable");
     assert_eq!(wrong.id, first.opened[0]);
-    assert_eq!(
-        wrong.valid_time.from,
-        period(Precision::Month, at(2024, 3, 1, 0))
-    );
+    assert_eq!(wrong.valid_time.from, period(Precision::Month, at(2024, 3, 1, 0)));
     assert_eq!(w.read(node, AsOf::current(at(2024, 3, 15, 0))).await, None);
-    let now = w
-        .read(node, AsOf::current(at(2024, 4, 2, 0)))
-        .await
-        .unwrap();
-    assert_eq!(
-        now.valid_time.from,
-        period(Precision::Day, at(2024, 4, 2, 0))
-    );
+    let now = w.read(node, AsOf::current(at(2024, 4, 2, 0))).await.unwrap();
+    assert_eq!(now.valid_time.from, period(Precision::Day, at(2024, 4, 2, 0)));
 
     // A coarser statement is no narrowing either.
     let coarser = w
-        .state(
-            node,
-            now.id,
-            BoundSide::Start,
-            period(Precision::Year, at(2024, 1, 1, 0)),
-        )
+        .state(node, now.id, BoundSide::Start, period(Precision::Year, at(2024, 1, 1, 0)))
         .await;
     assert_eq!(coarser.change, BoundChange::Correction);
 }
@@ -402,25 +340,14 @@ async fn a_bound_outside_the_earlier_period_is_recorded_as_a_correction_not_a_re
 async fn restating_the_same_bound_is_unchanged() {
     let w = World::new().await;
     let (node, first) = w
-        .node(
-            "Acme",
-            ValidTime::since_bound(period(Precision::Month, at(2024, 3, 1, 0))),
-        )
+        .node("Acme", ValidTime::since_bound(period(Precision::Month, at(2024, 3, 1, 0))))
         .await;
     let outcome = w
-        .state(
-            node,
-            first.opened[0],
-            BoundSide::Start,
-            period(Precision::Month, at(2024, 3, 20, 0)),
-        )
+        .state(node, first.opened[0], BoundSide::Start, period(Precision::Month, at(2024, 3, 20, 0)))
         .await;
     assert_eq!(outcome.change, BoundChange::Unchanged);
     assert!(outcome.opened.is_empty());
-    let read = w
-        .read(node, AsOf::current(at(2024, 5, 1, 0)))
-        .await
-        .unwrap();
+    let read = w.read(node, AsOf::current(at(2024, 5, 1, 0))).await.unwrap();
     assert_eq!(read.id, first.opened[0]);
 }
 
@@ -449,14 +376,8 @@ async fn a_later_write_to_the_node_keeps_a_refined_bound() {
         )
         .await
         .unwrap();
-    let before = w
-        .read(node, AsOf::current(at(2024, 4, 1, 0)))
-        .await
-        .unwrap();
-    assert_eq!(
-        before.valid_time.from,
-        period(Precision::Month, at(2024, 3, 1, 0))
-    );
+    let before = w.read(node, AsOf::current(at(2024, 4, 1, 0))).await.unwrap();
+    assert_eq!(before.valid_time.from, period(Precision::Month, at(2024, 3, 1, 0)));
     assert_eq!(w.read(node, AsOf::current(at(2024, 2, 1, 0))).await, None);
 }
 

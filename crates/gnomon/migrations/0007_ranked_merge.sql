@@ -31,10 +31,12 @@
 --
 -- Each Version records the rule that chose its values in `merge_rule`, and a
 -- change to a Kind's rule applies to later writes only: it changes no
--- existing Version, and a write recomputes only the Valid time it touches, so
--- a Version outside it keeps the rule it was written under. A Version a
--- later write keeps unchanged also keeps its recorded rule. Erasure, a later
--- migration, must recompute each Version under its recorded rule.
+-- existing Version. A write recomputes its Valid time widened to the whole of
+-- every open Version it overlaps or touches, so a Version outside that window
+-- keeps the rule it was written under, and one inside it is chosen again
+-- under the Kind's rule at the time of the write. A Version that choice
+-- leaves unchanged keeps its recorded rule. Erasure, a later migration, must
+-- recompute each Version under its recorded rule.
 --
 -- Bound statements are read as stored. A statement from an Episode that
 -- loses on Authority is recorded as a Refinement or a Correction as the

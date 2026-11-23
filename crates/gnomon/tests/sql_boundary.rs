@@ -840,8 +840,7 @@ async fn nodes() -> Nodes {
     }
 }
 
-const WRITE_NODE: &str =
-    "select status from gnomon.write_node($1, $2, $3, null, null, null, null, $4, null)";
+const WRITE_NODE: &str = "select status from gnomon.write_node($1, $2, $3, null, null, null, null, $4, null)";
 
 async fn write_node(
     tx: &Transaction<'_>,
@@ -1915,17 +1914,18 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
 /// The ID of the Contribution behind tenant one's first Version, and the
 /// Episode and Reference time a statement about it cites.
 async fn first_contribution(n: &Nodes) -> (i64, chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
-    let row =
-        n.w.db
-            .admin()
-            .await
-            .query_typed(
-                "select c.id, c.episode_reference_time, c.episode_recorded_at
+    let row = n
+        .w
+        .db
+        .admin()
+        .await
+        .query_typed(
+            "select c.id, c.episode_reference_time, c.episode_recorded_at
              from gnomon.contribution c where c.node_id = $1 order by c.id limit 1",
-                &[(&n.n1, Type::UUID)],
-            )
-            .await
-            .unwrap();
+            &[(&n.n1, Type::UUID)],
+        )
+        .await
+        .unwrap();
     (row[0].get(0), row[0].get(1), row[0].get(2))
 }
 
@@ -1998,19 +1998,11 @@ async fn a_caller_cannot_choose_the_kind_of_a_bound_statement_or_change_or_delet
         } else {
             ("2024-03-05", "day")
         };
-        insert_statement(&tx, &n, c, bound, precision)
-            .await
-            .unwrap();
+        insert_statement(&tx, &n, c, bound, precision).await.unwrap();
         tx.commit().await.unwrap();
         for (sql, what) in [
-            (
-                "update gnomon.bound_statement set bound_at = '2030-01-01'",
-                "update a statement",
-            ),
-            (
-                "update gnomon.bound_statement set kind = 'correction'",
-                "relabel a statement",
-            ),
+            ("update gnomon.bound_statement set bound_at = '2030-01-01'", "update a statement"),
+            ("update gnomon.bound_statement set kind = 'correction'", "relabel a statement"),
             ("delete from gnomon.bound_statement", "delete a statement"),
         ] {
             let mut client = n.w.db.login().await;
@@ -2018,16 +2010,17 @@ async fn a_caller_cannot_choose_the_kind_of_a_bound_statement_or_change_or_delet
             assert_refused(tx.execute_typed(sql, &[]).await, &format!("{role}: {what}"));
         }
     }
-    let rows =
-        n.w.db
-            .admin()
-            .await
-            .query_typed(
-                "select count(*), min(bound_at)::text from gnomon.bound_statement",
-                &[],
-            )
-            .await
-            .unwrap();
+    let rows = n
+        .w
+        .db
+        .admin()
+        .await
+        .query_typed(
+            "select count(*), min(bound_at)::text from gnomon.bound_statement",
+            &[],
+        )
+        .await
+        .unwrap();
     assert_eq!(rows[0].get::<_, i64>(0), 2);
     assert_eq!(rows[0].get::<_, String>(1), "2024-03-01 00:00:00+00");
 }
@@ -2039,21 +2032,13 @@ async fn a_caller_inserting_a_bound_statement_directly_gets_the_kind_the_earlier
     let mut client = n.w.db.login().await;
     let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
     // The first Contribution's start was unknown: any bound refines it.
-    insert_statement(&tx, &n, c, "2024-03-17 12:00+00", "month")
-        .await
-        .unwrap();
+    insert_statement(&tx, &n, c, "2024-03-17 12:00+00", "month").await.unwrap();
     // Inside March, narrower: still a Refinement.
-    insert_statement(&tx, &n, c, "2024-03-17 12:00+00", "day")
-        .await
-        .unwrap();
+    insert_statement(&tx, &n, c, "2024-03-17 12:00+00", "day").await.unwrap();
     // April is outside March 17: a contradiction, so a Correction.
-    insert_statement(&tx, &n, c, "2024-04-02", "day")
-        .await
-        .unwrap();
+    insert_statement(&tx, &n, c, "2024-04-02", "day").await.unwrap();
     // Coarser than the day it replaces: also a Correction.
-    insert_statement(&tx, &n, c, "2024-04-01", "month")
-        .await
-        .unwrap();
+    insert_statement(&tx, &n, c, "2024-04-01", "month").await.unwrap();
     let rows = tx
         .query_typed(
             "select kind, bound_at::text from gnomon.bound_statement order by id",
@@ -2103,17 +2088,14 @@ async fn a_caller_cannot_empty_a_contributions_valid_time_with_a_bound_statement
     )
     .await
     .unwrap();
-    let err = insert_statement(&tx, &n, c, "2024-03-01", "day")
-        .await
-        .unwrap_err();
+    let err = insert_statement(&tx, &n, c, "2024-03-01", "day").await.unwrap_err();
     assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{err:?}");
 }
 
 #[tokio::test]
 async fn a_caller_cannot_state_a_bound_in_another_tenant_or_scope_or_of_closed_history() {
     let n = nodes().await;
-    let call =
-        "select change from gnomon.state_bound($1, $2, $3, $4, 'from', '2024-03-01', 'month')";
+    let call = "select change from gnomon.state_bound($1, $2, $3, $4, 'from', '2024-03-01', 'month')";
     // Another Tenant's claims, naming tenant one.
     for role in [USER, WORKER] {
         let mut client = n.w.db.login().await;
@@ -2129,10 +2111,7 @@ async fn a_caller_cannot_state_a_bound_in_another_tenant_or_scope_or_of_closed_h
                 ],
             )
             .await;
-        assert_refused(
-            r,
-            &format!("{role}: state a bound of another Tenant's Node"),
-        );
+        assert_refused(r, &format!("{role}: state a bound of another Tenant's Node"));
         // The right Tenant, but a Scope the claims do not grant: the Node is
         // not visible.
         let mut client = n.w.db.login().await;
@@ -2149,11 +2128,7 @@ async fn a_caller_cannot_state_a_bound_in_another_tenant_or_scope_or_of_closed_h
             )
             .await
             .unwrap_err();
-        assert_eq!(
-            err.code().map(|c| c.code()),
-            Some("GNW01"),
-            "{role}: {err:?}"
-        );
+        assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{role}: {err:?}");
     }
     // A closed Version is history: a statement about it is refused.
     let mut client = n.w.db.login().await;
@@ -2188,11 +2163,7 @@ async fn a_refinement_leaves_committed_history_as_it_was_and_gives_callers_no_ne
             .await
             .unwrap()
             .iter()
-            .map(|r| {
-                (0..8)
-                    .map(|i| r.get::<_, Option<String>>(i))
-                    .collect::<Vec<_>>()
-            })
+            .map(|r| (0..8).map(|i| r.get::<_, Option<String>>(i)).collect::<Vec<_>>())
             .collect::<Vec<_>>()
     };
     let before = snapshot().await;
@@ -2218,22 +2189,13 @@ async fn a_refinement_leaves_committed_history_as_it_was_and_gives_callers_no_ne
     // The Versions that were there before are the same rows, apart from the
     // end of the Recorded time of the one the statement closed.
     for old in &before {
-        let new = after
-            .iter()
-            .find(|r| r[0] == old[0])
-            .expect("a row survives");
+        let new = after.iter().find(|r| r[0] == old[0]).expect("a row survives");
         assert_eq!(new[..6], old[..6], "committed history is not rewritten");
         assert_eq!(new[7], old[7]);
     }
     assert_eq!(after.len(), before.len() + 1);
-    let opened = after
-        .iter()
-        .find(|r| !before.iter().any(|b| b[0] == r[0]))
-        .unwrap();
-    let was = before
-        .iter()
-        .find(|b| b[0] == Some(n.open.to_string()))
-        .unwrap();
+    let opened = after.iter().find(|r| !before.iter().any(|b| b[0] == r[0])).unwrap();
+    let was = before.iter().find(|b| b[0] == Some(n.open.to_string())).unwrap();
     assert_eq!(opened[7], was[7], "a Refinement shares the text hash");
 
     // The statement added no right to rewrite history.
@@ -2264,10 +2226,7 @@ async fn a_refinement_leaves_committed_history_as_it_was_and_gives_callers_no_ne
     }
     // Nor can a caller rewrite a Version's bound by hand.
     for (sql, what) in [
-        (
-            "update gnomon.version set valid_from = '2030-01-01' where id = $1",
-            "move a bound",
-        ),
+        ("update gnomon.version set valid_from = '2030-01-01' where id = $1", "move a bound"),
         (
             "update gnomon.version set valid_from_precision = 'year' where id = $1",
             "change a bound's precision",
@@ -2288,9 +2247,7 @@ async fn a_stated_bound_is_the_start_of_its_period_in_utc_whatever_the_sessions_
     let mut client = n.w.db.login().await;
     let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
     // 23:00 UTC on March 31 is April 1 in Auckland.
-    tx.batch_execute("set local timezone = 'Pacific/Auckland'")
-        .await
-        .unwrap();
+    tx.batch_execute("set local timezone = 'Pacific/Auckland'").await.unwrap();
     let node: Uuid = tx
         .query_typed(
             "select gnomon.create_node($1, 'support', 'node')",
@@ -2329,22 +2286,10 @@ async fn a_stated_bound_is_the_start_of_its_period_in_utc_whatever_the_sessions_
 async fn a_write_with_a_precision_that_does_not_fit_its_bound_is_refused() {
     let n = nodes().await;
     for (bounds, what) in [
-        (
-            "'2024-03-01', 'unknown', null, null",
-            "a stated bound of unknown precision",
-        ),
-        (
-            "null, 'month', null, null",
-            "an unknown bound with a precision",
-        ),
-        (
-            "'2024-03-01', 'fortnight', null, null",
-            "a precision that does not exist",
-        ),
-        (
-            "'2024-03-17', 'month', '2024-03-20', 'month'",
-            "a period that is empty once truncated",
-        ),
+        ("'2024-03-01', 'unknown', null, null", "a stated bound of unknown precision"),
+        ("null, 'month', null, null", "an unknown bound with a precision"),
+        ("'2024-03-01', 'fortnight', null, null", "a precision that does not exist"),
+        ("'2024-03-17', 'month', '2024-03-20', 'month'", "a period that is empty once truncated"),
     ] {
         let mut client = n.w.db.login().await;
         let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
@@ -2361,11 +2306,7 @@ async fn a_write_with_a_precision_that_does_not_fit_its_bound_is_refused() {
             )
             .await
             .unwrap_err();
-        assert_eq!(
-            err.code().map(|c| c.code()),
-            Some("GNW01"),
-            "{what}: {err:?}"
-        );
+        assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{what}: {err:?}");
     }
 }
 
