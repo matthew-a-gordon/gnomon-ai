@@ -319,14 +319,14 @@ pub struct Citation {
     pub episode_recorded_at: DateTime<Utc>,
 }
 
-/// What an Episode states when a fact stopped being true: from an instant
-/// on, what a current Version said no longer holds.
+/// What an Episode states when what a Version stated stopped being true:
+/// from an instant on, what a current Version said no longer holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EndOfValidity {
     /// The Episode the statement cites. It must be in the Scope of the Node
     /// or Edge.
     pub episode: EpisodeId,
-    /// When the fact stopped being true, which must be [`Bound::At`] or
+    /// When what the Version stated stopped being true, which must be [`Bound::At`] or
     /// [`Bound::Period`]. A period is stored as its start, and the ended
     /// Version's end then reads as an instant.
     pub at: Bound,
@@ -345,8 +345,11 @@ pub struct Retraction {
 /// The kind of a statement about a Node or an Edge (GLOSSARY.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementKind {
+    /// The earlier Version was wrong about the same Valid time.
     Correction,
+    /// What the earlier Version stated was true and stopped being true.
     EndOfValidity,
+    /// What the Version stated was never true.
     Retraction,
 }
 
@@ -355,6 +358,7 @@ pub enum StatementKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
     pub kind: StatementKind,
+    /// The Episode that made the statement.
     pub episode: EpisodeId,
     /// The Version an End of validity ended or a Retraction retracted, as it
     /// stood. A Correction names none.

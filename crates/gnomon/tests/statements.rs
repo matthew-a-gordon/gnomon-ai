@@ -50,7 +50,11 @@ impl World {
             tenant: support::tenant(),
         };
         for (name, of, properties) in [
-            ("account", KindOf::Node, json!({ "plan": { "type": "string" } })),
+            (
+                "account",
+                KindOf::Node,
+                json!({ "plan": { "type": "string" } }),
+            ),
             ("company", KindOf::Node, json!({})),
             (
                 "owns",
@@ -239,7 +243,7 @@ impl World {
             .unwrap()
     }
 
-    /// What Retract Episode (ticket 12) and Erasure (ticket 13) will do to
+    /// What Retract Episode (#12) and Erasure (#13) will do to
     /// an Episode's rows, until they exist: delete its Contributions, its
     /// statements and its bound statements, as the operator. A later write
     /// to the Node then recomputes its Versions as an Erasure's recompute
@@ -310,14 +314,20 @@ async fn a_correction_replaces_the_earlier_version_for_the_same_valid_time_and_i
     assert_eq!(then.id, earlier.id);
     assert_eq!(then.values["plan"], "gold");
     assert_eq!(then.recorded_to, Some(outcome.recorded_at));
-    assert_eq!(then.recorded_from, before, "its Recorded time is not rewritten");
+    assert_eq!(
+        then.recorded_from, before,
+        "its Recorded time is not rewritten"
+    );
 }
 
 #[tokio::test]
-async fn an_end_of_validity_closes_the_fact_at_the_stated_valid_time_and_it_stays_current_before() {
+async fn an_end_of_validity_closes_what_the_version_stated_at_the_stated_valid_time_and_it_stays_current_before(
+) {
     let w = World::new().await;
     let first = w.episode(at(2024, 1, 1), None).await;
-    let node = w.account(first, ValidTime::since(at(2024, 1, 1)), "gold").await;
+    let node = w
+        .account(first, ValidTime::since(at(2024, 1, 1)), "gold")
+        .await;
     let earlier = w.read(node, at(2024, 3, 1)).await.unwrap();
 
     let ended = w.episode(at(2024, 5, 1), None).await;
@@ -331,11 +341,11 @@ async fn an_end_of_validity_closes_the_fact_at_the_stated_valid_time_and_it_stay
     assert_eq!(w.plan(node, at(2024, 4, 1)).await, None);
     assert_eq!(w.plan(node, at(2024, 9, 1)).await, None);
 
-    // As-of before the End of validity the fact had no end.
+    // As-of before the End of validity the Version had no end.
     let then = w
         .read_as_of(node, at(2024, 9, 1), earlier.recorded_from)
         .await
-        .expect("before the statement the fact still held in September");
+        .expect("before the statement the Version still held in September");
     assert_eq!(then.id, earlier.id);
     assert_eq!(then.values["plan"], "gold");
 }
@@ -388,7 +398,11 @@ async fn each_of_the_three_records_the_episode_that_made_it() {
     let retracting = w.episode(at(2024, 4, 1), None).await;
     w.retract(node, retracting, version.id).await;
 
-    let held = w.caller().list_node_statements(w.tenant, node).await.unwrap();
+    let held = w
+        .caller()
+        .list_node_statements(w.tenant, node)
+        .await
+        .unwrap();
     let summary: Vec<_> = held.iter().map(|s| (s.kind, s.episode)).collect();
     assert_eq!(
         summary,
@@ -410,7 +424,9 @@ async fn each_of_the_three_records_the_episode_that_made_it() {
         .list_citations(w.tenant, corrected.opened[0])
         .await
         .unwrap();
-    assert!(cited.iter().any(|c| c.episode == correcting && c.property == "plan"));
+    assert!(cited
+        .iter()
+        .any(|c| c.episode == correcting && c.property == "plan"));
 }
 
 #[tokio::test]
@@ -457,7 +473,11 @@ async fn an_end_of_validity_of_an_edge_leaves_it_holding_no_version_whatever_val
         .expect("as-of before the statement the Edge held in September");
     assert_eq!(still.id, earlier.id);
 
-    let held = w.caller().list_edge_statements(w.tenant, edge).await.unwrap();
+    let held = w
+        .caller()
+        .list_edge_statements(w.tenant, edge)
+        .await
+        .unwrap();
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].kind, StatementKind::EndOfValidity);
     assert_eq!(held[0].episode, ending);
@@ -483,13 +503,20 @@ async fn with_ranked_merge_on_a_lower_authority_statement_does_not_end_a_higher_
     assert_eq!(retracted.status, WriteStatus::Unchanged);
 
     let now = w.read(node, at(2024, 4, 1)).await.unwrap();
-    assert_eq!(now.id, version.id, "the Version is the one the higher Authority gave");
+    assert_eq!(
+        now.id, version.id,
+        "the Version is the one the higher Authority gave"
+    );
     assert_eq!(now.values["plan"], "gold");
     assert_eq!(now.valid_time.to, Bound::At(at(2024, 6, 1)));
     assert!(now.recorded_to.is_none());
 
     // All three stay held, and an equal Authority would have won.
-    let held = w.caller().list_node_statements(w.tenant, node).await.unwrap();
+    let held = w
+        .caller()
+        .list_node_statements(w.tenant, node)
+        .await
+        .unwrap();
     assert_eq!(held.len(), 3);
     assert!(held.iter().all(|s| s.episode == low));
 }
@@ -516,7 +543,10 @@ async fn with_ranked_merge_on_a_lower_authority_end_of_validity_of_an_edge_loses
         .await
         .unwrap();
     assert_eq!(outcome.status, WriteStatus::Unchanged);
-    assert!(w.edge_holds(edge, at(2024, 6, 1)).await, "the higher Authority says it holds");
+    assert!(
+        w.edge_holds(edge, at(2024, 6, 1)).await,
+        "the higher Authority says it holds"
+    );
 
     // Erasing the higher-Authority Episode's rows lets the held statement
     // take effect. A peer of the lower Authority, dated before it, had stated
@@ -531,19 +561,29 @@ async fn with_ranked_merge_on_a_lower_authority_end_of_validity_of_an_edge_loses
         )
         .await
         .unwrap();
-    assert!(w.edge_holds(edge, at(2024, 6, 1)).await, "the higher Authority still wins");
+    assert!(
+        w.edge_holds(edge, at(2024, 6, 1)).await,
+        "the higher Authority still wins"
+    );
     w.erase_rows_of(high).await;
     let again = w.episode(at(2024, 9, 1), Some(0)).await;
     w.caller()
         .write_edge(
             w.tenant,
             edge,
-            &Patch::new(again, ValidTime::between(at(2024, 1, 1), at(2024, 1, 2)), Map::new()),
+            &Patch::new(
+                again,
+                ValidTime::between(at(2024, 1, 1), at(2024, 1, 2)),
+                Map::new(),
+            ),
         )
         .await
         .unwrap();
     assert!(w.edge_holds(edge, at(2024, 1, 15)).await);
-    assert!(!w.edge_holds(edge, at(2024, 6, 1)).await, "the held End of validity took effect");
+    assert!(
+        !w.edge_holds(edge, at(2024, 6, 1)).await,
+        "the held End of validity took effect"
+    );
 }
 
 #[tokio::test]
@@ -556,8 +596,11 @@ async fn a_held_statement_is_found_by_the_episodes_rows_and_takes_effect_when_th
     // What Retract Episode of `low` must delete: a statement row and the
     // Contributions that carry its id, all keyed by the Episode.
     assert_eq!(
-        w.count("select count(*) from gnomon.statement where episode_id = $1", low.0)
-            .await,
+        w.count(
+            "select count(*) from gnomon.statement where episode_id = $1",
+            low.0
+        )
+        .await,
         1
     );
     assert_eq!(
@@ -579,25 +622,39 @@ async fn a_held_statement_is_found_by_the_episodes_rows_and_takes_effect_when_th
 /// returns the Node, the ending Episode and the higher Authority's.
 async fn held_end(w: &World) -> (NodeId, EpisodeId, EpisodeId) {
     let high = w.episode(at(2024, 1, 1), Some(10)).await;
-    let node = w.account(high, ValidTime::since(at(2024, 1, 1)), "gold").await;
-    let peer = w.episode(at(2024, 7, 1), Some(0)).await;
-    w.write(node, peer, ValidTime::since(at(2024, 1, 1)), json!({ "plan": "silver" }))
+    let node = w
+        .account(high, ValidTime::since(at(2024, 1, 1)), "gold")
         .await;
+    let peer = w.episode(at(2024, 7, 1), Some(0)).await;
+    w.write(
+        node,
+        peer,
+        ValidTime::since(at(2024, 1, 1)),
+        json!({ "plan": "silver" }),
+    )
+    .await;
     let low = w.episode(at(2024, 8, 1), Some(0)).await;
     let ended = w.end(node, low, at(2024, 4, 1)).await;
-    assert_eq!(ended.status, WriteStatus::Unchanged, "the higher Authority hides it");
+    assert_eq!(
+        ended.status,
+        WriteStatus::Unchanged,
+        "the higher Authority hides it"
+    );
     (node, low, high)
 }
 
 #[tokio::test]
-async fn erasure_of_the_higher_authority_episode_lets_a_held_statement_take_effect() {
+async fn deleting_the_higher_authority_episodes_rows_lets_a_held_statement_take_effect() {
     let w = World::new().await;
     w.set_rule("account", MergeRule::Ranked).await;
     let (node, _, high) = held_end(&w).await;
 
     w.erase_rows_of(high).await;
     w.recompute(node).await;
-    assert_eq!(w.plan(node, at(2024, 2, 1)).await.as_deref(), Some("silver"));
+    assert_eq!(
+        w.plan(node, at(2024, 2, 1)).await.as_deref(),
+        Some("silver")
+    );
     assert_eq!(
         w.plan(node, at(2024, 6, 1)).await,
         None,
@@ -606,7 +663,7 @@ async fn erasure_of_the_higher_authority_episode_lets_a_held_statement_take_effe
 }
 
 #[tokio::test]
-async fn retract_episode_of_the_lower_authority_episode_removes_the_held_statement() {
+async fn deleting_the_lower_authority_episodes_rows_removes_the_held_statement() {
     let w = World::new().await;
     w.set_rule("account", MergeRule::Ranked).await;
     let (node, low, high) = held_end(&w).await;
@@ -620,8 +677,11 @@ async fn retract_episode_of_the_lower_authority_episode_removes_the_held_stateme
         .unwrap()
         .is_empty());
     assert_eq!(
-        w.count("select count(*) from gnomon.contribution where episode_id = $1", low.0)
-            .await,
+        w.count(
+            "select count(*) from gnomon.contribution where episode_id = $1",
+            low.0
+        )
+        .await,
         0
     );
 
@@ -629,7 +689,10 @@ async fn retract_episode_of_the_lower_authority_episode_removes_the_held_stateme
     // effect: the peer's plan runs on.
     w.erase_rows_of(high).await;
     w.recompute(node).await;
-    assert_eq!(w.plan(node, at(2024, 6, 1)).await.as_deref(), Some("silver"));
+    assert_eq!(
+        w.plan(node, at(2024, 6, 1)).await.as_deref(),
+        Some("silver")
+    );
 }
 
 #[tokio::test]
@@ -662,7 +725,7 @@ async fn a_statement_with_nothing_to_act_on_is_refused() {
         .unwrap_err();
     assert!(matches!(e, Error::InvalidWrite(m) if m.contains("to correct")));
 
-    // An End of validity at an instant the fact does not span, or at its start.
+    // An End of validity at an instant no current Version spans, or at its start.
     for when in [at(2024, 7, 1), at(2024, 1, 1)] {
         let e = w
             .caller()

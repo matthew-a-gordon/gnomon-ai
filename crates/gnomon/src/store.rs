@@ -36,9 +36,9 @@ use crate::connect::ConnectOptions;
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Direction, EdgeId,
-    EdgeVersion, EndOfValidity, Episode, EpisodeId, Error, Kind, KindOf, MergeRule, NewEdge, NewEpisode, NewKind,
-    NewNode, NodeId, NodeVersion, Patch, Precision, Retraction, Scope, Statement as Held, StatementKind,
-    Step, TenantId, Traversal, ValidTime, VersionId, WriteOutcome, WriteStatus,
+    EdgeVersion, EndOfValidity, Episode, EpisodeId, Error, Kind, KindOf, MergeRule, NewEdge,
+    NewEpisode, NewKind, NewNode, NodeId, NodeVersion, Patch, Precision, Retraction, Scope,
+    StatementKind, Step, TenantId, Traversal, ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -657,7 +657,10 @@ impl Caller<'_> {
                     Versioned::Edge(EdgeId(rows[0].get(0)))
                 }
             };
-            done.push((of, write_patch(&tx, statements, tenant, of, patch, correct).await?));
+            done.push((
+                of,
+                write_patch(&tx, statements, tenant, of, patch, correct).await?,
+            ));
         }
         tx.commit().await?;
         Ok(done)
@@ -1085,7 +1088,7 @@ impl Caller<'_> {
         &self,
         tenant: impl Into<Option<TenantId>>,
         node: NodeId,
-    ) -> Result<Vec<Held>, Error> {
+    ) -> Result<Vec<crate::Statement>, Error> {
         self.list_statements(tenant.into(), node.0).await
     }
 
@@ -1095,7 +1098,7 @@ impl Caller<'_> {
         &self,
         tenant: impl Into<Option<TenantId>>,
         edge: EdgeId,
-    ) -> Result<Vec<Held>, Error> {
+    ) -> Result<Vec<crate::Statement>, Error> {
         self.list_statements(tenant.into(), edge.0).await
     }
 
@@ -1103,7 +1106,7 @@ impl Caller<'_> {
         &self,
         tenant: Option<TenantId>,
         id: uuid::Uuid,
-    ) -> Result<Vec<Held>, Error> {
+    ) -> Result<Vec<crate::Statement>, Error> {
         let mut client = self.store.client.lock().await;
         let (tx, tenant) = self.begin(&mut client, tenant).await?;
         let rows = self
@@ -1121,7 +1124,7 @@ impl Caller<'_> {
         tx.commit().await?;
         Ok(rows
             .iter()
-            .map(|r| Held {
+            .map(|r| crate::Statement {
                 kind: match r.get::<_, &str>(0) {
                     "correction" => StatementKind::Correction,
                     "end_of_validity" => StatementKind::EndOfValidity,
@@ -1260,7 +1263,11 @@ async fn write_patch(
                 .collect(),
         )
     });
-    let sql = if correct { of.correct_sql() } else { of.write_sql() };
+    let sql = if correct {
+        of.correct_sql()
+    } else {
+        of.write_sql()
+    };
     let rows = statements
         .query(
             tx,

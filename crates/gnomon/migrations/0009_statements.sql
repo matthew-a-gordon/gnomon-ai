@@ -44,7 +44,7 @@
 -- statement's Contributions are deleted with it, by the foreign key.
 --
 -- Callers get no new UPDATE or DELETE right, and no new SECURITY DEFINER
--- function: the three functions below run as the invoker (ADR-0009).
+-- function: every function below runs as the invoker (ADR-0009).
 
 -- A statement of an Episode about a Node or an Edge.
 create table gnomon.statement (
@@ -381,7 +381,7 @@ create function gnomon.correct_edge(
   $$;
 
 -- Records an End of validity or a Retraction of a Node or an Edge, citing one
--- Episode. An End of validity closes the fact at `p_at` (to `p_precision`): the
+-- Episode. An End of validity ends what the current Version stated at `p_at` (to `p_precision`): the
 -- current Version that holds across that instant ends there, and `p_at` must
 -- fall inside it, not at its start, which is a Retraction. A Retraction names
 -- a current Version and states that what it said was never true. Either way
