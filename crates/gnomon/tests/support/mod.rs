@@ -104,6 +104,9 @@ pub const REGISTER_KIND: &str =
 /// registration.
 pub const SET_MERGE_RULE: &str = "gnomon.set_merge_rule(uuid, text, text)";
 
+/// Erasure's signature, which a deployment grants like Kind registration.
+pub const ERASE_EPISODE: &str = "gnomon.erase_episode(uuid, uuid)";
+
 /// The embedding dimension the suites export with unless a test chooses one.
 pub const DEFAULT_DIMENSION: u32 = 1536;
 
@@ -420,6 +423,19 @@ impl TestDb {
             ))
             .await
             .expect("grant Kind registration");
+    }
+
+    /// What a deployment does to let `role` erase Episodes. The migrations
+    /// grant Erasure to no one (ADR-0009).
+    pub async fn grant_erasure(&self, role: &str) {
+        let role = quote_ident(role);
+        self.admin()
+            .await
+            .batch_execute(&format!(
+                "grant execute on function {ERASE_EPISODE} to {role}"
+            ))
+            .await
+            .expect("grant Erasure");
     }
 
     /// The deployment's operator: the role that applied the migrations and

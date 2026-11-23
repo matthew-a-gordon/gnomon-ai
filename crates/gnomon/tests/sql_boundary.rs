@@ -404,9 +404,13 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
     }
 }
 
-/// The only SECURITY DEFINER functions ADR-0009 allows. Erasure joins Kind
-/// registration and the setting of a Kind's merge rule in a later migration.
-const DEFINERS: &[&str] = &["gnomon.register_kind(", "gnomon.set_merge_rule("];
+/// The only SECURITY DEFINER functions ADR-0009 allows: Kind registration,
+/// the setting of a Kind's merge rule, and Erasure.
+const DEFINERS: &[&str] = &[
+    "gnomon.register_kind(",
+    "gnomon.set_merge_rule(",
+    "gnomon.erase_episode(",
+];
 
 #[tokio::test]
 async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but_the_definers() {
@@ -456,6 +460,7 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
         "gnomon.default_tenant()",
         "gnomon.call_tenant(",
         "gnomon.switch_to_multi_tenant()",
+        "gnomon.erase_episode(",
     ] {
         assert!(
             names.iter().any(|n| n.starts_with(expected)),
@@ -3587,7 +3592,7 @@ async fn the_statement_functions_run_as_the_invoker_and_add_no_definer() {
         );
     }
     // ADR-0009 names three definers: Erasure, Kind registration and the
-    // merge-rule setter. Erasure is a later ticket, so two exist today.
+    // merge-rule setter.
     let definers =
         w.db.admin()
             .await
@@ -3599,7 +3604,7 @@ async fn the_statement_functions_run_as_the_invoker_and_add_no_definer() {
             )
             .await
             .unwrap();
-    assert_eq!(definers[0].get::<_, i64>(0), 2);
+    assert_eq!(definers[0].get::<_, i64>(0), 3);
 }
 
 // Retract Episode (ADR-0003, ADR-0007, ADR-0009). It runs as the invoker, so
@@ -3865,5 +3870,356 @@ async fn a_caller_cannot_make_a_statement_that_retracts_its_episode_without_retr
     match r {
         Err(e) => assert_eq!(e.code(), Some(&SqlState::CHECK_VIOLATION), "{e:?}"),
         Ok(v) => panic!("an End of validity carried the flag: {v:?}"),
+    }
+}
+
+// Erase Episode (ADR-0003, ADR-0009). The one definer function that deletes
+// and rewrites committed history: granted to no caller role by the
+// migrations, refused across Tenants and Scopes, and the guard triggers stand
+// aside for it alone, because only the NOLOGIN definer role passes them.
+
+const ERASE_EPISODE: &str = "select erased_nodes from gnomon.erase_episode($1, $2)";
+
+/// Every row of every gnomon table, counted past RLS.
+async fn row_count(db: &TestDb) -> i64 {
+    let admin = db.admin().await;
+    let mut total = 0;
+    for table in tenant_tables(&admin).await {
+        total += admin
+            .query_typed(&format!("select count(*) from gnomon.{table}"), &[])
+            .await
+            .unwrap()[0]
+            .get::<_, i64>(0);
+    }
+    total
+}
+
+#[tokio::test]
+async fn the_migrations_grant_erasure_to_no_role_but_its_owner() {
+    let w = world().await;
+    let client = w.db.admin().await;
+    let rows = client
+        .query_typed(
+            &format!(
+                "select coalesce(nullif(a.grantee, 0)::regrole::text, 'public'),
+                        p.proowner::regrole::text, p.prosecdef
+                 from pg_proc p left join lateral aclexplode(p.proacl) a on true
+                 where p.oid = '{}'::regprocedure",
+                support::ERASE_EPISODE
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let owner: String = rows[0].get(1);
+    assert_eq!(owner, "gnomon_definer");
+    assert!(rows[0].get::<_, bool>(2), "Erasure is SECURITY DEFINER");
+    let grantees: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get::<_, Option<String>>(0))
+        .filter(|g| g != "gnomon_definer")
+        .collect();
+    assert!(grantees.is_empty(), "Erasure is granted to {grantees:?}");
+}
+
+#[tokio::test]
+async fn a_caller_role_without_the_grant_cannot_erase() {
+    let n = nodes().await;
+    let before = row_count(&n.w.db).await;
+    for role in [USER, WORKER] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+        let r = tx
+            .query_typed(
+                ERASE_EPISODE,
+                &[(&n.w.t1, Type::UUID), (&n.w.t1_support, Type::UUID)],
+            )
+            .await;
+        assert_refused(r, &format!("{role} erasing without the grant"));
+    }
+    assert_eq!(row_count(&n.w.db).await, before, "nothing was erased");
+}
+
+#[tokio::test]
+async fn a_caller_with_the_grant_cannot_erase_in_another_tenant_or_a_scope_it_cannot_see() {
+    let n = nodes().await;
+    n.w.db.grant_erasure(WORKER).await;
+    let before = row_count(&n.w.db).await;
+    let cases = [
+        // Another Tenant named outright.
+        (
+            n.w.t2,
+            n.w.t2_support,
+            &["support"][..],
+            "another Tenant",
+            true,
+        ),
+        // Another Tenant's Episode under the caller's own Tenant.
+        (
+            n.w.t1,
+            n.w.t2_support,
+            &["support"][..],
+            "another Tenant's Episode",
+            false,
+        ),
+        // An Episode of the caller's Tenant in a Scope it cannot see.
+        (
+            n.w.t1,
+            n.w.t1_billing,
+            &["support"][..],
+            "a Scope the caller cannot see",
+            false,
+        ),
+        // No Tenant.
+        (
+            Uuid::nil(),
+            n.w.t1_support,
+            &["support"][..],
+            "the nil Tenant",
+            true,
+        ),
+    ];
+    for (tenant, episode, scopes, what, privilege) in cases {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(n.w.t1, scopes)).await;
+        let r = tx
+            .query_typed(
+                ERASE_EPISODE,
+                &[(&tenant, Type::UUID), (&episode, Type::UUID)],
+            )
+            .await;
+        if privilege {
+            assert_refused(r, what);
+        } else {
+            match r {
+                Err(e) => assert_eq!(e.code().map(|c| c.code()), Some("GNW01"), "{what}: {e:?}"),
+                Ok(v) => panic!("erasing {what} was allowed: {v:?}"),
+            }
+        }
+    }
+    // Claims that bind another Tenant cannot erase in the caller's Tenant either.
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(n.w.t2, &["support"])).await;
+    let r = tx
+        .query_typed(
+            ERASE_EPISODE,
+            &[(&n.w.t1, Type::UUID), (&n.w.t1_support, Type::UUID)],
+        )
+        .await;
+    assert_refused(r, "claims of another Tenant");
+    assert_eq!(row_count(&n.w.db).await, before, "nothing was erased");
+}
+
+/// The Nodes fixture with a second Episode of Tenant one that names Node
+/// `n1` too, so that erasing the first rewrites `n1`'s history rather than
+/// deleting it.
+async fn erasable(n: &Nodes) -> Uuid {
+    let store = Store::connect(&n.w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let caller = store.as_worker(TenantId(n.w.t1), Scope::new("support"));
+    let f = caller
+        .record_episode(&NewEpisode {
+            tenant: Some(TenantId(n.w.t1)),
+            scope: Scope::new("support"),
+            content: "another source".into(),
+            reference_time: Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap(),
+            authority: None,
+        })
+        .await
+        .unwrap();
+    caller
+        .write_node(
+            TenantId(n.w.t1),
+            gnomon::NodeId(n.n1),
+            &gnomon::Patch::new(
+                f,
+                gnomon::ValidTime::UNKNOWN,
+                match json!({ "aliases": ["kept"] }) {
+                    serde_json::Value::Object(m) => m,
+                    _ => unreachable!(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    n.w.db.grant_erasure(WORKER).await;
+    f.0
+}
+
+#[tokio::test]
+async fn a_caller_cannot_forge_the_erasure_bypass_or_delete_what_an_erasure_rewrote() {
+    let n = nodes().await;
+    erasable(&n).await;
+    let t1 = n.w.t1;
+
+    // The bypass is the definer role itself, which no caller can become, and
+    // no setting a caller can change turns it on.
+    for role in [USER, WORKER] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        let r = tx.batch_execute("set local role gnomon_definer").await;
+        assert_refused(r.map(|_| ()), &format!("{role} becoming gnomon_definer"));
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        tx.batch_execute("select set_config('gnomon.erasing', 'on', true)")
+            .await
+            .unwrap();
+        let erasing: bool = tx
+            .query_typed("select gnomon.erasing()", &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert!(!erasing, "{role} turned the bypass on");
+        let r = tx
+            .execute_typed(
+                "delete from gnomon.version where id = $1",
+                &[(&n.closed, Type::UUID)],
+            )
+            .await;
+        assert_refused(r, &format!("{role} deleting a committed Version"));
+    }
+
+    // Erasure's parts are not callable on their own.
+    for (sql, what) in [
+        (
+            "select gnomon.replay_versions($1, 'support', $2, false, 'node', '-infinity', '{}')",
+            "the replay",
+        ),
+        (
+            "select gnomon.erase_episode_rows($1, $2)",
+            "the Episode's deletes",
+        ),
+        (
+            "select gnomon.erase_version_text($1, array[$2])",
+            "the text deletes",
+        ),
+    ] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+        let r = tx
+            .query_typed(sql, &[(&t1, Type::UUID), (&n.n1, Type::UUID)])
+            .await;
+        assert_refused(r, &format!("calling {what}"));
+    }
+    // The shared merge refuses a replay or another Recorded time from a caller.
+    for (at, replay, what) in [
+        ("now()", true, "a replay"),
+        (
+            "now() - interval '1 day'",
+            false,
+            "an earlier Recorded time",
+        ),
+    ] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+        let r = tx
+            .query_typed(
+                &format!(
+                    "select gnomon.merge_versions($1, 'support', $2, false, '-infinity', \
+                     'infinity', {at}, 'recency', $3)"
+                ),
+                &[
+                    (&t1, Type::UUID),
+                    (&n.n1, Type::UUID),
+                    (&replay, Type::BOOL),
+                ],
+            )
+            .await;
+        assert_refused(r, &format!("merging {what}"));
+    }
+
+    // After an Erasure in the same transaction, what it rewrote is still
+    // committed history to the caller: the replay marks it written by no
+    // transaction.
+    let before = version_rows(&n.w.db, n.n1).await;
+    for (sql, what) in [
+        (
+            "delete from gnomon.version where id = $1",
+            "delete a rewritten Version",
+        ),
+        (
+            "delete from gnomon.citation where version_id = $1",
+            "delete a rewritten Version's Citations",
+        ),
+        (
+            "update gnomon.version set recorded_to = transaction_timestamp() - interval '1 day'
+             where id = $1",
+            "rewrite a rewritten Version's Recorded time",
+        ),
+    ] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+        tx.query_typed(
+            ERASE_EPISODE,
+            &[(&t1, Type::UUID), (&n.w.t1_support, Type::UUID)],
+        )
+        .await
+        .unwrap();
+        let rewritten = tx
+            .query_typed(
+                "select id from gnomon.version where node_id = $1 and written_in = '0' limit 1",
+                &[(&n.n1, Type::UUID)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rewritten.len(),
+            1,
+            "the Erasure replayed the other Episode's write"
+        );
+        let id: Uuid = rewritten[0].get(0);
+        let r = tx.execute_typed(sql, &[(&id, Type::UUID)]).await;
+        assert_refused(r, what);
+    }
+    assert_eq!(
+        version_rows(&n.w.db, n.n1).await,
+        before,
+        "nothing was committed"
+    );
+
+    // A caller has no DELETE on what only Erasure deletes.
+    for table in [
+        "episode",
+        "contribution",
+        "statement",
+        "bound_statement",
+        "node",
+        "edge",
+    ] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+        let r = tx
+            .execute_typed(&format!("delete from gnomon.{table}"), &[])
+            .await;
+        assert_refused(r, &format!("deleting from gnomon.{table}"));
+    }
+}
+
+#[tokio::test]
+async fn an_erasure_refuses_a_transaction_that_already_wrote_what_the_episode_touched() {
+    let n = nodes().await;
+    let f = erasable(&n).await;
+    let t1 = n.w.t1;
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    write_node(
+        &tx,
+        t1,
+        n.n1,
+        Some(f),
+        json!({ "name": "same transaction" }),
+    )
+    .await
+    .unwrap();
+    let r = tx
+        .query_typed(
+            ERASE_EPISODE,
+            &[(&t1, Type::UUID), (&n.w.t1_support, Type::UUID)],
+        )
+        .await;
+    match r {
+        Err(e) => assert_eq!(e.code().map(|c| c.code()), Some("GNW01"), "{e:?}"),
+        Ok(v) => panic!("an Erasure after a write in its own transaction was allowed: {v:?}"),
     }
 }

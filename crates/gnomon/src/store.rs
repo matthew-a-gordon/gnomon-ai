@@ -36,9 +36,9 @@ use crate::connect::ConnectOptions;
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Direction, EdgeId,
-    EdgeVersion, EndOfValidity, Episode, EpisodeId, EpisodeRetraction, Error, Kind, KindOf,
-    MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId, NodeVersion, Patch, Precision,
-    Retraction, Scope, StatementKind, Step, TenantId, Traversal, ValidTime, VersionId,
+    EdgeVersion, EndOfValidity, Episode, EpisodeErasure, EpisodeId, EpisodeRetraction, Error, Kind,
+    KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId, NodeVersion, Patch,
+    Precision, Retraction, Scope, StatementKind, Step, TenantId, Traversal, ValidTime, VersionId,
     WriteOutcome, WriteStatus,
 };
 
@@ -1131,6 +1131,60 @@ impl Caller<'_> {
                     .into_iter()
                     .map(VersionId)
                     .collect(),
+            });
+        }
+    }
+
+    /// Erases an Episode (ADR-0003, ADR-0007): deletes it, its
+    /// Contributions, its statements, its Citations and every Version derived
+    /// from it alone, and recomputes every Version it touched, current and
+    /// closed, from the Contributions that remain, each under the merge rule
+    /// it recorded, in one transaction. As-of reads afterwards return the
+    /// history as if the Episode had never existed. A Node or Edge left with
+    /// nothing is erased too, a Node only once no Edge joins it.
+    ///
+    /// Erasure is a definer function that the migrations grant to no caller
+    /// role, so a call fails with [`Error::Database`] carrying
+    /// `insufficient_privilege` until the deployment grants EXECUTE on
+    /// `gnomon.erase_episode` (ADR-0009). Writes to the Nodes and Edges the
+    /// Episode touched wait for it to commit.
+    pub async fn erase_episode(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        episode: EpisodeId,
+    ) -> Result<EpisodeErasure, Error> {
+        let mut client = self.store.client.lock().await;
+        let mut attempt = 0;
+        let tenant = tenant.into();
+        loop {
+            let (tx, tenant) = self.begin(&mut client, tenant).await?;
+            let rows = self
+                .store
+                .statements
+                .query(
+                    &tx,
+                    "select erased_at, recomputed_nodes, recomputed_edges, erased_nodes, erased_edges
+                     from gnomon.erase_episode($1, $2)",
+                    &[(&tenant.0, Type::UUID), (&episode.0, Type::UUID)],
+                )
+                .await
+                .map_err(Error::from_store);
+            let rows = match rows {
+                Err(e) if attempt < WRITE_RETRIES && is_retryable(&e) => {
+                    attempt += 1;
+                    continue;
+                }
+                other => other?,
+            };
+            tx.commit().await?;
+            let row = &rows[0];
+            let ids = |i: usize| row.get::<_, Vec<uuid::Uuid>>(i);
+            return Ok(EpisodeErasure {
+                erased_at: row.get(0),
+                recomputed_nodes: ids(1).into_iter().map(NodeId).collect(),
+                recomputed_edges: ids(2).into_iter().map(EdgeId).collect(),
+                erased_nodes: ids(3).into_iter().map(NodeId).collect(),
+                erased_edges: ids(4).into_iter().map(EdgeId).collect(),
             });
         }
     }

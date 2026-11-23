@@ -1,0 +1,1285 @@
+//! Seam 1, Erase Episode (ADR-0003, ADR-0007, ADR-0009, ADR-0013): the
+//! Episode, its Contributions, statements and Citations, and every Version
+//! derived from it alone are deleted, and every surviving Version it touched,
+//! current and closed, is recomputed under the rule it recorded, through the
+//! Rust core's Store API against real Postgres. The oracle test is
+//! erase_oracle.rs, and the adversarial cases live in sql_boundary.rs.
+
+mod support;
+
+use std::time::Duration;
+
+use chrono::{DateTime, TimeZone, Utc};
+use gnomon::{
+    AsOf, Bound, BoundSide, BoundStatement, EdgeId, EndOfValidity, EpisodeErasure, EpisodeId,
+    KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId, NodeVersion, Patch,
+    Precision, Retraction, Scope, Store, TenantId, ValidTime, VersionId,
+};
+use serde_json::{json, Map, Value};
+use support::TestDb;
+use tokio_postgres::types::Type;
+use tokio_postgres::Client;
+use uuid::Uuid;
+
+const SCOPE: &str = "support";
+
+/// Text that only the erased Episode states, so a scan of every table can
+/// find any copy of it.
+const MARKER: &str = "erased-7f3a";
+
+fn at(y: i32, m: u32, d: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+}
+
+fn values(v: Value) -> Map<String, Value> {
+    match v {
+        Value::Object(m) => m,
+        other => panic!("not an object: {other}"),
+    }
+}
+
+struct World {
+    db: TestDb,
+    store: Store,
+    tenant: TenantId,
+}
+
+impl World {
+    /// A Tenant with the Node Kinds `account`, which declares `plan`, and
+    /// `company`, and the Edge Kind `owns`, which declares `share`. The
+    /// worker may register Kinds and erase Episodes.
+    async fn new() -> World {
+        let db = TestDb::migrated().await;
+        db.grant_kind_registration("gnomon_worker").await;
+        db.grant_erasure("gnomon_worker").await;
+        let store = Store::connect(&db.login_url(), &support::connect_options())
+            .await
+            .unwrap();
+        let w = World {
+            db,
+            store,
+            tenant: support::tenant(),
+        };
+        for (name, of, properties) in [
+            (
+                "account",
+                KindOf::Node,
+                json!({ "plan": { "type": "string" } }),
+            ),
+            ("company", KindOf::Node, json!({})),
+            (
+                "owns",
+                KindOf::Edge {
+                    source: vec!["account".into()],
+                    target: vec!["company".into()],
+                },
+                json!({ "share": { "type": "integer" } }),
+            ),
+        ] {
+            w.caller()
+                .register_kind(&NewKind {
+                    tenant: Some(w.tenant),
+                    name: name.into(),
+                    of,
+                    parent: None,
+                    properties: json!({ "type": "object", "properties": properties }),
+                    search: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        w
+    }
+
+    fn caller(&self) -> gnomon::Caller<'_> {
+        self.store.as_worker(self.tenant, Scope::new(SCOPE))
+    }
+
+    fn claims(&self) -> String {
+        json!({
+            "role": "gnomon_worker",
+            "app_metadata": { "tenant_id": self.tenant.0.to_string(), "scopes": [SCOPE] }
+        })
+        .to_string()
+    }
+
+    /// A raw transaction as the worker, as the Store opens one.
+    async fn raw<'c>(&self, client: &'c mut Client) -> tokio_postgres::Transaction<'c> {
+        let tx = client.transaction().await.unwrap();
+        tx.batch_execute("set local role gnomon_worker")
+            .await
+            .unwrap();
+        tx.query_typed(
+            "select set_config('request.jwt.claims', $1, true)",
+            &[(&self.claims(), Type::TEXT)],
+        )
+        .await
+        .unwrap();
+        tx
+    }
+
+    async fn episode(&self, reference_time: DateTime<Utc>, authority: Option<i32>) -> EpisodeId {
+        self.episode_saying(reference_time, authority, "an Episode")
+            .await
+    }
+
+    async fn episode_saying(
+        &self,
+        reference_time: DateTime<Utc>,
+        authority: Option<i32>,
+        content: &str,
+    ) -> EpisodeId {
+        self.caller()
+            .record_episode(&NewEpisode {
+                tenant: Some(self.tenant),
+                scope: Scope::new(SCOPE),
+                content: format!("{content} from {reference_time}"),
+                reference_time,
+                authority,
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn node(&self, kind: &str, episode: EpisodeId, vt: ValidTime, v: Value) -> NodeId {
+        self.caller()
+            .create_node(
+                &NewNode {
+                    tenant: Some(self.tenant),
+                    scope: Scope::new(SCOPE),
+                    kind: kind.into(),
+                },
+                &Patch::new(episode, vt, values(v)),
+            )
+            .await
+            .unwrap()
+            .0
+    }
+
+    async fn edge(
+        &self,
+        source: NodeId,
+        target: NodeId,
+        episode: EpisodeId,
+        vt: ValidTime,
+        v: Value,
+    ) -> EdgeId {
+        self.caller()
+            .create_edge(
+                &NewEdge {
+                    tenant: Some(self.tenant),
+                    scope: Scope::new(SCOPE),
+                    kind: "owns".into(),
+                    source,
+                    target,
+                },
+                &Patch::new(episode, vt, values(v)),
+            )
+            .await
+            .unwrap()
+            .0
+    }
+
+    async fn write(
+        &self,
+        node: NodeId,
+        episode: EpisodeId,
+        vt: ValidTime,
+        v: Value,
+    ) -> DateTime<Utc> {
+        self.caller()
+            .write_node(self.tenant, node, &Patch::new(episode, vt, values(v)))
+            .await
+            .unwrap()
+            .recorded_at
+    }
+
+    async fn write_edge(&self, edge: EdgeId, episode: EpisodeId, vt: ValidTime, v: Value) {
+        self.caller()
+            .write_edge(self.tenant, edge, &Patch::new(episode, vt, values(v)))
+            .await
+            .unwrap();
+    }
+
+    async fn erase(&self, episode: EpisodeId) -> EpisodeErasure {
+        self.caller()
+            .erase_episode(self.tenant, episode)
+            .await
+            .unwrap()
+    }
+
+    async fn read(&self, node: NodeId, valid_at: DateTime<Utc>) -> Option<NodeVersion> {
+        self.caller()
+            .read_node(self.tenant, node, AsOf::current(valid_at))
+            .await
+            .unwrap()
+    }
+
+    async fn read_as_of(
+        &self,
+        node: NodeId,
+        valid_at: DateTime<Utc>,
+        known_at: DateTime<Utc>,
+    ) -> Option<NodeVersion> {
+        self.caller()
+            .read_node(self.tenant, node, AsOf::at(valid_at, known_at))
+            .await
+            .unwrap()
+    }
+
+    async fn current_values(&self, node: NodeId, valid_at: DateTime<Utc>) -> Option<Value> {
+        self.read(node, valid_at)
+            .await
+            .map(|v| Value::Object(v.values))
+    }
+
+    async fn values_as_of(
+        &self,
+        node: NodeId,
+        valid_at: DateTime<Utc>,
+        known_at: DateTime<Utc>,
+    ) -> Option<Value> {
+        self.read_as_of(node, valid_at, known_at)
+            .await
+            .map(|v| Value::Object(v.values))
+    }
+
+    /// Whether a Node or Edge row exists, read past RLS.
+    async fn exists(&self, table: &str, id: Uuid) -> bool {
+        self.db
+            .admin()
+            .await
+            .query_typed(
+                &format!("select from gnomon.{table} where id = $1"),
+                &[(&id, Type::UUID)],
+            )
+            .await
+            .unwrap()
+            .len()
+            == 1
+    }
+
+    async fn store_sentence(&self, version: VersionId, sentence: &str) {
+        self.db
+            .admin()
+            .await
+            .execute_typed(
+                "insert into gnomon.sentence (tenant_id, scope, version_id, sentence)
+                 values ($1, $2, $3, $4)",
+                &[
+                    (&self.tenant.0, Type::UUID),
+                    (&SCOPE, Type::TEXT),
+                    (&version.0, Type::UUID),
+                    (&sentence, Type::TEXT),
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn sentence_of(&self, version: VersionId) -> Option<String> {
+        self.db
+            .admin()
+            .await
+            .query_typed(
+                "select sentence from gnomon.sentence where version_id = $1",
+                &[(&version.0, Type::UUID)],
+            )
+            .await
+            .unwrap()
+            .first()
+            .map(|r| r.get(0))
+    }
+
+    async fn current_edge_version(&self, edge: EdgeId, valid_at: DateTime<Utc>) -> VersionId {
+        self.caller()
+            .read_edge(self.tenant, edge, AsOf::current(valid_at))
+            .await
+            .unwrap()
+            .expect("the Edge holds")
+            .id
+    }
+}
+
+/// Every gnomon table, from the catalog.
+async fn gnomon_tables(admin: &Client) -> Vec<String> {
+    admin
+        .query_typed(
+            "select c.relname::text from pg_class c join pg_namespace n on n.oid = c.relnamespace
+             where n.nspname = 'gnomon' and c.relkind in ('r', 'p') order by 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+/// The gnomon tables that reference an Episode: a foreign key to
+/// `gnomon.episode`, or an `episode_id` column.
+async fn tables_with_an_episode_reference(admin: &Client) -> Vec<String> {
+    admin
+        .query_typed(
+            "select distinct c.relname::text
+             from pg_class c join pg_namespace n on n.oid = c.relnamespace
+             where n.nspname = 'gnomon' and c.relkind in ('r', 'p') and c.relname <> 'episode'
+               and (exists (select from pg_constraint k
+                            where k.conrelid = c.oid and k.contype = 'f'
+                              and k.confrelid = 'gnomon.episode'::regclass)
+                    or exists (select from pg_attribute a
+                               where a.attrelid = c.oid and a.attname = 'episode_id'
+                                 and not a.attisdropped))
+             order by 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+/// The gnomon tables whose rows are derived from a Version's text: a foreign
+/// key to `gnomon.version`, apart from the Citations, which name an Episode
+/// and are checked as such. Each names its Version in `version_id`.
+async fn tables_derived_from_version_text(admin: &Client) -> Vec<String> {
+    admin
+        .query_typed(
+            "select distinct c.relname::text
+             from pg_class c join pg_namespace n on n.oid = c.relnamespace
+             join pg_constraint k on k.conrelid = c.oid and k.contype = 'f'
+             where n.nspname = 'gnomon' and k.confrelid = 'gnomon.version'::regclass
+               and c.relname <> 'citation'
+             order by 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+#[tokio::test]
+async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value_only_it_supplied()
+{
+    let w = World::new().await;
+    let f = w.episode(at(2024, 1, 1), None).await;
+    let g = w.episode(at(2024, 1, 15), None).await;
+    let e = w
+        .episode_saying(at(2024, 2, 1), None, &format!("{MARKER} the erased source"))
+        .await;
+
+    // An account F describes, which E gives another plan for a while and an
+    // Alias for ever.
+    let a = w
+        .node("account", f, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    w.write(
+        a,
+        e,
+        ValidTime::between(at(2024, 3, 1), at(2024, 6, 1)),
+        json!({ "plan": format!("{MARKER}-plan") }),
+    )
+    .await;
+    w.write(
+        a,
+        e,
+        ValidTime::UNKNOWN,
+        json!({ "aliases": [format!("{MARKER}-alias")] }),
+    )
+    .await;
+    // An account only E describes, whose end G states.
+    let b = w
+        .node(
+            "account",
+            e,
+            ValidTime::UNKNOWN,
+            json!({ "plan": format!("{MARKER}-only") }),
+        )
+        .await;
+    let b_version = w.read(b, at(2024, 1, 1)).await.unwrap().id;
+    w.caller()
+        .state_bound(
+            w.tenant,
+            b,
+            &BoundStatement {
+                episode: g,
+                version: b_version,
+                side: BoundSide::End,
+                bound: Bound::Period {
+                    at: at(2030, 1, 1),
+                    precision: Precision::Year,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    // A company F describes, whose start E states.
+    let c = w
+        .node("company", f, ValidTime::UNKNOWN, json!({ "name": "Acme" }))
+        .await;
+    let c_version = w.read(c, at(2024, 1, 1)).await.unwrap().id;
+    w.caller()
+        .state_bound(
+            w.tenant,
+            c,
+            &BoundStatement {
+                episode: e,
+                version: c_version,
+                side: BoundSide::Start,
+                bound: Bound::Period {
+                    at: at(2020, 1, 1),
+                    precision: Precision::Year,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    // An Edge only E states, an Edge F states that E gives another share and
+    // ends, and an Edge E never touches.
+    let e_only = w
+        .edge(b, c, e, ValidTime::UNKNOWN, json!({ "share": 7 }))
+        .await;
+    let shared = w
+        .edge(a, c, f, ValidTime::UNKNOWN, json!({ "share": 40 }))
+        .await;
+    w.write_edge(
+        shared,
+        e,
+        ValidTime::between(at(2024, 3, 1), at(2024, 6, 1)),
+        json!({ "share": 41 }),
+    )
+    .await;
+    let d = w
+        .node("account", f, ValidTime::UNKNOWN, json!({ "plan": "pro" }))
+        .await;
+    let untouched = w
+        .edge(d, c, f, ValidTime::UNKNOWN, json!({ "share": 1 }))
+        .await;
+    w.caller()
+        .end_edge_validity(
+            w.tenant,
+            shared,
+            &EndOfValidity {
+                episode: e,
+                at: Bound::At(at(2025, 1, 1)),
+            },
+        )
+        .await
+        .unwrap();
+    // Sentences the Pipeline would have written: one of a Version derived from
+    // E alone, one of a Version E's Erasure recomputes, one it leaves alone.
+    let e_only_version = w.current_edge_version(e_only, at(2024, 1, 1)).await;
+    let shared_version = w.current_edge_version(shared, at(2024, 1, 1)).await;
+    let untouched_version = w.current_edge_version(untouched, at(2024, 1, 1)).await;
+    w.store_sentence(e_only_version, &format!("{MARKER}: b owns 7% of Acme"))
+        .await;
+    w.store_sentence(shared_version, "a owns 40% of Acme").await;
+    w.store_sentence(untouched_version, "d owns 1% of Acme")
+        .await;
+    // Last, E is retracted, which marks it and retracts what only it cites.
+    w.caller().retract_episode(w.tenant, e).await.unwrap();
+
+    // Every Version the Erasure deletes or recomputes: those of a Node or
+    // Edge E touched, held at or after the first Recorded time E touched it.
+    let admin = w.db.admin().await;
+    let recomputed: Vec<Uuid> = admin
+        .query_typed(
+            "select v.id from gnomon.version v
+             where v.recorded_to >= (
+               select min(x.at) from (
+                 select c.recorded_at as at from gnomon.contribution c
+                   where c.episode_id = $1 and c.versioned_id = v.versioned_id
+                 union all
+                 select b.recorded_at from gnomon.bound_statement b
+                   where b.episode_id = $1 and b.versioned_id = v.versioned_id
+               ) x)",
+            &[(&e.0, Type::UUID)],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert!(recomputed.contains(&shared_version.0));
+    assert!(recomputed.contains(&e_only_version.0));
+    assert!(!recomputed.contains(&untouched_version.0));
+
+    let erasure = w.erase(e).await;
+    assert_eq!(erasure.erased_edges, vec![e_only]);
+    assert!(erasure.erased_nodes.contains(&b));
+
+    // No row of any table names E or holds a value only E stated. The scan
+    // reads every table in the schema, so a table a later migration adds
+    // fails here until Erasure deletes from it.
+    let id = e.0.to_string();
+    for table in gnomon_tables(&admin).await {
+        let n: i64 = admin
+            .query_typed(
+                &format!(
+                    "select count(*) from gnomon.{table} x
+                     where strpos(x::text, $1) > 0 or strpos(x::text, $2) > 0"
+                ),
+                &[(&id, Type::TEXT), (&MARKER, Type::TEXT)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(
+            n, 0,
+            "gnomon.{table} still holds the erased Episode or its values"
+        );
+    }
+    let referencing = tables_with_an_episode_reference(&admin).await;
+    for expected in [
+        "bound_statement",
+        "citation",
+        "contribution",
+        "episode_retraction",
+        "statement",
+    ] {
+        assert!(
+            referencing.iter().any(|t| t == expected),
+            "{expected} is missing from {referencing:?}"
+        );
+    }
+    for table in &referencing {
+        let n: i64 = admin
+            .query_typed(
+                &format!("select count(*) from gnomon.{table} where episode_id = $1"),
+                &[(&e.0, Type::UUID)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(n, 0, "gnomon.{table} still names the erased Episode");
+    }
+    assert!(w
+        .caller()
+        .read_episode(w.tenant, e)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Nothing derived from the text of a Version the Erasure deleted or
+    // recomputed is left, and what it left alone keeps its Sentence.
+    let derived = tables_derived_from_version_text(&admin).await;
+    assert!(derived.iter().any(|t| t == "sentence"), "{derived:?}");
+    for table in &derived {
+        let n: i64 = admin
+            .query_typed(
+                &format!("select count(*) from gnomon.{table} where version_id = any($1)"),
+                &[(&recomputed, Type::UUID_ARRAY)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(
+            n, 0,
+            "gnomon.{table} still holds rows of recomputed Versions"
+        );
+    }
+    assert_eq!(
+        w.sentence_of(untouched_version).await.as_deref(),
+        Some("d owns 1% of Acme")
+    );
+
+    // What the others said survives.
+    assert_eq!(
+        w.current_values(a, at(2024, 4, 1)).await,
+        Some(json!({ "plan": "basic" }))
+    );
+    assert_eq!(
+        w.current_values(c, at(2024, 4, 1)).await,
+        Some(json!({ "name": "Acme" }))
+    );
+    let c_now = w.read(c, at(2024, 4, 1)).await.unwrap();
+    assert_eq!(
+        c_now.valid_time,
+        ValidTime::UNKNOWN,
+        "E's stated start is gone"
+    );
+    let shared_now = w
+        .caller()
+        .read_edge(w.tenant, shared, AsOf::current(at(2026, 1, 1)))
+        .await
+        .unwrap()
+        .expect("F's Edge holds after E's End of validity is erased");
+    assert_eq!(Value::Object(shared_now.values), json!({ "share": 40 }));
+}
+
+#[tokio::test]
+async fn surviving_versions_current_and_closed_are_recomputed_from_the_remaining_contributions() {
+    let w = World::new().await;
+    let f = w.episode(at(2024, 1, 1), None).await;
+    let e = w.episode(at(2024, 2, 1), None).await;
+    let g = w.episode(at(2024, 3, 1), None).await;
+    let ada = w
+        .node("node", f, ValidTime::UNKNOWN, json!({ "name": "Ada" }))
+        .await;
+    let t1 = w.read(ada, at(2024, 1, 1)).await.unwrap().recorded_from;
+    let t2 = w
+        .write(
+            ada,
+            e,
+            ValidTime::between(at(2024, 3, 1), at(2024, 6, 1)),
+            json!({ "name": "Erased" }),
+        )
+        .await;
+    let t3 = w
+        .write(
+            ada,
+            g,
+            ValidTime {
+                from: Bound::At(at(2024, 4, 1)),
+                to: Bound::Unknown,
+            },
+            json!({ "aliases": ["Countess"] }),
+        )
+        .await;
+    assert_eq!(
+        w.values_as_of(ada, at(2024, 5, 1), t3).await,
+        Some(json!({ "name": "Erased", "aliases": ["Countess"] }))
+    );
+
+    let erasure = w.erase(e).await;
+    assert_eq!(erasure.recomputed_nodes, vec![ada]);
+    assert!(erasure.erased_nodes.is_empty());
+
+    // As if E never existed, at every known-at instant.
+    for known in [t1, t2, t3] {
+        for month in 1..=8 {
+            let read = w.values_as_of(ada, at(2024, month, 15), known).await;
+            let mut expected = json!({ "name": "Ada" });
+            if known >= t3 && month >= 4 {
+                expected["aliases"] = json!(["Countess"]);
+            }
+            assert_eq!(
+                read,
+                Some(expected),
+                "valid-at month {month}, known-at {known}"
+            );
+        }
+    }
+    // The Version that was current at E's instant is closed where G's write
+    // closed it, and its Recorded time no longer stops at E's write.
+    let closed = w.read_as_of(ada, at(2024, 5, 1), t2).await.unwrap();
+    assert_eq!(closed.recorded_from, t1);
+    assert_eq!(closed.recorded_to, Some(t3));
+    // The current Versions cite only F and G.
+    let current = w.read(ada, at(2024, 5, 1)).await.unwrap();
+    let cited: Vec<EpisodeId> = w
+        .caller()
+        .list_citations(w.tenant, current.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.episode)
+        .collect();
+    assert!(
+        cited.contains(&f) && cited.contains(&g) && !cited.contains(&e),
+        "{cited:?}"
+    );
+}
+
+#[tokio::test]
+async fn each_recomputed_version_keeps_the_merge_rule_it_recorded_when_the_kinds_rule_changed_since(
+) {
+    let w = World::new().await;
+    let f = w.episode(at(2024, 1, 1), Some(5)).await;
+    let e = w.episode(at(2024, 2, 1), Some(0)).await;
+    let h = w.episode(at(2024, 3, 1), Some(0)).await;
+    let j = w.episode(at(2024, 4, 1), Some(0)).await;
+    let acct = w
+        .node("account", f, ValidTime::UNKNOWN, json!({ "plan": "gold" }))
+        .await;
+    w.write(acct, e, ValidTime::UNKNOWN, json!({ "aliases": ["e"] }))
+        .await;
+    // Under recency the later Reference time wins.
+    let t3 = w
+        .write(acct, h, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    w.caller()
+        .set_merge_rule(w.tenant, "account", MergeRule::Ranked)
+        .await
+        .unwrap();
+    // Under ranked merge F's Authority wins.
+    let t5 = w
+        .write(acct, j, ValidTime::UNKNOWN, json!({ "name": "J" }))
+        .await;
+    let before = w.read_as_of(acct, at(2024, 5, 1), t3).await.unwrap();
+    assert_eq!(before.merge_rule, MergeRule::Recency);
+    assert_eq!(before.values["plan"], json!("basic"));
+
+    w.erase(e).await;
+
+    // The step H wrote recorded recency and keeps it; the Kind's rule now is
+    // ranked, which would choose F's plan.
+    let replayed = w.read_as_of(acct, at(2024, 5, 1), t3).await.unwrap();
+    assert_eq!(replayed.merge_rule, MergeRule::Recency);
+    assert_eq!(Value::Object(replayed.values), json!({ "plan": "basic" }));
+    // The step J wrote recorded ranked and keeps it.
+    let now = w.read_as_of(acct, at(2024, 5, 1), t5).await.unwrap();
+    assert_eq!(now.merge_rule, MergeRule::Ranked);
+    assert_eq!(
+        Value::Object(now.values),
+        json!({ "plan": "gold", "name": "J" })
+    );
+    assert_eq!(
+        w.current_values(acct, at(2024, 5, 1)).await,
+        Some(json!({ "plan": "gold", "name": "J" }))
+    );
+}
+
+#[tokio::test]
+async fn a_statement_that_lost_to_the_erased_higher_authority_episode_takes_effect() {
+    let w = World::new().await;
+    w.caller()
+        .set_merge_rule(w.tenant, "account", MergeRule::Ranked)
+        .await
+        .unwrap();
+    let g = w.episode(at(2024, 1, 1), Some(0)).await;
+    let e = w.episode(at(2024, 1, 1), Some(5)).await;
+    let f = w.episode(at(2024, 2, 1), Some(0)).await;
+    let acct = w
+        .node("account", g, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    // E's higher-Authority Correction, then F's lower-Authority End of
+    // validity, which loses to it and is held.
+    w.caller()
+        .correct_node(
+            w.tenant,
+            acct,
+            &Patch::new(e, ValidTime::UNKNOWN, values(json!({ "plan": "gold" }))),
+        )
+        .await
+        .unwrap();
+    let ended = w
+        .caller()
+        .end_node_validity(
+            w.tenant,
+            acct,
+            &EndOfValidity {
+                episode: f,
+                at: Bound::At(at(2024, 6, 1)),
+            },
+        )
+        .await
+        .unwrap()
+        .recorded_at;
+    assert_eq!(
+        w.current_values(acct, at(2024, 7, 1)).await,
+        Some(json!({ "plan": "gold" })),
+        "F's End of validity is held"
+    );
+
+    w.erase(e).await;
+
+    assert_eq!(
+        w.current_values(acct, at(2024, 3, 1)).await,
+        Some(json!({ "plan": "basic" }))
+    );
+    assert_eq!(w.current_values(acct, at(2024, 7, 1)).await, None);
+    // From the instant F stated it, as if E never existed.
+    assert_eq!(w.values_as_of(acct, at(2024, 7, 1), ended).await, None);
+}
+
+#[tokio::test]
+async fn erasing_the_episode_behind_a_retraction_makes_the_retracted_fact_current_again() {
+    let w = World::new().await;
+    let f = w.episode(at(2024, 1, 1), None).await;
+    let e = w.episode(at(2024, 2, 1), None).await;
+    let acct = w
+        .node("account", f, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    let version = w.read(acct, at(2024, 1, 1)).await.unwrap().id;
+    let retracted = w
+        .caller()
+        .retract_node_version(
+            w.tenant,
+            acct,
+            &Retraction {
+                episode: e,
+                version,
+            },
+        )
+        .await
+        .unwrap()
+        .recorded_at;
+    assert_eq!(w.read(acct, at(2024, 1, 1)).await, None);
+
+    let erasure = w.erase(e).await;
+    assert_eq!(erasure.recomputed_nodes, vec![acct]);
+
+    let now = w.read(acct, at(2024, 1, 1)).await.expect("current again");
+    assert_eq!(Value::Object(now.values), json!({ "plan": "basic" }));
+    assert_eq!(now.recorded_to, None);
+    assert_eq!(
+        w.values_as_of(acct, at(2024, 1, 1), retracted).await,
+        Some(json!({ "plan": "basic" }))
+    );
+    assert!(w
+        .caller()
+        .list_node_statements(w.tenant, acct)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_node_left_with_no_versions_is_erased_with_its_last_edge_and_a_bare_node_stays() {
+    let w = World::new().await;
+    let e = w.episode(at(2024, 1, 1), None).await;
+    let f = w.episode(at(2024, 1, 2), None).await;
+    let acme = w
+        .node("company", f, ValidTime::UNKNOWN, json!({ "name": "Acme" }))
+        .await;
+    // a: only E describes it, and only E's Edge joins it.
+    let a = w
+        .node("account", e, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    let e_edge = w
+        .edge(a, acme, e, ValidTime::UNKNOWN, json!({ "share": 10 }))
+        .await;
+    // b: only E describes it, but F's Edge joins it.
+    let b = w
+        .node("account", e, ValidTime::UNKNOWN, json!({ "plan": "pro" }))
+        .await;
+    let f_edge = w
+        .edge(b, acme, f, ValidTime::UNKNOWN, json!({ "share": 20 }))
+        .await;
+    // A bare Node no Edge joins, which no Episode describes.
+    let mut client = w.db.login().await;
+    let tx = w.raw(&mut client).await;
+    let bare: Uuid = tx
+        .query_typed(
+            "select gnomon.create_node($1, $2, 'company')",
+            &[(&w.tenant.0, Type::UUID), (&SCOPE, Type::TEXT)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    tx.commit().await.unwrap();
+
+    let erasure = w.erase(e).await;
+    assert_eq!(erasure.erased_edges, vec![e_edge]);
+    assert_eq!(erasure.erased_nodes, vec![a]);
+    assert_eq!(erasure.recomputed_nodes, vec![b]);
+    assert!(!w.exists("edge", e_edge.0).await);
+    assert!(!w.exists("node", a.0).await);
+    // b has no Version now, and stays as a bare identity while F's Edge joins
+    // it.
+    assert!(w.exists("node", b.0).await);
+    assert_eq!(w.read(b, at(2024, 1, 1)).await, None);
+    assert!(w.exists("node", acme.0).await);
+    assert!(w.exists("node", bare).await);
+
+    // Erasing F erases its Edge, then b with its last Edge, then Acme, which
+    // F alone described and no Edge joins any more.
+    let erasure = w.erase(f).await;
+    assert_eq!(erasure.erased_edges, vec![f_edge]);
+    let mut expected = vec![acme, b];
+    expected.sort();
+    assert_eq!(erasure.erased_nodes, expected);
+    assert!(!w.exists("node", b.0).await);
+    assert!(
+        w.exists("node", bare).await,
+        "a bare Node no Edge joins stays"
+    );
+}
+
+/// Every row of every gnomon table the caller sees, as text.
+async fn snapshot(tx: &tokio_postgres::Transaction<'_>, tables: &[String]) -> Vec<String> {
+    let mut rows = Vec::new();
+    for table in tables {
+        for r in tx
+            .query_typed(
+                &format!("select '{table} ' || to_jsonb(x)::text from gnomon.{table} x"),
+                &[],
+            )
+            .await
+            .unwrap()
+        {
+            rows.push(r.get(0));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+#[tokio::test]
+async fn the_same_erasure_on_the_same_starting_data_always_removes_the_same_rows() {
+    let w = World::new().await;
+    let f = w.episode(at(2024, 1, 1), Some(1)).await;
+    let e = w.episode(at(2024, 2, 1), Some(2)).await;
+    let g = w.episode(at(2024, 3, 1), Some(0)).await;
+    let acme = w
+        .node("company", f, ValidTime::UNKNOWN, json!({ "name": "Acme" }))
+        .await;
+    let mut accounts = Vec::new();
+    for i in 0..5 {
+        let a = w
+            .node(
+                "account",
+                f,
+                ValidTime::UNKNOWN,
+                json!({ "plan": format!("p{i}") }),
+            )
+            .await;
+        w.write(
+            a,
+            e,
+            ValidTime::between(at(2024, 1 + i, 1), at(2024, 3 + i, 1)),
+            json!({ "plan": "erased" }),
+        )
+        .await;
+        w.write(
+            a,
+            g,
+            ValidTime::between(at(2024, 2 + i, 1), at(2024, 9, 1)),
+            json!({ "aliases": [format!("g{i}")] }),
+        )
+        .await;
+        w.edge(a, acme, e, ValidTime::UNKNOWN, json!({ "share": i }))
+            .await;
+        accounts.push(a);
+    }
+    let tables: Vec<String> = gnomon_tables(&w.db.admin().await)
+        .await
+        .into_iter()
+        .filter(|t| t != "schema_version" && t != "tenancy")
+        .collect();
+
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let mut client = w.db.login().await;
+        let tx = w.raw(&mut client).await;
+        let before = snapshot(&tx, &tables).await;
+        tx.query_typed(
+            "select from gnomon.erase_episode($1, $2)",
+            &[(&w.tenant.0, Type::UUID), (&e.0, Type::UUID)],
+        )
+        .await
+        .unwrap();
+        let after = snapshot(&tx, &tables).await;
+        tx.rollback().await.unwrap();
+        let removed: Vec<String> = before
+            .iter()
+            .filter(|r| after.binary_search(r).is_err())
+            .cloned()
+            .collect();
+        assert!(!removed.is_empty());
+        runs.push(removed);
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "two runs of one Erasure removed different rows"
+    );
+
+    // And the Erasure the Store commits removes exactly those rows.
+    let mut client = w.db.login().await;
+    let tx = w.raw(&mut client).await;
+    let before = snapshot(&tx, &tables).await;
+    tx.commit().await.unwrap();
+    w.erase(e).await;
+    let mut client = w.db.login().await;
+    let tx = w.raw(&mut client).await;
+    let after = snapshot(&tx, &tables).await;
+    let removed: Vec<String> = before
+        .iter()
+        .filter(|r| after.binary_search(r).is_err())
+        .cloned()
+        .collect();
+    assert_eq!(removed, runs[0]);
+}
+
+#[tokio::test]
+async fn a_write_to_an_affected_node_waits_for_the_erasure_to_commit_and_one_to_an_unaffected_node_does_not(
+) {
+    let w = World::new().await;
+    let f = w.episode(at(2024, 1, 1), None).await;
+    let e = w.episode(at(2024, 2, 1), None).await;
+    let affected = w
+        .node("account", f, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    w.write(affected, e, ValidTime::UNKNOWN, json!({ "plan": "erased" }))
+        .await;
+    let unaffected = w
+        .node("account", f, ValidTime::UNKNOWN, json!({ "plan": "pro" }))
+        .await;
+    let acme = w
+        .node("company", f, ValidTime::UNKNOWN, json!({ "name": "Acme" }))
+        .await;
+    let later = w.episode(at(2024, 3, 1), None).await;
+
+    // The Erasure runs and holds its locks until it commits.
+    let mut client = w.db.login().await;
+    let tx = w.raw(&mut client).await;
+    tx.query_typed(
+        "select from gnomon.erase_episode($1, $2)",
+        &[(&w.tenant.0, Type::UUID), (&e.0, Type::UUID)],
+    )
+    .await
+    .unwrap();
+
+    let other = w.db.store().await;
+    let tenant = w.tenant;
+    let write_affected = tokio::spawn({
+        let other = w.db.store().await;
+        async move {
+            other
+                .as_worker(tenant, Scope::new(SCOPE))
+                .write_node(
+                    tenant,
+                    affected,
+                    &Patch::new(later, ValidTime::UNKNOWN, values(json!({ "name": "late" }))),
+                )
+                .await
+                .unwrap()
+        }
+    });
+    let join_affected = tokio::spawn({
+        let other = w.db.store().await;
+        async move {
+            other
+                .as_worker(tenant, Scope::new(SCOPE))
+                .create_edge(
+                    &NewEdge {
+                        tenant: Some(tenant),
+                        scope: Scope::new(SCOPE),
+                        kind: "owns".into(),
+                        source: affected,
+                        target: acme,
+                    },
+                    &Patch::new(later, ValidTime::UNKNOWN, values(json!({ "share": 5 }))),
+                )
+                .await
+                .unwrap()
+        }
+    });
+    // The unaffected write completes while the Erasure is still open.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        other.as_worker(tenant, Scope::new(SCOPE)).write_node(
+            tenant,
+            unaffected,
+            &Patch::new(later, ValidTime::UNKNOWN, values(json!({ "name": "free" }))),
+        ),
+    )
+    .await
+    .expect("a write to an unaffected Node does not wait")
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !write_affected.is_finished(),
+        "the affected write did not wait"
+    );
+    assert!(
+        !join_affected.is_finished(),
+        "an Edge joined an affected Node without waiting"
+    );
+
+    tx.commit().await.unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(30), write_affected)
+        .await
+        .expect("the affected write goes on once the Erasure commits")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), join_affected)
+        .await
+        .unwrap()
+        .unwrap();
+    // It wrote after the Erasure, from the Contributions that remained.
+    let now = w.read(affected, at(2024, 1, 1)).await.unwrap();
+    assert_eq!(now.recorded_from, outcome.recorded_at);
+    assert_eq!(
+        Value::Object(now.values),
+        json!({ "plan": "basic", "name": "late" })
+    );
+}
+
+#[tokio::test]
+async fn an_erasure_deletes_the_sentence_of_every_edge_version_it_deletes_or_recomputes() {
+    let w = World::new().await;
+    let f = w.episode(at(2024, 1, 1), None).await;
+    let e = w.episode(at(2024, 2, 1), None).await;
+    let acme = w
+        .node("company", f, ValidTime::UNKNOWN, json!({ "name": "Acme" }))
+        .await;
+    let a = w
+        .node("account", f, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    let edge = w
+        .edge(a, acme, f, ValidTime::UNKNOWN, json!({ "share": 40 }))
+        .await;
+    let surviving = w.current_edge_version(edge, at(2024, 1, 1)).await;
+    w.store_sentence(surviving, "a owns 40% of Acme").await;
+    // E restates the share for a while. The Version F's write opened is
+    // closed, and E's Versions get Sentences of their own.
+    w.write_edge(
+        edge,
+        e,
+        ValidTime::between(at(2024, 3, 1), at(2024, 6, 1)),
+        json!({ "share": 99 }),
+    )
+    .await;
+    let derived = w.current_edge_version(edge, at(2024, 4, 1)).await;
+    let after_e = w.current_edge_version(edge, at(2024, 7, 1)).await;
+    w.store_sentence(derived, "a owns 99% of Acme").await;
+    w.store_sentence(after_e, "a owns 40% of Acme again").await;
+
+    w.erase(e).await;
+
+    // E's Versions are deleted, and their Sentences with them by the foreign
+    // key. F's Version survives, reopened, and its Sentence is deleted too,
+    // because the Erasure recomputed it. The Pipeline writes a new one.
+    assert_eq!(w.sentence_of(derived).await, None);
+    assert_eq!(w.sentence_of(after_e).await, None);
+    assert_eq!(
+        w.current_edge_version(edge, at(2024, 4, 1)).await,
+        surviving
+    );
+    assert_eq!(w.sentence_of(surviving).await, None);
+    let read = w
+        .caller()
+        .read_edge(w.tenant, edge, AsOf::current(at(2024, 4, 1)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.sentence, None);
+    assert_eq!(Value::Object(read.values), json!({ "share": 40 }));
+}
+
+#[tokio::test]
+async fn a_citation_of_a_retracted_episode_does_not_keep_a_version_current_once_its_corroborator_is_erased(
+) {
+    let w = World::new().await;
+    let r = w.episode(at(2024, 1, 1), None).await;
+    let e = w.episode(at(2024, 2, 1), None).await;
+    let acct = w
+        .node("account", r, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    let written = w.read(acct, at(2024, 1, 1)).await.unwrap().recorded_from;
+    // E states the same, so the Version cites both, and Retract Episode
+    // leaves it current.
+    w.write(acct, e, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    let retraction = w.caller().retract_episode(w.tenant, r).await.unwrap();
+    assert!(retraction.retracted.is_empty());
+    assert!(w.read(acct, at(2024, 1, 1)).await.is_some());
+
+    w.erase(e).await;
+
+    // As if E never existed, Retract Episode found the Version cited by R
+    // alone and retracted it. R's Citation counts as another Episode's for
+    // what the Erasure deletes, so R's value is still there before the
+    // Retraction, but R is retracted, so it is not current after it.
+    assert_eq!(
+        w.values_as_of(acct, at(2024, 1, 1), written).await,
+        Some(json!({ "plan": "basic" }))
+    );
+    assert_eq!(
+        w.values_as_of(acct, at(2024, 1, 1), retraction.recorded_at)
+            .await,
+        None
+    );
+    assert_eq!(w.read(acct, at(2024, 1, 1)).await, None);
+    let statements = w
+        .caller()
+        .list_node_statements(w.tenant, acct)
+        .await
+        .unwrap();
+    assert_eq!(statements.len(), 1, "{statements:?}");
+    assert_eq!(statements[0].episode, r);
+    assert_eq!(statements[0].recorded_at, retraction.recorded_at);
+}
+
+#[tokio::test]
+async fn an_erasure_of_many_nodes_holds_one_advisory_lock_for_each_and_runs_on_the_default_lock_table(
+) {
+    const NODES: usize = 500;
+    let w = World::new().await;
+    let e = w.episode(at(2024, 1, 1), None).await;
+    let mut nodes = Vec::new();
+    for i in 0..NODES {
+        nodes.push(
+            w.node(
+                "account",
+                e,
+                ValidTime::UNKNOWN,
+                json!({ "plan": format!("p{i}") }),
+            )
+            .await,
+        );
+    }
+    let mut client = w.db.login().await;
+    let tx = w.raw(&mut client).await;
+    let row = tx
+        .query_typed(
+            "select current_setting('max_locks_per_transaction')::int,
+                    current_setting('max_connections')::int
+                      + current_setting('max_prepared_transactions')::int",
+            &[],
+        )
+        .await
+        .unwrap();
+    let (per_transaction, slots): (i32, i32) = (row[0].get(0), row[0].get(1));
+    tx.query_typed(
+        "select from gnomon.erase_episode($1, $2)",
+        &[(&w.tenant.0, Type::UUID), (&e.0, Type::UUID)],
+    )
+    .await
+    .unwrap();
+    let held: i64 = tx
+        .query_typed(
+            "select count(*) from pg_locks where pid = pg_backend_pid() and locktype = 'advisory'",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    tx.commit().await.unwrap();
+    // One lock for the Episode and one for each Node, as the migration's
+    // header documents: more than max_locks_per_transaction, within the
+    // shared table of max_locks_per_transaction * (max_connections +
+    // max_prepared_transactions).
+    assert_eq!(held, 1 + NODES as i64);
+    assert!(
+        held > i64::from(per_transaction),
+        "the server allows {per_transaction}"
+    );
+    assert!(held < i64::from(per_transaction) * i64::from(slots));
+    println!(
+        "{held} advisory locks with max_locks_per_transaction = {per_transaction} \
+         and {slots} connection slots"
+    );
+    for node in [nodes[0], nodes[NODES - 1]] {
+        assert!(!w.exists("node", node.0).await);
+    }
+}
+
+#[tokio::test]
+async fn without_the_deployments_grant_erasure_fails_and_an_erased_episode_cannot_be_erased_again()
+{
+    let w = World::new().await;
+    let e = w.episode(at(2024, 1, 1), None).await;
+    let acct = w
+        .node("account", e, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    let as_user = w.store.as_user(values(json!({
+        "role": "authenticated",
+        "app_metadata": { "tenant_id": w.tenant.0.to_string(), "scopes": [SCOPE] }
+    })));
+    let err = as_user.erase_episode(w.tenant, e).await.unwrap_err();
+    assert_eq!(
+        err.sqlstate(),
+        Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+        "{err:?}"
+    );
+    assert!(w.read(acct, at(2024, 1, 1)).await.is_some());
+
+    w.erase(e).await;
+    let again = w.caller().erase_episode(w.tenant, e).await.unwrap_err();
+    assert!(matches!(again, gnomon::Error::InvalidWrite(_)), "{again:?}");
+}

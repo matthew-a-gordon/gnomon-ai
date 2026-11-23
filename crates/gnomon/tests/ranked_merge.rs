@@ -145,10 +145,11 @@ impl World {
             .get(0)
     }
 
-    /// What Erasure will do to an Episode's rows, until ticket 13 builds it:
-    /// delete the Episode's Contributions and bound statements, as the
-    /// operator. The Node's next write then recomputes its Versions as an
-    /// Erasure's recompute would.
+    /// Deletes an Episode's Contributions and bound statements as the
+    /// operator, and leaves the Episode. The Node's next write then
+    /// recomputes its current Versions from what remains. These tests
+    /// predate Erasure (erase_episode.rs), which also rewrites the Node's
+    /// closed history.
     async fn erase_rows_of(&self, episode: EpisodeId) {
         let admin = self.db.admin().await;
         for sql in [

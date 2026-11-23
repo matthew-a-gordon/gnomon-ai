@@ -138,3 +138,21 @@ pub struct Step {
     /// (ADR-0008).
     pub neighbour_version: Option<NodeVersion>,
 }
+
+/// What Erase Episode removed and recomputed (ADR-0003, ADR-0007).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeErasure {
+    /// When the Erasure ran: when the call's transaction started. History is
+    /// rewritten up to this instant as if the Episode had never existed.
+    pub erased_at: DateTime<Utc>,
+    /// The Nodes the Episode touched whose Versions were recomputed from the
+    /// Contributions that remain, in order of ID.
+    pub recomputed_nodes: Vec<NodeId>,
+    /// The Edges recomputed so, in order of ID.
+    pub recomputed_edges: Vec<EdgeId>,
+    /// The Nodes erased because nothing was left of them and no Edge joined
+    /// them, in order of ID.
+    pub erased_nodes: Vec<NodeId>,
+    /// The Edges erased because nothing was left of them, in order of ID.
+    pub erased_edges: Vec<EdgeId>,
+}

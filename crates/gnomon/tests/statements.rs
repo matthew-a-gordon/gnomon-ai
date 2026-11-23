@@ -243,11 +243,11 @@ impl World {
             .unwrap()
     }
 
-    /// What Retract Episode (#12) and Erasure (#13) will do to
-    /// an Episode's rows, until they exist: delete its Contributions, its
-    /// statements and its bound statements, as the operator. A later write
-    /// to the Node then recomputes its Versions as an Erasure's recompute
-    /// would.
+    /// Deletes an Episode's Contributions, statements and bound statements
+    /// as the operator, and leaves the Episode. A later write to the Node
+    /// then recomputes its current Versions from what remains. These tests
+    /// predate Erasure (erase_episode.rs), which also rewrites the Node's
+    /// closed history.
     async fn erase_rows_of(&self, episode: EpisodeId) {
         let admin = self.db.admin().await;
         for sql in [

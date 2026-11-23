@@ -75,6 +75,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0010_retract_episode",
         template: include_str!("../migrations/0010_retract_episode.sql"),
     },
+    Migration {
+        version: 11,
+        name: "0011_erase_episode",
+        template: include_str!("../migrations/0011_erase_episode.sql"),
+    },
 ];
 
 /// The schema version this build of the Store expects: the last migration's.
