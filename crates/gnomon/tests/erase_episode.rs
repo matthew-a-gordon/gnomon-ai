@@ -109,6 +109,13 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
     let shared = w
         .edge(a, c, f, ValidTime::UNKNOWN, json!({ "share": 40 }))
         .await;
+    // The Sentence of the Version F alone gave the Edge, which E's write
+    // closes and the Erasure reopens. Its text owes nothing to E, but the
+    // Erasure deletes its Sentence (ADR-0013), and the words of that Sentence
+    // must go with it, though the Version stays.
+    let shared_first = w.current_edge_version(shared, at(2024, 4, 1)).await;
+    w.store_sentence(shared_first, "a holds forty percent of Acme")
+        .await;
     w.write_edge(
         shared,
         e,
@@ -173,8 +180,21 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .map(|r| r.get(0))
         .collect();
     assert!(recomputed.contains(&shared_version.0));
+    assert!(recomputed.contains(&shared_first.0));
     assert!(recomputed.contains(&e_only_version.0));
     assert!(!recomputed.contains(&untouched_version.0));
+
+    // E's words are in the token table, its Alias of a, which Node Kinds
+    // search, and its Sentence, so the check below finds any it leaves.
+    let marked: i64 = admin
+        .query_typed(
+            "select count(*) from gnomon.search_token where strpos(token, $1) > 0",
+            &[(&MARKER, Type::TEXT)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert!(marked >= 2, "E's words are indexed: {marked}");
 
     let erasure = w.erase(e).await;
     assert_eq!(erasure.erased_edges, vec![e_only]);
@@ -219,8 +239,23 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
     assert_eq!(w.stage_records_of(SCOPE, f).await, f_stages);
 
     // What the Erasure left alone keeps its Sentence.
+    // F's first Version of the Edge holds again, with no Sentence and no
+    // word of the one it had.
+    assert!(w.exists("version", shared_first.0).await);
+    assert_eq!(w.sentence_of(shared_first).await, None);
+    let forty: i64 = admin
+        .query_typed(
+            "select count(*) from gnomon.search_token where version_id = $1 and token = 'forty'",
+            &[(&shared_first.0, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(forty, 0, "the reopened Version keeps a word of its erased Sentence");
     let derived = tables_derived_from_version_text(&admin).await;
     assert!(derived.iter().any(|t| t == "sentence"), "{derived:?}");
+    assert!(derived.iter().any(|t| t == "search_token"), "{derived:?}");
+    support::erasure::assert_search_counts_match_the_token_rows(&admin).await;
     assert_eq!(
         w.sentence_of(untouched_version).await.as_deref(),
         Some("d owns 1% of Acme")

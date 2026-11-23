@@ -691,6 +691,10 @@ pub async fn assert_no_residue(admin: &Client, residue: &Residue<'_>) {
     }
     let gone = [residue.versions, residue.recomputed].concat();
     for table in tables_derived_from_version_text(admin).await {
+        if table == SEARCH_TOKEN {
+            assert_tokens_derived_anew(admin, residue).await;
+            continue;
+        }
         let n: i64 = admin
             .query_typed(
                 &format!("select count(*) from gnomon.{table} where version_id = any($1)"),
@@ -706,21 +710,111 @@ pub async fn assert_no_residue(admin: &Client, residue: &Residue<'_>) {
     }
 }
 
+/// The token table of full-text Search (migration 0016), whose rows the
+/// Store derives from each Version's text.
+pub const SEARCH_TOKEN: &str = "search_token";
+
+/// The BM25 counts of each Scope, which an Erasure lowers rather than
+/// deletes while the Scope holds other documents.
+pub const BM25_COUNT_TABLES: &[&str] = &["search_token_frequency", "search_scope_length"];
+
+/// The token rows an Erasure leaves: none of a Version it deleted, and for
+/// each recomputed Version that survives, exactly the rows its text as it
+/// stands now gives, so none holds a word only the erased text held.
+async fn assert_tokens_derived_anew(admin: &Client, residue: &Residue<'_>) {
+    let n: i64 = admin
+        .query_typed(
+            "select count(*) from gnomon.search_token where version_id = any($1)",
+            &[(&residue.versions, Type::UUID_ARRAY)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(
+        n, 0,
+        "gnomon.search_token still holds rows of erased Versions"
+    );
+    let stale: Vec<String> = admin
+        .query_typed(
+            "with kept as (
+               select tenant_id, scope, token, version_id, tf, dl
+               from gnomon.search_token where version_id = any($1)),
+             anew as (
+               select t.* from gnomon.version v
+               cross join lateral gnomon.search_text_tokens(v.tenant_id, array[v.id]) t
+               where v.id = any($1))
+             select format('%s %s', version_id, token)
+             from ((table kept except table anew) union all (table anew except table kept)) d
+             order by 1",
+            &[(&residue.recomputed, Type::UUID_ARRAY)],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "gnomon.search_token holds rows of recomputed Versions not derived from their text \
+         as it stands: {stale:?}"
+    );
+}
+
+/// Checks that the BM25 counts, read past RLS, are those the token rows give
+/// when counted again: each Scope's documents per word, and its documents
+/// and words.
+pub async fn assert_search_counts_match_the_token_rows(admin: &Client) {
+    for (stored, recounted, what) in [
+        (
+            "select scope, token, documents from gnomon.search_token_frequency",
+            "select scope, token, count(*) from gnomon.search_token group by 1, 2",
+            "the document frequencies",
+        ),
+        (
+            "select scope, documents::text, length from gnomon.search_scope_length",
+            "select scope, count(*)::text, sum(dl)::bigint
+             from (select distinct scope, version_id, dl from gnomon.search_token) d group by 1",
+            "the Scope totals",
+        ),
+    ] {
+        let read = |sql: &'static str| async move {
+            let mut rows: Vec<String> = admin
+                .query_typed(
+                    &format!("select format('%s %s %s', x.a, x.b, x.c) from ({sql}) x(a, b, c)"),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(read(stored).await, read(recounted).await, "{what}");
+    }
+}
+
 /// Every row of every gnomon table, read past RLS, as text, but for the two
-/// tables no Erasure touches.
+/// tables no Erasure touches and the BM25 counts, which
+/// [`assert_only_removed`] checks against the token rows instead.
 pub async fn every_row(admin: &Client) -> Vec<String> {
     let tables: Vec<String> = gnomon_tables(admin)
         .await
         .into_iter()
-        .filter(|t| t != "schema_version" && t != "tenancy")
+        .filter(|t| {
+            t != "schema_version" && t != "tenancy" && !BM25_COUNT_TABLES.contains(&t.as_str())
+        })
         .collect();
     rows_of(admin, &tables).await
 }
 
 /// Checks that an Erasure removed exactly the rows that name one of `ids` in
 /// their text, from `before`, a read of [`every_row`] taken before it, and
-/// changed nothing else.
+/// changed nothing else, and that the BM25 counts went down with the token
+/// rows it removed.
 pub async fn assert_only_removed(admin: &Client, before: &[String], ids: &[Uuid]) {
+    assert_search_counts_match_the_token_rows(admin).await;
     let needles: Vec<String> = ids.iter().map(Uuid::to_string).collect();
     let kept: Vec<String> = before
         .iter()

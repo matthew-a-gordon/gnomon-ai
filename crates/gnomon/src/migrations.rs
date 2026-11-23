@@ -100,6 +100,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0015_reserved_edge_kinds",
         template: include_str!("../migrations/0015_reserved_edge_kinds.sql"),
     },
+    Migration {
+        version: 16,
+        name: "0016_full_text_search",
+        template: include_str!("../migrations/0016_full_text_search.sql"),
+    },
 ];
 
 /// The schema version this build of the Store expects: the last migration's.

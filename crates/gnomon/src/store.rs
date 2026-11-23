@@ -38,10 +38,10 @@ use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Direction, EdgeId,
     EdgeVersion, EndOfValidity, Episode, EpisodeErasure, EpisodeId, EpisodeRetraction, Error,
-    GraphErasure, Kind, KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId,
-    NodeVersion, Patch, Precision, Retraction, Scope, StageError, StageOutcome, StageRecord,
-    StageStatus, StageUsage, StageWrite, StatementKind, Step, TenantId, Traversal, VacuumMode,
-    VacuumReport, ValidTime, VersionId, WriteOutcome, WriteStatus,
+    FullTextCandidate, GraphErasure, Kind, KindOf, MergeRule, NewEdge, NewEpisode, NewKind,
+    NewNode, NodeId, NodeVersion, Patch, Precision, Retraction, Scope, StageError, StageOutcome,
+    StageRecord, StageStatus, StageUsage, StageWrite, StatementKind, Step, TenantId, Traversal,
+    VacuumMode, VacuumReport, ValidTime, VersionId, Versioned, WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -1053,6 +1053,61 @@ impl Caller<'_> {
             .collect())
     }
 
+    /// The full-text branch of Search (ADR-0010): the Versions whose
+    /// searchable text holds a word of `query`, As-of `as_of`, best first,
+    /// at most `limit` of them. Each is ranked by BM25 from the term counts
+    /// of the caller's allowed Scopes only, so another Scope's text never
+    /// changes the order. Words are lower-cased and split as Postgres's
+    /// `simple` text search configuration splits them, with no stemming and
+    /// no stop words. A Version is found as soon as the write that opened it
+    /// commits, before any embedding is stored.
+    ///
+    /// The searchable text of a Version is what its Kind marks: the
+    /// properties it names, a Node's name and Aliases, and an Edge
+    /// Version's Sentence once one is stored. A `limit` below 1 fails with
+    /// [`Error::Database`] and SQLSTATE 22023.
+    pub async fn search_full_text(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        query: &str,
+        as_of: AsOf,
+        limit: i32,
+    ) -> Result<Vec<FullTextCandidate>, Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
+                "select version_id, node_id, edge_id, scope, score, rank
+                 from gnomon.search_full_text($1, $2, $3, $4, $5)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&query, Type::TEXT),
+                    (&as_of.valid_at, Type::TIMESTAMPTZ),
+                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&limit, Type::INT4),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|r| FullTextCandidate {
+                version: VersionId(r.get(0)),
+                of: match r.get::<_, Option<uuid::Uuid>>(1) {
+                    Some(node) => Versioned::Node(NodeId(node)),
+                    None => Versioned::Edge(EdgeId(r.get(2))),
+                },
+                scope: Scope::new(r.get::<_, String>(3)),
+                score: r.get(4),
+                rank: r.get(5),
+            })
+            .collect())
+    }
+
     /// States a bound of a current Version's Valid time, citing the
     /// statement's Episode (ADR-0008). A bound the Version left unknown, or a
     /// narrower precision within the same period, is a Refinement. A bound
@@ -1625,14 +1680,8 @@ enum Ending<'a> {
     Retract(&'a Retraction),
 }
 
-/// The Node or Edge a write or a bound statement is about, and the Store
-/// functions that write it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Versioned {
-    Node(NodeId),
-    Edge(EdgeId),
-}
-
+/// The Store functions that write the Node or Edge a write or a bound
+/// statement is about.
 impl Versioned {
     fn id(self) -> uuid::Uuid {
         match self {

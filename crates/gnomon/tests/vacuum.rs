@@ -24,8 +24,9 @@ use tokio_postgres::Client;
 /// Text only the erased rows hold, so a scan of every page can find a copy.
 const MARKER: &str = "vacuumed-7f3e";
 
-/// The tables an Erasure deletes from or rewrites today, as migration 0013's
-/// header lists them.
+/// The tables an Erasure deletes from or rewrites today: those migration
+/// 0013's header lists, and the token table and BM25 counts of migration
+/// 0016.
 const ERASED_TABLES: &[&str] = &[
     "gnomon.bound_statement",
     "gnomon.citation",
@@ -35,6 +36,9 @@ const ERASED_TABLES: &[&str] = &[
     "gnomon.episode_retraction",
     "gnomon.erasure_reach",
     "gnomon.node",
+    "gnomon.search_scope_length",
+    "gnomon.search_token",
+    "gnomon.search_token_frequency",
     "gnomon.sentence",
     "gnomon.stage_record",
     "gnomon.stage_usage",

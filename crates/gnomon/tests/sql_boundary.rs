@@ -347,6 +347,10 @@ const ONTOLOGY_TABLES: &[&str] = &["kind", "kind_rule", "kind_merge"];
 /// it holds no row once the Erasure returns.
 const ERASURE_REACH: &str = "erasure_reach";
 
+/// The BM25 counts of each Scope, which only the token table's triggers
+/// write (migration 0016).
+const BM25_COUNT_TABLES: &[&str] = &["search_token_frequency", "search_scope_length"];
+
 #[tokio::test]
 async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_tenant_scope_policy()
 {
@@ -434,6 +438,19 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
                     reach.starts_with("((tenant_id = gnomon.tenant_id()) AND "),
                     "gnomon.{name}: the reach is {reach}"
                 );
+                // The one write: an Erasure that deletes the token rows of
+                // an Edge in such a Scope lowers that Scope's BM25 counts
+                // (migration 0016). The counts' guard refuses any write but
+                // the token table's trigger's.
+                if BM25_COUNT_TABLES.contains(&name.as_str())
+                    && reach.contains("gnomon.erasure_reaches_scope(")
+                {
+                    assert!(
+                        check.is_none() || check.as_deref() == Some(reach),
+                        "gnomon.{name}: the reach's check is {check:?}"
+                    );
+                    continue;
+                }
                 assert_eq!(check, None, "gnomon.{name}: the definer's reach writes");
                 continue;
             }
@@ -5586,4 +5603,207 @@ async fn a_caller_cannot_delete_a_stage_record_or_change_what_it_names() {
         }
     }
     assert_eq!(stage_rows(&w.db).await, before);
+}
+
+/// The token table of full-text Search and the BM25 counts of each Scope
+/// (ADR-0010, migration 0016).
+const SEARCH_TABLES: &[&str] = &[
+    "search_token",
+    "search_token_frequency",
+    "search_scope_length",
+];
+
+/// `world()` with a Node named "zebra" and something of its own in each
+/// Tenant's `support` and `billing` Scopes, written through the Store by
+/// each Scope's worker.
+async fn searchable_world() -> World {
+    let w = world().await;
+    let store = Store::connect(&w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let admin = w.db.admin().await;
+    for row in admin
+        .query_typed("select tenant_id, scope, id from gnomon.episode", &[])
+        .await
+        .unwrap()
+    {
+        let (tenant, scope, episode): (Uuid, String, Uuid) = (row.get(0), row.get(1), row.get(2));
+        let name = format!("zebra {scope}");
+        store
+            .as_worker(TenantId(tenant), Scope::new(scope.clone()))
+            .create_node(
+                &gnomon::NewNode {
+                    tenant: Some(TenantId(tenant)),
+                    scope: Scope::new(scope),
+                    kind: gnomon::ROOT_NODE_KIND.into(),
+                },
+                &gnomon::Patch::new(
+                    EpisodeId(episode),
+                    gnomon::ValidTime::UNKNOWN,
+                    match json!({ "name": name }) {
+                        serde_json::Value::Object(m) => m,
+                        _ => unreachable!(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    w
+}
+
+#[tokio::test]
+async fn a_caller_reads_only_its_own_tenants_and_scopes_token_rows_and_counts() {
+    let w = searchable_world().await;
+    for role in [USER, WORKER] {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        for table in SEARCH_TABLES {
+            let seen: Vec<(Uuid, String)> = tx
+                .query_typed(
+                    &format!("select distinct tenant_id, scope from gnomon.{table}"),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| (r.get(0), r.get(1)))
+                .collect();
+            assert_eq!(
+                seen,
+                vec![(w.t1, "support".to_owned())],
+                "{role} read gnomon.{table}"
+            );
+        }
+        // Search finds only the caller's own Scope, and nothing when it
+        // names the other Tenant.
+        let at = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
+        for (tenant, expected) in [(w.t1, vec!["support".to_owned()]), (w.t2, vec![])] {
+            let scopes: Vec<String> = tx
+                .query_typed(
+                    "select scope from gnomon.search_full_text($1, 'zebra billing support', $2, null, 10)",
+                    &[(&tenant, Type::UUID), (&at, Type::TIMESTAMPTZ)],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            assert_eq!(scopes, expected, "{role} searched {tenant}");
+        }
+        // The counts a caller reads are its own Scope's: one document, which
+        // says "zebra" and "support".
+        let documents: i64 = tx
+            .query_typed(
+                "select sum(documents)::bigint from gnomon.search_scope_length where tenant_id = $1",
+                &[(&w.t1, Type::UUID)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(documents, 1, "{role} counted documents of another Scope");
+    }
+}
+
+#[tokio::test]
+async fn a_caller_cannot_write_the_token_rows_or_the_counts_directly_even_in_its_own_scope() {
+    let w = searchable_world().await;
+    let admin = w.db.admin().await;
+    let tables: Vec<String> = SEARCH_TABLES.iter().map(|t| t.to_string()).collect();
+    let before = support::erasure::rows_of(&admin, &tables).await;
+    let own_version: Uuid = admin
+        .query_typed(
+            "select id from gnomon.version where tenant_id = $1 and scope = 'support'",
+            &[(&w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    for role in [USER, WORKER] {
+        for scope in ["support", "billing"] {
+            for sql in [
+                // A forged word for the caller's own Version.
+                format!(
+                    "insert into gnomon.search_token (tenant_id, scope, token, version_id, tf, dl)
+                     values ('{t}', '{scope}', 'forged', '{own_version}', 1, 1)",
+                    t = w.t1
+                ),
+                format!("update gnomon.search_token set tf = 99 where scope = '{scope}'"),
+                format!("delete from gnomon.search_token where scope = '{scope}'"),
+                format!(
+                    "insert into gnomon.search_token_frequency (tenant_id, scope, token, documents)
+                     values ('{t}', '{scope}', 'forged', 1000)",
+                    t = w.t1
+                ),
+                format!(
+                    "update gnomon.search_token_frequency set documents = 1000 where scope = '{scope}'"
+                ),
+                format!("delete from gnomon.search_token_frequency where scope = '{scope}'"),
+                format!(
+                    "insert into gnomon.search_scope_length (tenant_id, scope, documents, length)
+                     values ('{t}', 'elsewhere', 1000, 1000)",
+                    t = w.t1
+                ),
+                format!(
+                    "update gnomon.search_scope_length set documents = 1000 where scope = '{scope}'"
+                ),
+                format!("delete from gnomon.search_scope_length where scope = '{scope}'"),
+                // The re-index function, called directly rather than from a
+                // Sentence's trigger.
+                format!(
+                    "select gnomon.index_search_text('{t}', array['{own_version}'::uuid])",
+                    t = w.t1
+                ),
+            ] {
+                let mut client = w.db.login().await;
+                let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+                assert_refused(tx.batch_execute(&sql).await, &format!("{role}: {sql}"));
+            }
+        }
+        // No caller can add a trigger of its own to the tables.
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        assert_refused(
+            tx.batch_execute(
+                "create trigger forged after insert on gnomon.search_token
+                 for each statement execute function gnomon.search_count_inserted()",
+            )
+            .await,
+            &format!("{role} adds a trigger"),
+        );
+    }
+    assert_eq!(support::erasure::rows_of(&admin, &tables).await, before);
+}
+
+/// The guard on the token table and the counts lets a write through only at
+/// a trigger depth of 2 or more, which a caller reaches only through a
+/// trigger. No caller role, and not the login role, can create anything in
+/// any schema, so no caller can make a trigger of its own that writes them.
+/// A deployment that grants its caller roles CREATE on a schema gives them
+/// that way (docs/testing.md).
+#[tokio::test]
+async fn no_caller_role_can_create_in_any_schema_so_no_trigger_of_its_own_writes_the_counts() {
+    let w = world().await;
+    let admin = w.db.admin().await;
+    let rows = admin
+        .query_typed(
+            "select r.rolname::text, n.nspname::text from pg_namespace n cross join pg_roles r
+             where r.rolname in ('authenticated', 'gnomon_worker', $1)
+               and has_schema_privilege(r.oid, n.oid, 'CREATE') order by 1, 2",
+            &[(&support::LOGIN_ROLE, Type::TEXT)],
+        )
+        .await
+        .unwrap();
+    let creators: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(creators, vec![], "caller roles that may create in a schema");
+    let mut client = w.db.login().await;
+    for role in [USER, WORKER] {
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        assert_refused(
+            tx.batch_execute("create table public.forged (id int)")
+                .await,
+            &format!("{role} creates a table"),
+        );
+        tx.rollback().await.unwrap();
+    }
 }
