@@ -3946,7 +3946,7 @@ async fn a_caller_with_the_grant_cannot_erase_in_another_tenant_or_a_scope_it_ca
     n.w.db.grant_erasure(WORKER).await;
     let before = row_count(&n.w.db).await;
     let cases = [
-        // Another Tenant named outright.
+        // The call names another Tenant.
         (
             n.w.t2,
             n.w.t2_support,
@@ -3954,7 +3954,7 @@ async fn a_caller_with_the_grant_cannot_erase_in_another_tenant_or_a_scope_it_ca
             "another Tenant",
             true,
         ),
-        // Another Tenant's Episode under the caller's own Tenant.
+        // The call names the caller's Tenant and another Tenant's Episode.
         (
             n.w.t1,
             n.w.t2_support,
@@ -3962,7 +3962,7 @@ async fn a_caller_with_the_grant_cannot_erase_in_another_tenant_or_a_scope_it_ca
             "another Tenant's Episode",
             false,
         ),
-        // An Episode of the caller's Tenant in a Scope it cannot see.
+        // The Episode is the caller's Tenant's, in a Scope it cannot see.
         (
             n.w.t1,
             n.w.t1_billing,
@@ -3970,7 +3970,7 @@ async fn a_caller_with_the_grant_cannot_erase_in_another_tenant_or_a_scope_it_ca
             "a Scope the caller cannot see",
             false,
         ),
-        // No Tenant.
+        // The call names the nil Tenant.
         (
             Uuid::nil(),
             n.w.t1_support,
@@ -4062,11 +4062,11 @@ async fn a_caller_cannot_forge_the_erasure_bypass_or_delete_what_an_erasure_rewr
         assert_refused(r.map(|_| ()), &format!("{role} becoming gnomon_definer"));
         let mut client = n.w.db.login().await;
         let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-        tx.batch_execute("select set_config('gnomon.erasing', 'on', true)")
+        tx.batch_execute("select set_config('gnomon.running_as_definer', 'on', true)")
             .await
             .unwrap();
         let erasing: bool = tx
-            .query_typed("select gnomon.erasing()", &[])
+            .query_typed("select gnomon.running_as_definer()", &[])
             .await
             .unwrap()[0]
             .get(0);
@@ -4128,6 +4128,19 @@ async fn a_caller_cannot_forge_the_erasure_bypass_or_delete_what_an_erasure_rewr
             .await;
         assert_refused(r, &format!("merging {what}"));
     }
+
+    // Called directly as a write, the merge takes the write path's lock and
+    // Tenant check, so it cannot reach another Tenant's Node.
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    let r = tx
+        .query_typed(
+            "select gnomon.merge_versions($1, 'support', $2, false, '-infinity', 'infinity', \
+             transaction_timestamp(), 'recency', false)",
+            &[(&n.w.t2, Type::UUID), (&n.n2, Type::UUID)],
+        )
+        .await;
+    assert_refused(r, "merging another Tenant's Node directly");
 
     // After an Erasure in the same transaction, what it rewrote is still
     // committed history to the caller: the replay marks it written by no

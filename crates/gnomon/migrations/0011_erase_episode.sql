@@ -1,14 +1,16 @@
 -- gnomon migration 0011: Erase Episode.
 --
--- Erasure physically deletes an Episode, its Contributions, its statements,
--- its Citations and every Version derived from it alone, and recomputes
--- every surviving Version it touched, current and closed, from the
--- Contributions that remain, in one transaction, leaving no tombstone
--- (ADR-0003, ADR-0007). It is the only route that deletes or rewrites
--- committed history, and it is the third and last SECURITY DEFINER function
--- ADR-0009 allows, beside Kind registration and the merge-rule setter. Like
--- them it is owned by the NOLOGIN `gnomon_definer`, checks the Tenant against
--- `gnomon.tenant_id()`, and is granted to no caller role here: each
+-- Erasure physically deletes an Episode and leaves no tombstone (ADR-0003).
+-- In one transaction it deletes the Episode, its Contributions, its
+-- statements, its Citations and every Version derived from it alone. It then
+-- recomputes every surviving Version the Episode touched, current and
+-- closed, from the Contributions that remain (ADR-0007). It is the only route
+-- that deletes or rewrites committed history.
+--
+-- Erasure is the third and last SECURITY DEFINER function ADR-0009 allows,
+-- beside Kind registration and the merge-rule setter. Like them it is owned
+-- by the NOLOGIN `gnomon_definer` and checks the Tenant against
+-- `gnomon.tenant_id()`. This migration grants it to no caller role: each
 -- deployment grants it to the roles it chooses.
 --
 -- Recompute is replay, from prototype 4 (`prototype/recompute-cost`,
@@ -16,101 +18,118 @@
 --
 --   1. T0 is the earliest Recorded time at which the Episode touched it.
 --      History before T0 owes nothing to the Episode and stays as it is.
---   2. Every Version recorded from T0 on is deleted, with its Citations, and
---      every Version current at T0 is reopened and loses the Citations added
+--   2. The Episode's rows are deleted (`gnomon.erase_episode_rows`).
+--   3. Every Version recorded from T0 on is deleted, with its Citations.
+--      Every Version current at T0 is reopened and loses the Citations added
 --      from T0 on. The Node or Edge now stands as it stood just before T0.
---   3. The Episode's rows are deleted.
 --   4. Every Recorded time from T0 on at which something that remains was
 --      written to the Node or Edge is a step. Each step runs the write
---      path's merge, `gnomon.merge_versions`, at that Recorded time, over the
---      Valid time that step's write named, reading only the rows recorded by
---      then, under the merge rule that step's Versions recorded (ADR-0007).
---      A rule change applies to later writes only, so a history can mix
---      rules, and each step keeps the rule it had. A step that opened no
---      Version takes the rule the Kind had at that Recorded time.
+--      path's merge, `gnomon.merge_versions`, at that Recorded time. It
+--      merges over the Valid time that step's write named, reads only the
+--      rows recorded by then, and uses the merge rule that step's Versions
+--      recorded (ADR-0007). A rule change applies to later writes only, so a
+--      history can mix rules, and each step keeps the rule it had. A step
+--      that opened no Version takes the rule the Kind had at that Recorded
+--      time.
 --
 -- The result is the history as if the Episode had never existed. A statement
 -- that lost to a value the erased Episode alone supplied, such as a
 -- lower-Authority End of validity, takes effect at the step that recorded
 -- it, because the merge no longer finds the value it lost to. Erasing the
--- Episode behind a Retraction makes the retracted fact current again,
+-- Episode behind a Retraction makes the retracted Version current again,
 -- because the Retraction's null Contributions are gone. As-of reads at a
 -- past known-at instant are stable except across an Erasure, which rewrites
 -- Recorded-time history (ADR-0007).
 --
--- A Citation of a retracted Episode counts as a Citation of another Episode:
--- its value Contributions still count in the merge, as Retract Episode left
+-- Another Episode's Retraction of a Version that only the erased Episode
+-- cites is deleted with it. Its Valid time is that Version's, so it would
+-- keep a value of the erased Episode's and blank other values over it. As if
+-- the Episode never existed, the Version it retracts was never there. A bound
+-- statement of another Episode about the erased Episode's Contributions goes
+-- too. Another Episode's End of validity stays, because the instant it states
+-- is its own, and it takes effect once the values it lost to are gone.
+--
+-- A Citation of a retracted Episode counts as a Citation of another Episode.
+-- Its value Contributions still count in the merge, as Retract Episode left
 -- them (migration 0010). But Retract Episode retracted only the Versions that
 -- the Episode alone cited, and a Version that the erased Episode also cited
--- was not one of them. So the replay runs Retract Episode's choice again at
--- the step where the Episode was retracted: each current Version there that
+-- was not one of them. So the replay makes Retract Episode's choice again at
+-- the step where the Episode was retracted. Each current Version there that
 -- only the retracted Episode cites gets the Retraction Retract Episode would
--- have made. A fact from a retracted Episode is never left current because
+-- have made. A retracted Episode's value is never left current because
 -- Erasure removed the Episode that corroborated it.
 --
 -- Erasure also deletes what was derived from the text of every Version it
--- deletes or recomputes: today the Sentence of each such Edge Version
--- (ADR-0013), every Version of an affected Node or Edge held at or after T0.
--- The Pipeline writes a new Sentence afterwards.
+-- deletes or recomputes, which is every Version of an affected Node or Edge
+-- held at or after T0. Today that is the Sentence of each such Edge Version
+-- (ADR-0013). The Pipeline writes a new Sentence afterwards.
 --
 -- A Node or Edge the Episode touched that is left with no Contribution, and
 -- so with no Version, is erased with it. A Node left so stays as a bare
 -- identity while any Edge joins it, and is erased with its last Edge
--- (ADR-0007): an endpoint of an Edge the Erasure erases goes too when nothing
+-- (ADR-0007). An endpoint of an Edge the Erasure erases goes too when nothing
 -- is left of it and no other Edge joins it. A Node no Edge joins and the
 -- Episode never touched is left alone, bare or not.
 --
 -- Erasure acts in the caller's Tenant and Scopes only. The definer role is
 -- under RLS, and this migration gives it the same Tenant and Scope policies
--- as the callers, so an endpoint Node in a Scope the caller cannot see is
--- never erased and stays bare.
+-- as the callers. An endpoint Node in a Scope the caller cannot see is never
+-- erased and stays bare. A Node joined by an Edge in a Scope the caller
+-- cannot see stays too, because the Edge still joins it.
 --
--- Locks (ADR-0007). An Erasure takes, in this order and for the rest of its
--- transaction:
+-- Locks (ADR-0007). An Erasure takes these, for the rest of its transaction:
 --
 --   1. the advisory lock of the Episode's ID, which Retract Episode also
---      takes, then the Episode's row FOR UPDATE, which waits for every write
---      citing the Episode that is still running and makes every later one
---      wait and then fail its foreign key;
+--      takes;
 --   2. the advisory lock (`gnomon.node_lock_key`) of every Node and Edge the
 --      Episode touched and of both endpoints of every such Edge, in order of
 --      their IDs, so two Erasures, or an Erasure and a Retract Episode,
---      cannot deadlock.
+--      cannot deadlock;
+--   3. the Episode's row FOR UPDATE. A write takes its Node's or Edge's lock
+--      and then, through a Contribution's foreign key, a share lock on the
+--      Episode's row, so this is the same order. Taking the row waits for
+--      every write citing the Episode that is still running. The Erasure
+--      then locks whatever those writes touched, and from then on a write
+--      that cites the Episode waits for the Erasure and fails its foreign key.
 --
--- Every write to a Node or Edge takes that Node's or Edge's lock, and from
--- this migration creating an Edge takes the locks of both its endpoints, in
+-- Every write to a Node or Edge takes that Node's or Edge's lock. From this
+-- migration, creating an Edge takes the locks of both its endpoints, in
 -- order of their IDs. A write to an affected Node therefore waits until the
--- Erasure commits, a write to an unaffected one does not, and an Edge cannot
+-- Erasure commits, and a write to an unaffected one does not. An Edge cannot
 -- join a Node while an Erasure decides whether to erase it. Reads never wait.
+-- A transaction that writes several Nodes takes their locks in the order it
+-- writes them, so it can still deadlock with an Erasure. Postgres detects
+-- the deadlock and fails one of them, and the Store retries it.
 --
 -- Each advisory lock is an entry in the server's shared lock table, which
 -- holds `max_locks_per_transaction * (max_connections +
 -- max_prepared_transactions)` entries for every session together. One
 -- transaction may hold more than `max_locks_per_transaction` while the table
--- has room. An Erasure holds 1 + (Nodes and Edges it touched) + (endpoints of
--- those Edges, counted once each) advisory locks, beside its ordinary table
--- locks. An Erasure that needs more than the table has free fails with
--- SQLSTATE 53200 (out of shared memory) and rolls back, erasing nothing. The
--- locks are not batched, because a batch would have to commit, and an
--- Erasure is one transaction. A deployment that erases Episodes cited across
--- many thousands of Nodes raises `max_locks_per_transaction` first; prototype
--- 4 needed 1024 for 500 Nodes on a server with few connections.
+-- has room. An Erasure holds one advisory lock for the Episode, one for each
+-- Node and Edge it touched and one for each endpoint of those Edges, beside
+-- its ordinary table locks. An Erasure that needs more than the table has
+-- free fails with SQLSTATE 53200 (out of shared memory). It rolls back and
+-- erases nothing. The locks are not batched, because a batch would have to
+-- commit, and an Erasure is one transaction. A deployment that erases
+-- Episodes cited across many thousands of Nodes raises
+-- `max_locks_per_transaction` first. Prototype 4 needed 1024 for 500 Nodes
+-- on a server with few connections.
 --
 -- The guard triggers (ADR-0009) refuse every caller's delete or rewrite of
--- committed history. Erasure passes them because it runs as
--- `gnomon_definer`: `gnomon.erasing()` is true only when the current user is
--- that role, which no caller role can become (it has no members and never
--- logs in), and no setting a caller can change affects it. The Versions,
--- Citations, statements and Contributions the replay writes carry the
--- Recorded times of the steps they replay. Their transaction mark,
+-- committed history. Erasure passes them because it runs as `gnomon_definer`.
+-- `gnomon.running_as_definer()` is true only when the current user is that
+-- role. No caller role can become it, because it has no members and never
+-- logs in, and no setting a caller can change affects the check. The
+-- Versions, Citations, statements and Contributions the replay writes carry
+-- the Recorded times of the steps they replay. Their transaction mark,
 -- `written_in`, and the `closed_in` of each Version the replay closes are
--- '0', which no transaction ever has, so no transaction, not even the
+-- '0', which no transaction ever has. So no transaction, not even the
 -- Erasure's own, may delete or reopen them afterwards.
 --
--- An Erasure runs in a transaction of its own: it refuses to erase when its
--- transaction already wrote to a Node or Edge it touches, and fails with a
--- serialization failure, which the caller retries, when a transaction that
--- started later wrote one first.
+-- An Erasure runs in a transaction of its own. It refuses to erase when its
+-- transaction already wrote to a Node or Edge the Episode touched. It fails
+-- with a serialization failure, which the caller retries, when a transaction
+-- that started later wrote one first.
 --
 -- Later tables extend Erasure in two places, and only there:
 --
@@ -121,10 +140,11 @@
 --                                token rows and BM25 counts (#17), full and
 --                                quantized embeddings (#18).
 
--- Whether the current call is an Erasure: true only inside a function owned
--- by the NOLOGIN definer role. Kind registration and the merge-rule setter
--- run as that role too, and touch no table this flag unlocks.
-create function gnomon.erasing() returns boolean
+-- Whether the current user is the NOLOGIN definer role, which is true only
+-- inside a function that role owns. Erasure is the one such function that
+-- writes the tables whose guards this lets past. Kind registration and the
+-- merge-rule setter run as the role too, and write only the Ontology.
+create function gnomon.running_as_definer() returns boolean
   language sql stable parallel safe security invoker set search_path = ''
   as $$ select current_user = 'gnomon_definer'::name $$;
 
@@ -133,31 +153,31 @@ create function gnomon.erasing() returns boolean
 -- caller, stay as earlier migrations wrote them.
 drop trigger version_check_insert on gnomon.version;
 create trigger version_check_insert before insert on gnomon.version
-  for each row when (not gnomon.erasing())
+  for each row when (not gnomon.running_as_definer())
   execute function gnomon.version_check_insert();
 drop trigger version_guard_update on gnomon.version;
 create trigger version_guard_update before update on gnomon.version
-  for each row when (not gnomon.erasing())
+  for each row when (not gnomon.running_as_definer())
   execute function gnomon.version_guard_update();
 drop trigger version_guard_delete on gnomon.version;
 create trigger version_guard_delete before delete on gnomon.version
-  for each row when (not gnomon.erasing())
+  for each row when (not gnomon.running_as_definer())
   execute function gnomon.guard_delete('Version');
 drop trigger citation_guard_delete on gnomon.citation;
 create trigger citation_guard_delete before delete on gnomon.citation
-  for each row when (not gnomon.erasing())
+  for each row when (not gnomon.running_as_definer())
   execute function gnomon.guard_delete('Citation');
 drop trigger citation_check_insert on gnomon.citation;
 create trigger citation_check_insert before insert on gnomon.citation
-  for each row when (not gnomon.erasing())
+  for each row when (not gnomon.running_as_definer())
   execute function gnomon.citation_check_insert();
 drop trigger contribution_check_insert on gnomon.contribution;
 create trigger contribution_check_insert before insert on gnomon.contribution
-  for each row when (not gnomon.erasing())
+  for each row when (not gnomon.running_as_definer())
   execute function gnomon.contribution_check_insert();
 drop trigger statement_check_insert on gnomon.statement;
 create trigger statement_check_insert before insert on gnomon.statement
-  for each row when (not gnomon.erasing())
+  for each row when (not gnomon.running_as_definer())
   execute function gnomon.statement_check_insert();
 
 -- During an Erasure a Version still changes only in its Recorded-time end.
@@ -183,7 +203,7 @@ create function gnomon.version_erasure_update() returns trigger
   end
   $$;
 create trigger version_erasure_update before update on gnomon.version
-  for each row when (gnomon.erasing())
+  for each row when (gnomon.running_as_definer())
   execute function gnomon.version_erasure_update();
 
 -- Creating an Edge takes the locks of both its endpoints, in order of their
@@ -240,7 +260,10 @@ create function gnomon.kind_merge_rule_at(p_tenant_id uuid, p_kind text, p_at ti
 --             and closed what it closed at `p_at`, and what it writes is
 --             recorded at `p_at` and marked written by no transaction.
 --
--- The caller has locked the Node or Edge and named its Scope.
+-- A write takes the Node's or Edge's lock here, and is refused when a
+-- transaction that started later wrote the Node or Edge first, so a caller
+-- that calls the merge directly gets the write path's guarantees. An Erasure
+-- has taken its locks already.
 create function gnomon.merge_versions(
   p_tenant_id uuid,
   p_scope text,
@@ -274,13 +297,38 @@ create function gnomon.merge_versions(
     if p_rule is null or p_rule not in ('recency', 'ranked') then
       raise exception using errcode = 'GNW01', message = 'a merge rule is recency or ranked';
     end if;
-    if p_replay and not gnomon.erasing() then
+    if p_replay and not gnomon.running_as_definer() then
       raise exception using errcode = 'insufficient_privilege',
         message = 'only Erasure replays history';
     end if;
-    if not p_replay and p_at is distinct from transaction_timestamp() then
-      raise exception using errcode = 'insufficient_privilege',
-        message = 'a write merges at the start of its own transaction';
+    if not p_replay then
+      if p_at is distinct from transaction_timestamp() then
+        raise exception using errcode = 'insufficient_privilege',
+          message = 'a write merges at the start of its own transaction';
+      end if;
+      if (select l.scope from gnomon.lock_for_write(p_tenant_id, p_id, p_is_edge) l)
+           is distinct from p_scope then
+        raise exception using errcode = 'GNW01',
+          message = format('%s %s is not in Scope %s',
+                           case when p_is_edge then 'Edge' else 'Node' end, p_id, p_scope);
+      end if;
+      -- A transaction that started before another wrote this Node or Edge,
+      -- but took the lock after that one committed, would record a Version
+      -- earlier than one already recorded. It fails with a serialization
+      -- failure, and the caller retries the transaction.
+      if exists (
+        select from gnomon.contribution c
+        where c.tenant_id = p_tenant_id and c.scope = v_scope and c.versioned_id = p_id
+          and c.recorded_at > t
+      ) or exists (
+        select from gnomon.version x
+        where x.tenant_id = p_tenant_id and x.scope = v_scope and x.versioned_id = p_id
+          and x.recorded_from = t and x.written_in <> me
+      ) then
+        raise exception using errcode = 'serialization_failure',
+          message = format('a later transaction wrote %s %s first; retry the write',
+                           case when p_is_edge then 'Edge' else 'Node' end, p_id);
+      end if;
     end if;
     select coalesce(array_agg(st.id), '{}') into ignored_statements
       from gnomon.statement st
@@ -547,9 +595,10 @@ create function gnomon.merge_versions(
   end
   $$;
 
--- The write path's recompute, as migration 0010 left it: it locks the Node or
--- Edge, refuses a write that a later transaction overtook, and merges at the
--- start of its transaction under the rule the Kind has now.
+-- The write path's recompute, as migration 0010 left it: it merges at the
+-- start of its transaction under the rule the Kind has now, and the merge
+-- locks the Node or Edge and refuses a write that a later transaction
+-- overtook.
 create or replace function gnomon.recompute_versions(
   p_tenant_id uuid,
   p_id uuid,
@@ -562,35 +611,14 @@ create or replace function gnomon.recompute_versions(
   language plpgsql volatile security invoker set search_path = ''
   as $$
   declare
-    t constant timestamptz := transaction_timestamp();
-    me constant xid8 := pg_current_xact_id();
-    v_of constant text := case when p_is_edge then 'Edge' else 'Node' end;
     v_scope text;
     v_kind text;
     step record;
   begin
     select l.scope, l.kind into v_scope, v_kind
       from gnomon.lock_for_write(p_tenant_id, p_id, p_is_edge) l;
-
-    -- A transaction that started before another wrote this Node or Edge,
-    -- but took the lock after that one committed, would record a Version
-    -- earlier than one already recorded. It fails with a serialization
-    -- failure, and the caller retries the transaction.
-    if exists (
-      select from gnomon.contribution c
-      where c.tenant_id = p_tenant_id and c.scope = v_scope and c.versioned_id = p_id
-        and c.recorded_at > t
-    ) or exists (
-      select from gnomon.version x
-      where x.tenant_id = p_tenant_id and x.scope = v_scope and x.versioned_id = p_id
-        and x.recorded_from = t and x.written_in <> me
-    ) then
-      raise exception using errcode = 'serialization_failure',
-        message = format('a later transaction wrote %s %s first; retry the write', v_of, p_id);
-    end if;
-
     select * into step from gnomon.merge_versions(
-      p_tenant_id, v_scope, p_id, p_is_edge, p_from, p_to, t,
+      p_tenant_id, v_scope, p_id, p_is_edge, p_from, p_to, transaction_timestamp(),
       gnomon.kind_merge_rule(p_tenant_id, v_kind), false);
     changed := step.changed;
     opened := step.opened;
@@ -610,18 +638,37 @@ create function gnomon.erase_version_text(p_tenant_id uuid, p_versions uuid[])
     where s.tenant_id = p_tenant_id and s.version_id = any(p_versions);
   $$;
 
--- Deletes every row that names an Episode, and then the Episode. A bound
--- statement names the Contribution it is about, which may be another
--- Episode's, so the bound statements go first: this Episode's, and every
--- other Episode's about this Episode's Contributions. Then its Contributions,
--- its statements (whose Contributions would cascade), its Citations and its
--- Retraction marker. Tickets #24 and #16 add their stage records, usage counts
--- and Summary and Community Citations here.
+-- Deletes every row that names an Episode or is about what it alone said,
+-- and then the Episode. It runs before the replay, while the Citations still
+-- show what the Episode alone supplied:
+--
+--   1. Every other Episode's Retraction of a Version that only this Episode
+--      cites. Its Valid time is that Version's, so it would keep a value of
+--      this Episode's, and as if the Episode never existed the Version it
+--      retracts was never there. An End of validity stays: the instant it
+--      states is its own Episode's, and once this Episode's values are gone
+--      it takes effect (ADR-0007).
+--   2. The bound statements: this Episode's, and every other Episode's about
+--      this Episode's Contributions, which name them.
+--   3. Its Contributions, its statements (whose Contributions would
+--      cascade), its Citations and its Retraction marker.
+--
+-- Tickets #24 and #16 add their stage records, usage counts and Summary and
+-- Community Citations here.
 create function gnomon.erase_episode_rows(p_tenant_id uuid, p_episode_id uuid)
   returns void
   language plpgsql volatile security invoker set search_path = ''
   as $$
   begin
+    delete from gnomon.statement s
+      where s.tenant_id = p_tenant_id and s.episode_id <> p_episode_id
+        and s.kind = 'retraction'
+        and exists (select from gnomon.citation c
+                    where c.tenant_id = s.tenant_id and c.version_id = s.version_id
+                      and c.episode_id = p_episode_id)
+        and not exists (select from gnomon.citation c
+                        where c.tenant_id = s.tenant_id and c.version_id = s.version_id
+                          and c.episode_id <> p_episode_id);
     delete from gnomon.bound_statement b
       where b.tenant_id = p_tenant_id
         and (b.episode_id = p_episode_id
@@ -664,7 +711,7 @@ create function gnomon.replay_versions(
     v_whole boolean;
     v_statement bigint;
   begin
-    if not gnomon.erasing() then
+    if not gnomon.running_as_definer() then
       raise exception using errcode = 'insufficient_privilege',
         message = 'only Erasure replays history';
     end if;
@@ -796,10 +843,10 @@ create function gnomon.replay_versions(
   end
   $$;
 
--- Erase Episode. Returns when it was erased, the Nodes and Edges it
+-- Erase Episode. It returns when the Erasure ran, the Nodes and Edges it
 -- recomputed, and the Nodes and Edges it erased because nothing was left of
--- them, each in order of ID. See the header for what it deletes, the locks it takes and the
--- replay.
+-- them, each list in order of ID. The header says what it deletes, which
+-- locks it takes and how it replays.
 create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
   returns table (
     erased_at timestamptz,
@@ -819,6 +866,11 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
     v_text uuid[];
     v_edges uuid[] := '{}';
     v_nodes uuid[] := '{}';
+    v_lock uuid[];
+    v_locked uuid[] := '{}';
+    v_row_locked boolean := false;
+    v_candidates uuid[];
+    v_id uuid;
   begin
     if p_tenant_id is null or p_tenant_id is distinct from gnomon.tenant_id() then
       raise exception using errcode = 'insufficient_privilege',
@@ -826,44 +878,57 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
     end if;
     perform pg_catalog.pg_advisory_xact_lock(gnomon.node_lock_key(p_tenant_id, p_episode_id));
     select e.scope into v_scope
-      from gnomon.episode e where e.tenant_id = p_tenant_id and e.id = p_episode_id
-      for update;
+      from gnomon.episode e where e.tenant_id = p_tenant_id and e.id = p_episode_id;
     if not found then
       raise exception using errcode = 'GNW01',
         message = format('Episode %s is not visible to the caller', p_episode_id);
     end if;
 
-    -- Every Node and Edge the Episode touched.
-    select coalesce(array_agg(distinct x.id order by x.id), '{}') into v_touched
-      from (
-        select c.versioned_id as id from gnomon.contribution c
-          where c.tenant_id = p_tenant_id and c.episode_id = p_episode_id
-        union
-        select s.versioned_id from gnomon.statement s
-          where s.tenant_id = p_tenant_id and s.episode_id = p_episode_id
-        union
-        select b.versioned_id from gnomon.bound_statement b
-          where b.tenant_id = p_tenant_id and b.episode_id = p_episode_id
-        union
-        select v.versioned_id from gnomon.citation c
-          join gnomon.version v on v.tenant_id = c.tenant_id and v.id = c.version_id
-          where c.tenant_id = p_tenant_id and c.episode_id = p_episode_id
-      ) x;
-
-    -- Their locks and their Edges' endpoints' locks, in order of ID.
-    for it in
-      select distinct l.id from (
-        select unnest(v_touched) as id
-        union
-        select e.source_id from gnomon.edge e
-          where e.tenant_id = p_tenant_id and e.id = any(v_touched)
-        union
-        select e.target_id from gnomon.edge e
-          where e.tenant_id = p_tenant_id and e.id = any(v_touched)
-      ) l
-      order by l.id
+    -- The locks of every Node and Edge the Episode touched and of their
+    -- Edges' endpoints, in order of ID, then the Episode's row, as a write
+    -- takes its Node's lock and then, through a foreign key, a lock on the
+    -- Episode's row. Locking the row waits for every write citing the
+    -- Episode that is still running, and what those wrote is locked next.
+    -- After that no write can cite the Episode, so the set is final.
     loop
-      perform pg_catalog.pg_advisory_xact_lock(gnomon.node_lock_key(p_tenant_id, it.id));
+      select coalesce(array_agg(distinct x.id order by x.id), '{}') into v_touched
+        from (
+          select c.versioned_id as id from gnomon.contribution c
+            where c.tenant_id = p_tenant_id and c.episode_id = p_episode_id
+          union
+          select s.versioned_id from gnomon.statement s
+            where s.tenant_id = p_tenant_id and s.episode_id = p_episode_id
+          union
+          select b.versioned_id from gnomon.bound_statement b
+            where b.tenant_id = p_tenant_id and b.episode_id = p_episode_id
+          union
+          select v.versioned_id from gnomon.citation c
+            join gnomon.version v on v.tenant_id = c.tenant_id and v.id = c.version_id
+            where c.tenant_id = p_tenant_id and c.episode_id = p_episode_id
+        ) x;
+      v_lock := array(
+        select distinct l.id from (
+          select unnest(v_touched) as id
+          union
+          select e.source_id from gnomon.edge e
+            where e.tenant_id = p_tenant_id and e.id = any(v_touched)
+          union
+          select e.target_id from gnomon.edge e
+            where e.tenant_id = p_tenant_id and e.id = any(v_touched)
+        ) l
+        where l.id <> all (v_locked)
+        order by l.id);
+      exit when cardinality(v_lock) = 0 and v_row_locked;
+      foreach v_id in array v_lock loop
+        perform pg_catalog.pg_advisory_xact_lock(gnomon.node_lock_key(p_tenant_id, v_id));
+      end loop;
+      v_locked := v_locked || v_lock;
+      if not v_row_locked then
+        perform from gnomon.episode e
+          where e.tenant_id = p_tenant_id and e.id = p_episode_id
+          for update;
+        v_row_locked := true;
+      end if;
     end loop;
 
     -- History is rewritten up to the Erasure's own start, and no further.
@@ -940,6 +1005,10 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
         left join gnomon.edge e on e.tenant_id = p_tenant_id and e.id = x.id
       ) p;
 
+    -- The Episode's rows, while the Citations still show what it alone
+    -- supplied.
+    perform gnomon.erase_episode_rows(p_tenant_id, p_episode_id);
+
     -- Each Node and Edge back to where it stood just before T0, losing the
     -- text derived from every Version held at or after T0.
     for it in
@@ -961,8 +1030,6 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
         where v.tenant_id = p_tenant_id and v.versioned_id = it.id
           and v.recorded_to >= it.t0 and v.recorded_to <> 'infinity';
     end loop;
-
-    perform gnomon.erase_episode_rows(p_tenant_id, p_episode_id);
 
     for it in
       select (p ->> 'id')::uuid as id, (p ->> 'is_edge')::boolean as is_edge, p ->> 'kind' as kind,
@@ -993,23 +1060,35 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
            coalesce(array_agg(g.source_id) || array_agg(g.target_id), '{}')
       into v_edges, v_nodes
       from gone g;
-    with gone as (
-      delete from gnomon.node n
-        where n.tenant_id = p_tenant_id and n.id = any(v_touched || v_nodes)
-          and not exists (select from gnomon.contribution c
-                          where c.tenant_id = n.tenant_id and c.node_id = n.id)
-          and not exists (select from gnomon.statement s
-                          where s.tenant_id = n.tenant_id and s.node_id = n.id)
-          and not exists (select from gnomon.bound_statement b
-                          where b.tenant_id = n.tenant_id and b.node_id = n.id)
-          and not exists (select from gnomon.version v
-                          where v.tenant_id = n.tenant_id and v.node_id = n.id)
-          and not exists (select from gnomon.edge e
-                          where e.tenant_id = n.tenant_id
-                            and (e.source_id = n.id or e.target_id = n.id))
-        returning n.id
-    )
-    select coalesce(array_agg(g.id), '{}') into v_nodes from gone g;
+    -- A Node is erased one at a time, so that one joined by an Edge in a Scope
+    -- the caller cannot see, which RLS hides from the check above the delete
+    -- but not from the foreign key, stays as a bare identity and the rest of
+    -- the Erasure goes on.
+    v_candidates := array(select distinct u.id from unnest(v_touched || v_nodes) u(id)
+                          order by u.id);
+    v_nodes := '{}';
+    foreach v_id in array v_candidates loop
+      begin
+        delete from gnomon.node n
+          where n.tenant_id = p_tenant_id and n.id = v_id
+            and not exists (select from gnomon.contribution c
+                            where c.tenant_id = n.tenant_id and c.node_id = n.id)
+            and not exists (select from gnomon.statement s
+                            where s.tenant_id = n.tenant_id and s.node_id = n.id)
+            and not exists (select from gnomon.bound_statement b
+                            where b.tenant_id = n.tenant_id and b.node_id = n.id)
+            and not exists (select from gnomon.version v
+                            where v.tenant_id = n.tenant_id and v.node_id = n.id)
+            and not exists (select from gnomon.edge e
+                            where e.tenant_id = n.tenant_id
+                              and (e.source_id = n.id or e.target_id = n.id));
+        if found then
+          v_nodes := v_nodes || v_id;
+        end if;
+      exception when foreign_key_violation then
+        null;
+      end;
+    end loop;
 
     erased_at := t;
     erased_nodes := array(select u.id from unnest(v_nodes) u(id) order by u.id);
@@ -1058,7 +1137,7 @@ begin
     select format('function %s', p.oid::regprocedure) as object, a.grantee
     from pg_proc p, aclexplode(p.proacl) a
     where p.oid in (
-      'gnomon.erasing()'::regprocedure,
+      'gnomon.running_as_definer()'::regprocedure,
       'gnomon.version_erasure_update()'::regprocedure,
       'gnomon.edge_await_endpoints()'::regprocedure,
       'gnomon.kind_merge_rule_at(uuid, text, timestamptz)'::regprocedure,
@@ -1073,7 +1152,7 @@ begin
       'revoke all on %s from %s', g.object,
       case when g.grantee = 0 then 'public' else g.grantee::regrole::text end);
   end loop;
-  revoke all on function gnomon.erasing() from public;
+  revoke all on function gnomon.running_as_definer() from public;
   revoke all on function gnomon.version_erasure_update() from public;
   revoke all on function gnomon.edge_await_endpoints() from public;
   revoke all on function gnomon.kind_merge_rule_at(uuid, text, timestamptz) from public;
@@ -1106,8 +1185,8 @@ end
 $$;
 
 -- Every caller fires the guard triggers, whose conditions call
--- `gnomon.erasing()`, and the write path calls the merge.
-grant execute on function gnomon.erasing() to authenticated, gnomon_worker, gnomon_definer;
+-- `gnomon.running_as_definer()`, and the write path calls the merge.
+grant execute on function gnomon.running_as_definer() to authenticated, gnomon_worker, gnomon_definer;
 grant execute on function gnomon.merge_versions(
   uuid, text, uuid, boolean, timestamptz, timestamptz, timestamptz, text, boolean)
   to authenticated, gnomon_worker, gnomon_definer;

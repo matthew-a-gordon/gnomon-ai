@@ -23,16 +23,17 @@ use serde_json::{json, Map, Value};
 use support::TestDb;
 
 const SCOPE: &str = "support";
-const RANKED_KIND: &str = "ranked_thing";
+const RANKED_KIND: &str = "ranked_person";
 
 /// Day `d` of the Valid-time axis, which may be fractional.
 fn at(d: f64) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap() + Duration::minutes((d * 1440.0) as i64)
 }
 
-/// One Episode: its Reference time in whole days and its Authority.
+/// What the oracle needs of one Episode: its Reference time in whole days
+/// and its Authority.
 #[derive(Debug, Clone, Copy)]
-struct Source {
+struct EpisodeTraits {
     reference_day: u32,
     authority: i32,
 }
@@ -68,7 +69,7 @@ impl Write {
 #[derive(Debug, Clone)]
 struct Case {
     ranked: bool,
-    sources: Vec<Source>,
+    episodes: Vec<EpisodeTraits>,
     /// Transactions of one to three writes each.
     sequence: Vec<Vec<Write>>,
     /// The order the Episodes are erased in.
@@ -80,8 +81,8 @@ fn case() -> impl Strategy<Value = Case> {
         any::<bool>(),
         proptest::collection::vec((1..4u32, 0..3i32), 2..5),
     )
-        .prop_flat_map(|(ranked, sources)| {
-            let n = sources.len();
+        .prop_flat_map(|(ranked, traits)| {
+            let n = traits.len();
             let value = |xs: &'static [&'static str]| {
                 prop_oneof![
                     2 => Just(None),
@@ -114,9 +115,9 @@ fn case() -> impl Strategy<Value = Case> {
             (
                 Just(ranked),
                 Just(
-                    sources
+                    traits
                         .into_iter()
-                        .map(|(reference_day, authority)| Source {
+                        .map(|(reference_day, authority)| EpisodeTraits {
                             reference_day,
                             authority,
                         })
@@ -126,9 +127,9 @@ fn case() -> impl Strategy<Value = Case> {
                 Just((0..n).collect::<Vec<_>>()).prop_shuffle(),
             )
         })
-        .prop_map(|(ranked, sources, sequence, erasures)| Case {
+        .prop_map(|(ranked, traits, sequence, erasures)| Case {
             ranked,
-            sources,
+            episodes: traits,
             sequence,
             erasures,
         })
@@ -154,7 +155,7 @@ fn oracle(
             .flat_map(|(t, tx)| tx.iter().enumerate().map(move |(i, w)| (t, i, w)))
             .filter(|(_, _, w)| !erased.contains(&w.episode) && w.covers(d))
             .filter_map(|(t, i, w)| {
-                let s = case.sources[w.episode];
+                let s = case.episodes[w.episode];
                 let authority = if case.ranked { s.authority } else { 0 };
                 w.values()
                     .get(property)
@@ -229,13 +230,13 @@ fn as_of_reads_after_every_erasure_agree_with_an_oracle_over_the_remaining_contr
 async fn check(store: &Store, tenant: TenantId, case: &Case) -> (Vec<String>, usize, usize) {
     let caller = store.as_worker(tenant, Scope::new(SCOPE));
     let mut episodes: Vec<EpisodeId> = Vec::new();
-    for (i, s) in case.sources.iter().enumerate() {
+    for (i, s) in case.episodes.iter().enumerate() {
         episodes.push(
             caller
                 .record_episode(&NewEpisode {
                     tenant: Some(tenant),
                     scope: Scope::new(SCOPE),
-                    content: format!("source {i}: {s:?}"),
+                    content: format!("Episode {i}: {s:?}"),
                     reference_time: at(f64::from(s.reference_day)),
                     authority: Some(s.authority),
                 })

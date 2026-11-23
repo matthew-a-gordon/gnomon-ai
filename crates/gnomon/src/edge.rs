@@ -148,7 +148,8 @@ pub struct EpisodeErasure {
     /// The Nodes the Episode touched whose Versions were recomputed from the
     /// Contributions that remain, in order of ID.
     pub recomputed_nodes: Vec<NodeId>,
-    /// The Edges recomputed so, in order of ID.
+    /// The Edges the Episode touched whose Versions were recomputed, in order
+    /// of ID.
     pub recomputed_edges: Vec<EdgeId>,
     /// The Nodes erased because nothing was left of them and no Edge joined
     /// them, in order of ID.

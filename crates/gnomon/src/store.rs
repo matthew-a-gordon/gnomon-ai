@@ -1135,13 +1135,14 @@ impl Caller<'_> {
         }
     }
 
-    /// Erases an Episode (ADR-0003, ADR-0007): deletes it, its
-    /// Contributions, its statements, its Citations and every Version derived
-    /// from it alone, and recomputes every Version it touched, current and
-    /// closed, from the Contributions that remain, each under the merge rule
-    /// it recorded, in one transaction. As-of reads afterwards return the
-    /// history as if the Episode had never existed. A Node or Edge left with
-    /// nothing is erased too, a Node only once no Edge joins it.
+    /// Erases an Episode (ADR-0003, ADR-0007). In one transaction it deletes
+    /// the Episode, its Contributions, its statements, its Citations and
+    /// every Version derived from it alone. It recomputes every Version the
+    /// Episode touched, current and closed, from the Contributions that
+    /// remain, each under the merge rule it recorded. As-of reads afterwards
+    /// return the history as if the Episode had never existed. A Node or
+    /// Edge left with nothing is erased too, and a Node only once no Edge
+    /// joins it.
     ///
     /// Erasure is a definer function that the migrations grant to no caller
     /// role, so a call fails with [`Error::Database`] carrying

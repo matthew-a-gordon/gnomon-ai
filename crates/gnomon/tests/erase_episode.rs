@@ -787,7 +787,7 @@ async fn a_statement_that_lost_to_the_erased_higher_authority_episode_takes_effe
 }
 
 #[tokio::test]
-async fn erasing_the_episode_behind_a_retraction_makes_the_retracted_fact_current_again() {
+async fn erasing_the_episode_behind_a_retraction_makes_the_retracted_version_current_again() {
     let w = World::new().await;
     let f = w.episode(at(2024, 1, 1), None).await;
     let e = w.episode(at(2024, 2, 1), None).await;
@@ -1071,7 +1071,28 @@ async fn a_write_to_an_affected_node_waits_for_the_erasure_to_commit_and_one_to_
     .await
     .expect("a write to an unaffected Node does not wait")
     .unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Both wait on an advisory lock the Erasure holds.
+    let admin = w.db.admin().await;
+    let mut waiting = 0;
+    for _ in 0..200 {
+        waiting = admin
+            .query_typed(
+                "select count(*) from pg_locks where locktype = 'advisory' and not granted
+                 and database = (select oid from pg_database where datname = current_database())",
+                &[],
+            )
+            .await
+            .unwrap()[0]
+            .get::<_, i64>(0);
+        if waiting >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        waiting, 2,
+        "the affected write and the Edge do not wait on the Erasure"
+    );
     assert!(
         !write_affected.is_finished(),
         "the affected write did not wait"
@@ -1282,4 +1303,115 @@ async fn without_the_deployments_grant_erasure_fails_and_an_erased_episode_canno
     w.erase(e).await;
     let again = w.caller().erase_episode(w.tenant, e).await.unwrap_err();
     assert!(matches!(again, gnomon::Error::InvalidWrite(_)), "{again:?}");
+}
+
+#[tokio::test]
+async fn a_node_an_edge_in_a_scope_the_caller_cannot_see_still_joins_stays_bare() {
+    let w = World::new().await;
+    let e = w.episode(at(2024, 1, 1), None).await;
+    let a = w
+        .node("account", e, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    // A worker of another Scope joins a with an Edge of its own.
+    let billing = w.store.as_worker(w.tenant, Scope::new("billing"));
+    let f = billing
+        .record_episode(&NewEpisode {
+            tenant: Some(w.tenant),
+            scope: Scope::new("billing"),
+            content: "billing's Episode".into(),
+            reference_time: at(2024, 1, 2),
+            authority: None,
+        })
+        .await
+        .unwrap();
+    let acme = billing
+        .create_node(
+            &NewNode {
+                tenant: Some(w.tenant),
+                scope: Scope::new("billing"),
+                kind: "company".into(),
+            },
+            &Patch::new(f, ValidTime::UNKNOWN, values(json!({ "name": "Acme" }))),
+        )
+        .await
+        .unwrap()
+        .0;
+    let both = w.store.as_user(values(json!({
+        "role": "authenticated",
+        "app_metadata": { "tenant_id": w.tenant.0.to_string(), "scopes": [SCOPE, "billing"] }
+    })));
+    let hidden = both
+        .create_edge(
+            &NewEdge {
+                tenant: Some(w.tenant),
+                scope: Scope::new("billing"),
+                kind: "owns".into(),
+                source: a,
+                target: acme,
+            },
+            &Patch::new(f, ValidTime::UNKNOWN, values(json!({ "share": 3 }))),
+        )
+        .await
+        .unwrap()
+        .0;
+
+    // The support worker cannot see the Edge, yet the Erasure goes on, and a
+    // stays as a bare identity because the Edge still joins it.
+    let erasure = w.erase(e).await;
+    assert!(erasure.erased_nodes.is_empty(), "{erasure:?}");
+    assert_eq!(erasure.recomputed_nodes, vec![a]);
+    assert!(w.exists("node", a.0).await);
+    assert!(w.exists("edge", hidden.0).await);
+    assert_eq!(w.read(a, at(2024, 1, 1)).await, None);
+}
+
+#[tokio::test]
+async fn another_episodes_retraction_of_a_version_only_the_erased_episode_supplied_goes_with_it() {
+    let w = World::new().await;
+    let f = w.episode(at(2024, 1, 1), None).await;
+    let e = w.episode(at(2024, 2, 1), None).await;
+    let g = w.episode(at(2024, 3, 1), None).await;
+    let acct = w
+        .node("account", f, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    w.write(
+        acct,
+        e,
+        ValidTime::between(at(2024, 3, 1), at(2024, 6, 1)),
+        json!({ "plan": "gold" }),
+    )
+    .await;
+    let only_e = w.read(acct, at(2024, 4, 1)).await.unwrap().id;
+    // G retracts the Version only E supplied, so nothing holds over E's
+    // Valid time.
+    w.caller()
+        .retract_node_version(
+            w.tenant,
+            acct,
+            &Retraction {
+                episode: g,
+                version: only_e,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(w.read(acct, at(2024, 4, 1)).await, None);
+
+    w.erase(e).await;
+
+    // As if E never existed, G retracted nothing, and F's plan holds over
+    // what was E's Valid time.
+    for month in [1, 4, 7] {
+        assert_eq!(
+            w.current_values(acct, at(2024, month, 15)).await,
+            Some(json!({ "plan": "basic" })),
+            "month {month}"
+        );
+    }
+    assert!(w
+        .caller()
+        .list_node_statements(w.tenant, acct)
+        .await
+        .unwrap()
+        .is_empty());
 }
