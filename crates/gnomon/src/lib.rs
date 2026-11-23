@@ -18,7 +18,7 @@ use tokio_postgres::error::SqlState;
 use uuid::Uuid;
 
 pub use connect::{ConnectOptions, Tls};
-pub use kind::{Kind, KindOf, NewKind, ROOT_EDGE_KIND, ROOT_NODE_KIND};
+pub use kind::{Kind, KindOf, MergeRule, NewKind, ROOT_EDGE_KIND, ROOT_NODE_KIND};
 pub use node::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, NewNode, NodeId,
     NodeVersion, Patch, Precision, ValidTime, VersionId, WriteOutcome, WriteStatus,

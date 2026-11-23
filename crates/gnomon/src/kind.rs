@@ -43,6 +43,37 @@ impl KindOf {
     }
 }
 
+/// The rule that chooses a Version's values from its Contributions
+/// (ADR-0007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeRule {
+    /// The latest Reference time wins, then the latest Recorded time. This is
+    /// the rule of every Kind until it turns ranked merge on.
+    Recency,
+    /// The highest Authority wins, then the latest Reference time, then the
+    /// latest Recorded time. Authority decides only between Contributions
+    /// whose Valid times overlap, and it ranks a Correction, an End of
+    /// validity and a Retraction as it ranks a value.
+    Ranked,
+}
+
+impl MergeRule {
+    pub(crate) fn as_sql(self) -> &'static str {
+        match self {
+            MergeRule::Recency => "recency",
+            MergeRule::Ranked => "ranked",
+        }
+    }
+
+    pub(crate) fn from_sql(s: &str) -> MergeRule {
+        match s {
+            "recency" => MergeRule::Recency,
+            "ranked" => MergeRule::Ranked,
+            other => panic!("the Store returned merge rule {other:?}"),
+        }
+    }
+}
+
 /// A Kind to register in one Tenant's Ontology.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewKind {

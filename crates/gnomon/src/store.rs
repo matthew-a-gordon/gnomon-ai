@@ -36,8 +36,8 @@ use crate::connect::ConnectOptions;
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Episode,
-    EpisodeId, Error, Kind, KindOf, NewEpisode, NewKind, NewNode, NodeId, NodeVersion, Patch,
-    Precision, Scope, TenantId, ValidTime, VersionId, WriteOutcome, WriteStatus,
+    EpisodeId, Error, Kind, KindOf, MergeRule, NewEpisode, NewKind, NewNode, NodeId, NodeVersion,
+    Patch, Precision, Scope, TenantId, ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -404,6 +404,61 @@ impl Caller<'_> {
         Ok(registered.expect("a Kind just registered is visible to its registrant"))
     }
 
+    /// Sets a Kind's own merge rule. Ranked merge orders a Node's values by
+    /// Authority, then Reference time, then Recorded time (ADR-0007). A
+    /// Kind below a Kind that ranks inherits the rule, and cannot turn it
+    /// off: the call fails with [`Error::InvalidKind`]. A change applies to
+    /// later writes only. It changes no existing Version.
+    ///
+    /// The deployment decides who may set it: without its EXECUTE grant on
+    /// `gnomon.set_merge_rule`, the call fails with `insufficient_privilege`.
+    pub async fn set_merge_rule(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        kind: &str,
+        rule: MergeRule,
+    ) -> Result<(), Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        self.store
+            .statements
+            .query(
+                &tx,
+                "select gnomon.set_merge_rule($1, $2, $3)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&kind, Type::TEXT),
+                    (&rule.as_sql(), Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The merge rule a Kind has in the Tenant's Ontology: ranked if it or
+    /// any ancestor ranks, else recency.
+    pub async fn merge_rule(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        kind: &str,
+    ) -> Result<MergeRule, Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
+                "select gnomon.kind_merge_rule($1, $2)",
+                &[(&tenant.0, Type::UUID), (&kind, Type::TEXT)],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(MergeRule::from_sql(rows[0].get(0)))
+    }
+
     /// Reads a Kind of the Tenant's Ontology, a root Kind included, or `None`
     /// if this caller's Tenant has no such Kind.
     pub async fn read_kind(
@@ -547,7 +602,8 @@ impl Caller<'_> {
                 "select id, node_id, scope, kind, props,
                         nullif(valid_from, '-infinity'), valid_from_precision::text,
                         nullif(valid_to, 'infinity'), valid_to_precision::text,
-                        recorded_from, nullif(recorded_to, 'infinity'), uncertain, text_hash
+                        recorded_from, nullif(recorded_to, 'infinity'), uncertain, text_hash,
+                        merge_rule::text
                  from gnomon.read_node($1, $2, $3, $4)",
                 &[
                     (&tenant.0, Type::UUID),
@@ -577,6 +633,7 @@ impl Caller<'_> {
                 recorded_to: r.get(10),
                 uncertain: r.get(11),
                 text_hash: r.get(12),
+                merge_rule: MergeRule::from_sql(r.get(13)),
             }
         }))
     }
@@ -698,7 +755,9 @@ async fn write_patch(
                 .collect(),
         )
     });
-    let rows = statements.query(tx,
+    let rows = statements
+        .query(
+            tx,
             "select status, recorded_at, versions
              from gnomon.write_node($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             &[

@@ -55,6 +55,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0006_bound_precision",
         template: include_str!("../migrations/0006_bound_precision.sql"),
     },
+    Migration {
+        version: 7,
+        name: "0007_ranked_merge",
+        template: include_str!("../migrations/0007_ranked_merge.sql"),
+    },
 ];
 
 /// The schema version this build of the Store expects: the last migration's.

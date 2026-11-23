@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-use crate::{EpisodeId, Scope, TenantId};
+use crate::{EpisodeId, MergeRule, Scope, TenantId};
 
 /// The ID of a Node, a UUID v7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -253,6 +253,9 @@ pub struct NodeVersion {
     /// so a Refinement shares the earlier Version's and needs no new
     /// embedding.
     pub text_hash: String,
+    /// The rule that chose this Version's values. A change to a Kind's rule
+    /// leaves it as it was (ADR-0007).
+    pub merge_rule: MergeRule,
 }
 
 /// Which bound of a Version's Valid time a statement is about.

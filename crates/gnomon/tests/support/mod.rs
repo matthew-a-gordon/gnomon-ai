@@ -101,6 +101,10 @@ pub const REGISTER_KIND: &str =
     "gnomon.register_kind(uuid, text, text, text, jsonb, text[], text[], text[])";
 
 /// The embedding dimension the suites export with unless a test chooses one.
+/// The merge rule setter's signature, which a deployment grants like Kind
+/// registration.
+pub const SET_MERGE_RULE: &str = "gnomon.set_merge_rule(uuid, text, text)";
+
 pub const DEFAULT_DIMENSION: u32 = 1536;
 
 pub struct TestDb {
@@ -407,11 +411,12 @@ impl TestDb {
     /// What a deployment does to let `role` register Kinds. The migrations
     /// grant Kind registration to no one (ADR-0009).
     pub async fn grant_kind_registration(&self, role: &str) {
+        let role = quote_ident(role);
         self.admin()
             .await
             .batch_execute(&format!(
-                "grant execute on function {REGISTER_KIND} to {}",
-                quote_ident(role)
+                "grant execute on function {REGISTER_KIND} to {role};
+                 grant execute on function {SET_MERGE_RULE} to {role}"
             ))
             .await
             .expect("grant Kind registration");
