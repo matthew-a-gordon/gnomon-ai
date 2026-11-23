@@ -95,7 +95,7 @@ pub struct Server {
     /// pooler in a pooler lane, otherwise the server itself.
     callers: (String, u16),
     /// The user name the login role connects with: the role itself, or
-    /// `<role>.<tenant>` behind Supavisor.
+    /// `<role>.<Supavisor tenant>` behind Supavisor.
     pub(super) login_user: String,
     pub(super) migration_role: Option<String>,
     lock_path: PathBuf,
@@ -226,14 +226,15 @@ impl Lock {
 }
 
 /// An environment variable, if it is set and not empty.
-fn env(name: &str) -> Option<String> {
+pub(super) fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-/// The login role's user name: `GNOMON_TEST_POOLER_TENANT`, when set, is
-/// Supavisor's tenant, which it reads from the user name's suffix.
+/// The login role's user name. `GNOMON_TEST_SUPAVISOR_TENANT`, when set,
+/// names a Supavisor tenant, which Supavisor reads from the suffix of the
+/// user name. That tenant is Supavisor's, not a gnomon Tenant.
 fn login_user() -> String {
-    match env("GNOMON_TEST_POOLER_TENANT") {
+    match env("GNOMON_TEST_SUPAVISOR_TENANT") {
         Some(tenant) => format!("{}.{tenant}", super::LOGIN_ROLE),
         None => super::LOGIN_ROLE.to_owned(),
     }

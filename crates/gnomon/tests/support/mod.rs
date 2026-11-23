@@ -55,11 +55,24 @@ pub fn connect_options() -> gnomon::ConnectOptions {
 
 /// Whether `GNOMON_TEST_NAMED_STATEMENTS` turns named statements on.
 pub fn named_statements_from_env() -> bool {
-    match std::env::var("GNOMON_TEST_NAMED_STATEMENTS").as_deref() {
-        Err(_) | Ok("") | Ok("0") => false,
-        Ok("1") => true,
-        Ok(other) => panic!("GNOMON_TEST_NAMED_STATEMENTS={other:?}: use 0 or 1"),
+    match server::env("GNOMON_TEST_NAMED_STATEMENTS").as_deref() {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("GNOMON_TEST_NAMED_STATEMENTS={other:?}: use 0 or 1"),
     }
+}
+
+/// An error with every error under it, where the reason is: Postgres's
+/// message, or why a TLS handshake failed.
+pub fn chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        source = s.source();
+    }
+    out
 }
 
 /// A new Tenant, unknown to every other test.

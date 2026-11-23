@@ -11,19 +11,6 @@ use gnomon::{ConnectOptions, Store, Tls};
 use support::tls::{self, Answer, TestCa};
 use support::TestDb;
 
-/// The text of an error and of every error under it, which is where the
-/// TLS failure's reason is.
-fn chain(e: &dyn std::error::Error) -> String {
-    let mut out = e.to_string();
-    let mut source = e.source();
-    while let Some(s) = source {
-        out.push_str(": ");
-        out.push_str(&s.to_string());
-        source = s.source();
-    }
-    out
-}
-
 #[tokio::test]
 async fn by_default_the_store_refuses_a_server_whose_certificate_it_does_not_trust() {
     let db = TestDb::migrated().await;
@@ -36,9 +23,9 @@ async fn by_default_the_store_refuses_a_server_whose_certificate_it_does_not_tru
 
     match Store::connect(&db.login_url_through(proxy), &ConnectOptions::default()).await {
         Err(e) => assert!(
-            chain(&e).contains("UnknownIssuer"),
+            support::chain(&e).contains("UnknownIssuer"),
             "expected an untrusted certificate, got {}",
-            chain(&e)
+            support::chain(&e)
         ),
         Ok(_) => panic!("the Store trusted a certificate from a CA it was never given"),
     }
@@ -79,9 +66,9 @@ async fn the_store_refuses_a_trusted_certificate_that_names_another_host() {
 
     match Store::connect(&db.login_url_through(proxy), &options).await {
         Err(e) => assert!(
-            chain(&e).contains("not valid for name"),
+            support::chain(&e).contains("not valid for name"),
             "expected a certificate for another name, got {}",
-            chain(&e)
+            support::chain(&e)
         ),
         Ok(_) => panic!("the Store accepted a certificate issued for another host"),
     }
@@ -94,9 +81,9 @@ async fn by_default_the_store_never_falls_back_to_plain_text_when_the_server_ref
 
     match Store::connect(&db.login_url_through(proxy), &ConnectOptions::default()).await {
         Err(e) => assert!(
-            chain(&e).contains("TLS"),
+            support::chain(&e).contains("TLS"),
             "expected a refused TLS request, got {}",
-            chain(&e)
+            support::chain(&e)
         ),
         Ok(_) => panic!("the Store connected in plain text to a server that refused TLS"),
     }

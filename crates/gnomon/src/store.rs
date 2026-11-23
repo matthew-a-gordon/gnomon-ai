@@ -90,31 +90,30 @@ impl Store {
     pub async fn connect(connection: &str, options: &ConnectOptions) -> Result<Store, Error> {
         let mut config: Config = connection.parse()?;
         let ssl_mode = config.get_ssl_mode();
-        let mut client = if options.tls.is_plaintext() {
-            if matches!(ssl_mode, SslMode::Require) {
-                return Err(Error::InvalidConnection(
-                    "the connection string sets sslmode=require, but the Store's TLS setting \
-                     is Tls::plaintext()"
-                        .into(),
-                ));
+        let mut client = match options.tls.connector()? {
+            None => {
+                if matches!(ssl_mode, SslMode::Require) {
+                    return Err(Error::InvalidConnection(
+                        "the connection string sets sslmode=require, but the Store's TLS \
+                         setting is Tls::plaintext()"
+                            .into(),
+                    ));
+                }
+                config.ssl_mode(SslMode::Disable);
+                spawn_connection(config.connect(NoTls).await?)
             }
-            config.ssl_mode(SslMode::Disable);
-            spawn_connection(config.connect(NoTls).await?)
-        } else {
-            if matches!(ssl_mode, SslMode::Disable) {
-                return Err(Error::InvalidConnection(
-                    "the connection string sets sslmode=disable, which does not turn TLS off; \
-                     connect with Tls::plaintext() to connect without TLS"
-                        .into(),
-                ));
+            Some(tls) => {
+                if matches!(ssl_mode, SslMode::Disable) {
+                    return Err(Error::InvalidConnection(
+                        "the connection string sets sslmode=disable, which does not turn TLS \
+                         off; connect with Tls::plaintext() to connect without TLS"
+                            .into(),
+                    ));
+                }
+                // Never fall back to plain text, as libpq's default `prefer` does.
+                config.ssl_mode(SslMode::Require);
+                spawn_connection(config.connect(tls).await?)
             }
-            // Never fall back to plain text, as libpq's default `prefer` does.
-            config.ssl_mode(SslMode::Require);
-            let tls = options
-                .tls
-                .connector()?
-                .expect("a TLS mode other than plain text has a connector");
-            spawn_connection(config.connect(tls).await?)
         };
         let statements = Statements::new(options.named_statements);
         let embedding_dimension = check_schema(&mut client, &statements).await?;

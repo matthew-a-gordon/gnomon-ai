@@ -119,18 +119,17 @@ impl Tls {
         Tls(Mode::Plaintext)
     }
 
-    pub(crate) fn is_plaintext(&self) -> bool {
-        matches!(self.0, Mode::Plaintext)
-    }
-
     /// The connector for a TLS mode, or `None` for plain text.
     pub(crate) fn connector(&self) -> Result<Option<MakeRustlsConnect>, Error> {
+        if matches!(self.0, Mode::Plaintext) {
+            return Ok(None);
+        }
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let builder = ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .map_err(|e| Error::InvalidConnection(format!("TLS: {e}")))?;
         let config = match &self.0 {
-            Mode::Plaintext => return Ok(None),
+            Mode::Plaintext => unreachable!("returned above"),
             Mode::PlatformRoots => builder
                 .with_root_certificates(platform_roots()?)
                 .with_no_client_auth(),

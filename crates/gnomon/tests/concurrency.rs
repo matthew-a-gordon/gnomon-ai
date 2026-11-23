@@ -25,35 +25,28 @@ const STORES: usize = 24;
 const BYSTANDERS: usize = 6;
 const ROUNDS: usize = 20;
 
-/// One caller: its Tenant, shared with one sibling in another Scope, and
-/// whether it is an end user or a worker.
+#[derive(Clone, Copy)]
+enum Role {
+    User,
+    Worker,
+}
+
+/// Who one caller is: its Tenant, shared with one sibling in another Scope,
+/// its Scope, and whether it is an end user or a worker.
 #[derive(Clone)]
-struct Who {
+struct Identity {
     tenant: TenantId,
     scope: String,
-    worker: bool,
+    role: Role,
 }
 
-impl Who {
+impl Identity {
     fn caller<'s>(&self, store: &'s Store) -> Caller<'s> {
-        if self.worker {
-            store.as_worker(self.tenant, Scope::new(&self.scope))
-        } else {
-            store.as_user(support::user(self.tenant, &[&self.scope]))
+        match self.role {
+            Role::Worker => store.as_worker(self.tenant, Scope::new(&self.scope)),
+            Role::User => store.as_user(support::user(self.tenant, &[&self.scope])),
         }
     }
-}
-
-/// An error with every error under it, where Postgres's message is.
-fn chain(e: &dyn std::error::Error) -> String {
-    let mut out = e.to_string();
-    let mut source = e.source();
-    while let Some(s) = source {
-        out.push_str(": ");
-        out.push_str(&s.to_string());
-        source = s.source();
-    }
-    out
 }
 
 /// The latest Episode each caller recorded, for the others to try to read.
@@ -61,7 +54,7 @@ type Latest = Arc<Mutex<Vec<Option<EpisodeId>>>>;
 
 async fn run_caller(
     i: usize,
-    who: Vec<Who>,
+    who: Vec<Identity>,
     store: Store,
     latest: Latest,
     start: Arc<Barrier>,
@@ -85,7 +78,7 @@ async fn run_caller(
                 authority: None,
             })
             .await
-            .map_err(|e| format!("caller {i} round {round}: record: {}", chain(&e)))?;
+            .map_err(|e| format!("caller {i} round {round}: record: {}", support::chain(&e)))?;
         latest.lock().unwrap()[i] = Some(id);
 
         let read = caller
@@ -94,7 +87,7 @@ async fn run_caller(
             .map_err(|e| {
                 format!(
                     "caller {i} round {round}: read its own Episode: {}",
-                    chain(&e)
+                    support::chain(&e)
                 )
             })?
             .ok_or_else(|| format!("caller {i} round {round}: its own Episode is not visible"))?;
@@ -115,7 +108,7 @@ async fn run_caller(
                         e.scope
                     ))
                 }
-                Err(e) => return Err(format!("caller {i} round {round}: {}", chain(&e))),
+                Err(e) => return Err(format!("caller {i} round {round}: {}", support::chain(&e))),
             }
         }
 
@@ -129,7 +122,7 @@ async fn run_caller(
                          ran with this caller's claims and read {found:?}"
                     ))
                 }
-                Err(e) => return Err(format!("caller {i} round {round}: {}", chain(&e))),
+                Err(e) => return Err(format!("caller {i} round {round}: {}", support::chain(&e))),
             }
         }
     }
@@ -147,7 +140,7 @@ async fn run_bystander(
     let mut checks = 0;
     // At least a few checks, however fast the callers finish.
     while !done.load(Ordering::Relaxed) || checks < 20 {
-        let tx = client.transaction().await.map_err(|e| chain(&e))?;
+        let tx = client.transaction().await.map_err(|e| support::chain(&e))?;
         let row = tx
             .query_typed(
                 "select current_user::text, \
@@ -156,9 +149,9 @@ async fn run_bystander(
                 &[],
             )
             .await
-            .map_err(|e| chain(&e))?
+            .map_err(|e| support::chain(&e))?
             .remove(0);
-        tx.commit().await.map_err(|e| chain(&e))?;
+        tx.commit().await.map_err(|e| support::chain(&e))?;
         let (user, claims, role): (String, String, String) = (row.get(0), row.get(1), row.get(2));
         if user != LOGIN_ROLE || !claims.is_empty() || role != "none" {
             return Err(format!(
@@ -174,11 +167,11 @@ async fn run_bystander(
 async fn concurrent_callers_never_see_another_callers_tenant_or_claims() {
     let db = TestDb::migrated().await;
     let tenants: Vec<TenantId> = (0..STORES / 2).map(|_| support::tenant()).collect();
-    let who: Vec<Who> = (0..STORES)
-        .map(|i| Who {
+    let who: Vec<Identity> = (0..STORES)
+        .map(|i| Identity {
             tenant: tenants[i / 2],
             scope: format!("scope-{i}"),
-            worker: i % 3 == 0,
+            role: if i % 3 == 0 { Role::Worker } else { Role::User },
         })
         .collect();
 

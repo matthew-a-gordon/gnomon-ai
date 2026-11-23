@@ -10,7 +10,8 @@
 #                     container, with unnamed statements, the Store's default.
 #   pgbouncer-named   The same PgBouncer, with GNOMON_TEST_NAMED_STATEMENTS=1.
 #                     PgBouncer 1.21 and later support named statements when
-#                     max_prepared_statements is above 0, which its default is.
+#                     max_prepared_statements is above 0. It has defaulted to
+#                     200 since 1.24.
 #   supavisor         The Supabase CLI local stack with only the database and
 #                     Supavisor running, with unnamed statements.
 #
@@ -20,16 +21,23 @@
 # harness builds templates and creates each test's database. Each run prints
 # the pooler's settings before the suite starts.
 #
-# Everything is named gnomon-t5. The PgBouncer containers publish on loopback
-# with ports Docker picks. The CLI stack uses ports 56050 to 56059 only. The
+# The PgBouncer containers and their network are named with
+# GNOMON_TEST_CONTAINER_PREFIX (default gnomon-t5), and publish on loopback
+# with ports Docker picks. The CLI stack's project id is gnomon-t5, in
+# supabase/config.toml beside this script. The CLI stack uses ports 56050 to 56059 only. The
 # script removes what it started, and nothing else, whether the run passed or
-# not. Needs Docker, npx, and the images edoburu/pgbouncer,
-# pgvector/pgvector:pg17 and supabase/supavisor:2.10.1.
+# not. Needs Docker, npx, and the images edoburu/pgbouncer (pinned below),
+# pgvector/pgvector:pg17 and supabase/supavisor:2.10.1, which the pinned CLI
+# runs.
 set -euo pipefail
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 
-name=gnomon-t5
+name=${GNOMON_TEST_CONTAINER_PREFIX:-gnomon-t5}
+project=gnomon-t5
 workdir=crates/gnomon/tests/support/pooler
+# PgBouncer 1.26.1. Pinned by digest, so a later pull cannot change the
+# defaults a run uses.
+pgbouncer_image=edoburu/pgbouncer@sha256:8638aa563607256d3c7440437534195f1066a92b68015d89ae9d6b935b444a6d
 cli=(npx --yes supabase@3.2.0)
 password=gnomon-test
 poolers=${LANE4_POOLERS:-pgbouncer pgbouncer-named supavisor}
@@ -39,7 +47,7 @@ stop_pgbouncer() {
   docker network rm "$name-net" >/dev/null 2>&1 || true
 }
 stop_supavisor() {
-  "${cli[@]}" stop --workdir "$workdir" --project-id "$name" --no-backup >/dev/null 2>&1 || true
+  "${cli[@]}" stop --workdir "$workdir" --project-id "$project" --no-backup >/dev/null 2>&1 || true
 }
 cleanup() {
   stop_pgbouncer
@@ -89,7 +97,7 @@ start_pgbouncer() {
     -p 127.0.0.1::5432 \
     -e DB_HOST="$name-postgres" -e DB_USER=postgres -e DB_PASSWORD="$password" \
     -e AUTH_TYPE=scram-sha-256 -e POOL_MODE=transaction \
-    edoburu/pgbouncer >/dev/null
+    "$pgbouncer_image" >/dev/null
   wait_for "$name-net" "host=$name-pgbouncer user=postgres dbname=postgres"
 
   echo "== PgBouncer settings"
@@ -101,7 +109,7 @@ start_pgbouncer() {
 
   export GNOMON_TEST_DATABASE_URL="postgres://postgres:$password@127.0.0.1:$(host_port "$name-pgbouncer")/postgres"
   export GNOMON_TEST_DIRECT_DATABASE_URL="postgres://postgres:$password@127.0.0.1:$(host_port "$name-postgres")/postgres"
-  unset GNOMON_TEST_MIGRATION_ROLE GNOMON_TEST_MIGRATION_PASSWORD GNOMON_TEST_POOLER_TENANT
+  unset GNOMON_TEST_MIGRATION_ROLE GNOMON_TEST_MIGRATION_PASSWORD GNOMON_TEST_SUPAVISOR_TENANT
 }
 
 start_supavisor() {
@@ -122,23 +130,24 @@ start_supavisor() {
   "${cli[@]}" start --workdir "$workdir"
 
   echo "== Supavisor settings"
-  docker inspect "supabase_pooler_$name" --format '{{.Config.Image}}'
+  docker inspect "supabase_pooler_$project" --format '{{.Config.Image}}'
   # The tenant the CLI registers, without its password, and the pooler's
   # environment, without its secrets. No NAMED_PREPARED_STATEMENTS flag is
   # set, so named statements are off, Supavisor's default.
-  docker exec "supabase_pooler_$name" cat /app/pooler_tenant.exs |
+  docker exec "supabase_pooler_$project" cat /app/pooler_tenant.exs |
     sed -n '/^params = %{/,/^}/p' | sed -E 's/("db_password" => ")[^"]*/\1<redacted>/'
-  docker inspect "supabase_pooler_$name" --format '{{range .Config.Env}}{{println .}}{{end}}' |
+  docker inspect "supabase_pooler_$project" --format '{{range .Config.Env}}{{println .}}{{end}}' |
     grep -v -E 'KEY|SECRET|PASSWORD|DATABASE_URL|^PATH=|^LANG|^LC_' | grep .
-  PGPASSWORD=postgres psql_on "supabase_network_$name" \
-    "host=supabase_db_$name user=supabase_admin dbname=postgres" -tAc 'select version()'
+  PGPASSWORD=postgres psql_on "supabase_network_$project" \
+    "host=supabase_db_$project user=supabase_admin dbname=postgres" -tAc 'select version()'
 
   export GNOMON_TEST_DATABASE_URL="postgres://postgres:postgres@127.0.0.1:56053/postgres"
   export GNOMON_TEST_DIRECT_DATABASE_URL="postgres://supabase_admin:postgres@127.0.0.1:56052/postgres"
   export GNOMON_TEST_MIGRATION_ROLE=postgres
   export GNOMON_TEST_MIGRATION_PASSWORD=postgres
-  # Supavisor reads its tenant from the user name: gnomon_test_login.pooler-dev.
-  export GNOMON_TEST_POOLER_TENANT=pooler-dev
+  # Supavisor reads its own tenant, not a gnomon Tenant, from the user name:
+  # gnomon_test_login.pooler-dev.
+  export GNOMON_TEST_SUPAVISOR_TENANT=pooler-dev
 }
 
 for run in $poolers; do
