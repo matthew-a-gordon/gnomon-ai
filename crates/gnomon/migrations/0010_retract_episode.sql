@@ -604,7 +604,13 @@ create function gnomon.retract_episode(p_tenant_id uuid, p_episode_id uuid)
         perform gnomon.write_ending_as(
           p_tenant_id, v.versioned_id, v.is_edge, p_episode_id, 'retraction', v.id, null, null,
           true);
-        v_done := v_done || v.id;
+        -- Under ranked merge a Retraction can lose, and then the Version stays
+        -- current: it is not retracted and is not reported.
+        if not exists (select from gnomon.version x
+                       where x.tenant_id = p_tenant_id and x.id = v.id
+                         and x.recorded_to = 'infinity') then
+          v_done := v_done || v.id;
+        end if;
       end if;
     end loop;
 
