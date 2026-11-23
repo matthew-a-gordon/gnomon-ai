@@ -136,8 +136,8 @@ async fn the_cli_applied_every_gnomon_migration_to_the_stack_as_postgres() {
         .get(0);
     assert_eq!(owner, "postgres", "the role that applied the migrations");
 
-    // The harness's login role, which the Store connects as.
-    let _template = support::TestDb::empty_with_login().await;
+    // Creates the harness's login role, which the Store connects as.
+    let _creates_the_login_role = support::TestDb::empty_with_login().await;
     gnomon::Store::connect_no_tls(&support::login_url_to("postgres").await)
         .await
         .expect("the Store accepts the schema the CLI applied");
@@ -190,7 +190,7 @@ async fn the_stack_exposes_no_schema_that_holds_what_the_migrations_created() {
     // PostgREST names the schemas it exposes when it refuses another.
     let (status, body) = rest(
         "GET",
-        "/rest/v1/schema_version",
+        "/rest/v1/any_table",
         &[("Accept-Profile", "pg_catalog")],
         "",
     )

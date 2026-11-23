@@ -4,8 +4,9 @@ The suite runs with plain `cargo test` or with `cargo nextest run`, and every te
 
 ## What runs where
 
-- `crates/gnomon/tests/export.rs` drives `gnomon migrations export` through the binary for the plain and supabase targets. It needs no database. It shows that a re-export after a new release adds only the new migrations, with Supabase versions after every migration already in the chain, and refuses to rewrite a released one. A unit test in `crates/gnomon/src/migrations.rs` exports a fake newer release on every target.
-- `crates/gnomon/tests/alembic.rs` drives the alembic target and checks the result with Alembic itself: the down-revision links `alembic history` reports, a single head, the consumer's own revisions before and after gnomon's, and `alembic upgrade head` giving a schema the Store accepts. It needs `uvx`, and its last test needs a database.
+- `crates/gnomon/tests/export.rs` drives `gnomon migrations export` through the binary for the plain and supabase targets. It needs no database. It shows that a re-export after a new release adds only the new migrations, with Supabase versions after every migration already in the chain, and refuses to rewrite a released one. It also compares the supabase and alembic output with the released copies in `crates/gnomon/tests/golden`, because consumers commit that output and a re-export refuses a released file that changed. A unit test in `crates/gnomon/src/migrations.rs` exports a fake newer release on every target.
+- `crates/gnomon/tests/supabase_target.rs` applies the supabase export with the Supabase CLI's own runner, `supabase migration up`, to a database of the suite's server: an earlier release, then a consumer's later migration, then the new release, of which the CLI applies only the new migration. It needs `npx`.
+- `crates/gnomon/tests/alembic.rs` drives the alembic target and checks the result with Alembic itself: the down-revision links `alembic history` reports, a single head, the consumer's own revisions before and after gnomon's, and `alembic upgrade head` giving a schema the Store accepts, first from an empty chain and then from an earlier release's. It needs `uvx`, and its last two tests need a database.
 - `crates/gnomon/tests/supabase_cli.rs` is lane 3 only, ignored elsewhere. On the Supabase CLI stack it shows that the CLI applied every gnomon migration as `postgres`, that PostgREST reaches no gnomon table or function, and that no schema PostgREST exposes holds what the migrations created.
 - `crates/gnomon/tests/store_api.rs` is seam 1: the Rust core's Store API against real Postgres.
 - `crates/gnomon/tests/kinds.rs` is seam 1 for Kind registration: registering and reading Kinds, and evaluating their compiled rules with `jsonb_path_match`.
@@ -60,7 +61,7 @@ The script needs Docker and `npx`. It:
 1. checks that ports 56030 to 56039 are free. The stack uses only that block, so it never collides with another project's stack on the CLI's default ports;
 2. exports the migrations with `--target supabase` into the CLI project in `crates/gnomon/tests/support/supabase`, whose `config.toml` sets `project_id = "gnomon-t3"` and runs only the database, Kong and PostgREST;
 3. starts the stack, so the CLI applies the migrations to its `postgres` database as `postgres`;
-4. runs `tests/supabase_cli.rs` with `--run-ignored only`, then the whole suite with `GNOMON_TEST_TARGET=supabase` and `GNOMON_TEST_DATABASE_URL` pointed at the stack;
+4. runs `tests/supabase_cli.rs` with `--run-ignored only`, then the whole suite with `GNOMON_TEST_TARGET=supabase` and `GNOMON_TEST_DATABASE_URL` pointed at the stack. `GNOMON_TEST_SUPABASE_API_URL` gives those tests the stack's API gateway, `http://127.0.0.1:56031`;
 5. stops the stack with `supabase stop --project-id gnomon-t3 --no-backup`, whether the run passed or not, and stops no other stack.
 
 To check that nothing is left: `docker ps -a --filter name=gnomon-t3`.

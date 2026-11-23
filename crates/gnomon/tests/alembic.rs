@@ -177,3 +177,41 @@ async fn alembic_upgrade_head_applies_a_schema_the_store_accepts() {
         "alembic current: {current}"
     );
 }
+
+#[tokio::test]
+async fn alembic_upgrade_head_applies_only_the_new_revision_after_a_release() {
+    // A chain at an earlier release, which shipped every migration but the
+    // last, upgraded, then given a later revision of the consumer's own.
+    let db = support::TestDb::empty_with_login().await;
+    let url = db.migration_url("postgresql+psycopg");
+    let project = Project::new();
+    assert_ok(&export_alembic("1536", &project.versions()));
+    let revisions = gnomon_revisions();
+    let (last, earlier) = revisions.split_last().unwrap();
+    let last_file = files(&project.versions()).pop().unwrap().0;
+    std::fs::remove_file(project.versions().join(last_file)).unwrap();
+    project
+        .alembic(&["upgrade", "head"], Some(&url))
+        .expect("the earlier release upgrades");
+    project.add_consumer_revision("beef00000001", earlier.last().map(String::as_str));
+    project
+        .alembic(&["upgrade", "head"], Some(&url))
+        .expect("the consumer's revision upgrades");
+    match gnomon::Store::connect_no_tls(&db.login_url()).await {
+        Err(gnomon::Error::SchemaVersion { found, .. }) => {
+            assert_eq!(found, Some(gnomon::migrations::SCHEMA_VERSION - 1));
+        }
+        Err(other) => panic!("expected a schema version error, got {other:?}"),
+        Ok(_) => panic!("the Store ran against the earlier release's schema"),
+    }
+
+    assert_ok(&export_alembic("1536", &project.versions()));
+    project
+        .alembic(&["upgrade", "head"], Some(&url))
+        .expect("alembic upgrade head applies the new revision");
+    let current = project.alembic(&["current"], Some(&url)).unwrap();
+    assert_eq!(current.split_whitespace().next(), Some(last.as_str()));
+    gnomon::Store::connect_no_tls(&db.login_url())
+        .await
+        .expect("the Store accepts the upgraded schema");
+}

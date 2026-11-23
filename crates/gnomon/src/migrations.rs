@@ -304,6 +304,9 @@ enum Placement {
 /// The Supabase CLI's version format.
 const SUPABASE_VERSION: &str = "%Y%m%d%H%M%S";
 
+/// The migration that runs `create extension if not exists vector`.
+const CREATES_PGVECTOR: i32 = 1;
+
 /// What the supabase target writes before migration 0001, which runs
 /// `create extension if not exists vector`. Without it, pgvector lands in
 /// the first schema on the migration role's search path, `public`, which
@@ -362,7 +365,9 @@ impl Target {
             .replace(DIMENSION_PLACEHOLDER, &dimension.get().to_string());
         match self {
             Self::Plain => sql,
-            Self::Supabase if m.version == 1 => format!("{SUPABASE_EXTENSIONS}{sql}"),
+            Self::Supabase if m.version == CREATES_PGVECTOR => {
+                format!("{SUPABASE_EXTENSIONS}{sql}")
+            }
             Self::Supabase => sql,
             Self::Alembic => alembic::revision(m, parent, &sql),
         }

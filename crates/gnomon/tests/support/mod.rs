@@ -33,6 +33,7 @@ use std::process::Command;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls};
 
+pub use gnomon::migrations::Target;
 pub use server::Server;
 
 /// The role the Store logs in as. The harness grants it the caller roles and
@@ -92,7 +93,7 @@ pub fn export_plain(dimension: u32, out: &Path) {
 /// Writes the migrations for `target` into `out` with the `gnomon` binary.
 pub fn export_to(target: Target, dimension: u32, out: &Path) {
     let run = Command::new(env!("CARGO_BIN_EXE_gnomon"))
-        .args(["migrations", "export", "--target", target.name()])
+        .args(["migrations", "export", "--target", &target.to_string()])
         .arg("--embedding-dimension")
         .arg(dimension.to_string())
         .arg("--out")
@@ -128,33 +129,38 @@ pub fn exported(dimension: u32) -> Vec<(String, String)> {
 /// the same way.
 pub const SUPABASE_CLI: &str = "supabase@3.2.0";
 
-/// The export target whose tooling applies the migrations to a template.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Target {
-    Plain,
-    Supabase,
-    Alembic,
+/// The export target whose tooling applies the migrations to a template:
+/// the one `GNOMON_TEST_TARGET` names, `plain` by default.
+pub fn target_from_env() -> Target {
+    match std::env::var("GNOMON_TEST_TARGET") {
+        Err(_) => Target::Plain,
+        Ok(name) if name.is_empty() => Target::Plain,
+        Ok(name) => name
+            .parse()
+            .unwrap_or_else(|e| panic!("GNOMON_TEST_TARGET: {e}")),
+    }
 }
 
-impl Target {
-    /// The target `GNOMON_TEST_TARGET` names, `plain` by default.
-    pub fn from_env() -> Target {
-        match std::env::var("GNOMON_TEST_TARGET").as_deref() {
-            Err(_) | Ok("") | Ok("plain") => Target::Plain,
-            Ok("supabase") => Target::Supabase,
-            Ok("alembic") => Target::Alembic,
-            Ok(other) => panic!(
-                "GNOMON_TEST_TARGET={other:?} is not a target the suite knows: use plain, supabase or alembic"
-            ),
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Target::Plain => "plain",
-            Target::Supabase => "supabase",
-            Target::Alembic => "alembic",
-        }
+/// Runs `supabase migration up` with the pinned CLI, applying the
+/// migrations in `workdir/supabase/migrations` that the database at `url`
+/// has not applied yet. Returns the CLI's output.
+pub fn supabase_migration_up(workdir: &Path, url: &str) -> Result<String, String> {
+    let run = Command::new("npx")
+        .args(["--yes", SUPABASE_CLI, "migration", "up", "--yes"])
+        .arg("--workdir")
+        .arg(workdir)
+        .arg(format!("--remote={url}"))
+        .output()
+        .expect("npx runs; see docs/testing.md");
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    if run.status.success() {
+        Ok(output)
+    } else {
+        Err(output)
     }
 }
 
@@ -207,19 +213,8 @@ impl Server {
                     dimension,
                     &workdir.path().join("supabase/migrations"),
                 );
-                let run = Command::new("npx")
-                    .args(["--yes", SUPABASE_CLI, "migration", "up", "--yes"])
-                    .arg("--workdir")
-                    .arg(workdir.path())
-                    .arg(format!("--remote={}", self.migration_url("postgresql", db)))
-                    .output()
-                    .expect("npx runs; see docs/testing.md");
-                assert!(
-                    run.status.success(),
-                    "supabase migration up failed: {}{}",
-                    String::from_utf8_lossy(&run.stdout),
-                    String::from_utf8_lossy(&run.stderr)
-                );
+                supabase_migration_up(workdir.path(), &self.migration_url("postgresql", db))
+                    .unwrap_or_else(|e| panic!("supabase migration up failed: {e}"));
             }
             Target::Alembic => {
                 let project = alembic::Project::new();
@@ -259,16 +254,12 @@ impl Server {
     async fn template(&self, dimension: u32) -> String {
         // The plain export names the migration set. A supabase export's
         // file names change with its clock, so they cannot.
-        let target = Target::from_env();
+        let target = target_from_env();
         let mut h = DefaultHasher::new();
         exported(dimension).hash(&mut h);
         let name = match target {
             Target::Plain => format!("gnomon_template_{dimension}_{:016x}", h.finish()),
-            _ => format!(
-                "gnomon_template_{}_{dimension}_{:016x}",
-                target.name(),
-                h.finish()
-            ),
+            _ => format!("gnomon_template_{target}_{dimension}_{:016x}", h.finish()),
         };
 
         let _lock = self.lock();
