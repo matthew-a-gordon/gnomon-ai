@@ -318,3 +318,51 @@ pub struct Citation {
     /// When gnomon recorded the Episode.
     pub episode_recorded_at: DateTime<Utc>,
 }
+
+/// What an Episode states when a fact stopped being true: from an instant
+/// on, what a current Version said no longer holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndOfValidity {
+    /// The Episode the statement cites. It must be in the Scope of the Node
+    /// or Edge.
+    pub episode: EpisodeId,
+    /// When the fact stopped being true, which must be [`Bound::At`] or
+    /// [`Bound::Period`]. A period is stored as its start, and the ended
+    /// Version's end then reads as an instant.
+    pub at: Bound,
+}
+
+/// What an Episode states when a current Version was never true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retraction {
+    /// The Episode the statement cites. It must be in the Scope of the Node
+    /// or Edge.
+    pub episode: EpisodeId,
+    /// The current Version that was never true.
+    pub version: VersionId,
+}
+
+/// The kind of a statement about a Node or an Edge (GLOSSARY.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementKind {
+    Correction,
+    EndOfValidity,
+    Retraction,
+}
+
+/// One Correction, End of validity or Retraction, with the Episode that made
+/// it. A statement that lost on Authority is held and listed all the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Statement {
+    pub kind: StatementKind,
+    pub episode: EpisodeId,
+    /// The Version an End of validity ended or a Retraction retracted, as it
+    /// stood. A Correction names none.
+    pub version: Option<VersionId>,
+    /// The Valid time the statement is about: the span a Correction states,
+    /// from the stated instant to the end of the Version for an End of
+    /// validity, and the whole Valid time of the Version for a Retraction.
+    pub valid_time: ValidTime,
+    /// When gnomon recorded the statement: when its transaction started.
+    pub recorded_at: DateTime<Utc>,
+}

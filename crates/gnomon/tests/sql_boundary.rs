@@ -1860,6 +1860,18 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         )
         .await
         .unwrap();
+    // An End of validity writes a statement.
+    single
+        .end_node_validity(
+            None,
+            node,
+            &gnomon::EndOfValidity {
+                episode,
+                at: gnomon::Bound::At(Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap()),
+            },
+        )
+        .await
+        .unwrap();
     // An Edge from the Node to itself, and its Version's Sentence, which the
     // table's owner stores until ticket #26 adds the function that does.
     let (_, edge) = single
@@ -1898,6 +1910,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         "bound_statement",
         "edge",
         "sentence",
+        "statement",
     ] {
         assert!(
             tables.iter().any(|t| t == expected),
@@ -3085,4 +3098,398 @@ async fn a_caller_inserting_directly_cannot_forge_the_built_in_that_says_an_edge
             Some(code) => assert_eq!(r.unwrap_err().code(), Some(&code), "{props}"),
         }
     }
+}
+
+// Correction, End of validity and Retraction (ADR-0007, ADR-0009). A
+// statement is held like a Contribution: callers read and insert it, and
+// change or delete nothing. The merge reads a statement only through the
+// Contributions that carry its ID, and each of those is checked against it.
+
+const END_VALIDITY: &str =
+    "select status from gnomon.end_validity($1, $2, false, $3, $4::text::timestamptz, 'instant')";
+const RETRACT_VERSION: &str =
+    "select status from gnomon.retract_version($1, $2, false, $3, $4)";
+const INSERT_STATEMENT_ROW: &str = "insert into gnomon.statement
+    (tenant_id, scope, node_id, episode_id, kind, version_id, valid_from, valid_from_precision,
+     valid_to, valid_to_precision, episode_reference_time, episode_recorded_at)
+  select $1, 'support', $2, $3, 'end_of_validity', $4, '2024-03-01', 'instant',
+         'infinity', 'unknown', ep.reference_time, ep.recorded_at
+  from gnomon.episode ep where ep.id = $3 returning id";
+
+#[tokio::test]
+async fn a_caller_cannot_choose_the_recorded_time_of_a_statement_or_change_or_delete_one() {
+    let n = nodes().await;
+    let t1 = n.w.t1;
+    for (role, at) in [(USER, "2024-06-01"), (WORKER, "2024-03-01")] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        tx.query_typed(
+            END_VALIDITY,
+            &[
+                (&t1, Type::UUID),
+                (&n.n1, Type::UUID),
+                (&n.w.t1_support, Type::UUID),
+                (&at, Type::TEXT),
+            ],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        // The Recorded time is not a column a caller may insert.
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        let r = tx
+            .execute_typed(
+                "insert into gnomon.statement
+                   (tenant_id, scope, node_id, episode_id, kind, version_id, valid_from,
+                    valid_from_precision, valid_to, valid_to_precision, episode_reference_time,
+                    episode_recorded_at, recorded_at)
+                 select $1, 'support', $2, $3, 'end_of_validity', $4, '2024-03-01', 'instant',
+                        'infinity', 'unknown', ep.reference_time, ep.recorded_at, '2000-01-01'
+                 from gnomon.episode ep where ep.id = $3",
+                &[
+                    (&t1, Type::UUID),
+                    (&n.n1, Type::UUID),
+                    (&n.w.t1_support, Type::UUID),
+                    (&n.open, Type::UUID),
+                ],
+            )
+            .await;
+        assert_refused(r, &format!("{role}: insert a statement with its Recorded time"));
+
+        for (sql, what) in [
+            ("update gnomon.statement set kind = 'retraction'", "relabel a statement"),
+            ("update gnomon.statement set valid_from = '2030-01-01'", "update a statement"),
+            ("delete from gnomon.statement", "delete a statement"),
+        ] {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            assert_refused(tx.execute_typed(sql, &[]).await, &format!("{role}: {what}"));
+        }
+    }
+    let rows = n
+        .w
+        .db
+        .admin()
+        .await
+        .query_typed(
+            "select count(*), min(recorded_at) > '2020-01-01' from gnomon.statement",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, i64>(0), 2);
+    assert!(rows[0].get::<_, bool>(1));
+}
+
+#[tokio::test]
+async fn a_statement_row_alone_changes_no_version() {
+    let n = nodes().await;
+    let t1 = n.w.t1;
+    // Callers may insert a statement directly, but the merge reads only the
+    // Contributions that name it, so a bare row ends nothing.
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    tx.query_typed(
+        INSERT_STATEMENT_ROW,
+        &[
+            (&t1, Type::UUID),
+            (&n.n1, Type::UUID),
+            (&n.w.t1_support, Type::UUID),
+            (&n.open, Type::UUID),
+        ],
+    )
+    .await
+    .unwrap();
+    let rows = tx
+        .query_typed(
+            "select changed from gnomon.recompute_node($1, $2, '-infinity', 'infinity')",
+            &[(&t1, Type::UUID), (&n.n1, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    assert!(!rows[0].get::<_, bool>(0), "a bare statement changed a Version");
+    tx.commit().await.unwrap();
+    assert_eq!(version_rows(&n.w.db, n.n1).await.0, 2, "no Version was added");
+}
+
+#[tokio::test]
+async fn a_caller_cannot_forge_a_contribution_that_does_not_belong_to_the_statement_it_names() {
+    let n = nodes().await;
+    let t1 = n.w.t1;
+    let second_episode = {
+        // A second Episode in the same Scope, to name a different one.
+        let store = Store::connect(&n.w.db.login_url(), &support::connect_options())
+            .await
+            .unwrap();
+        store
+            .as_worker(TenantId(t1), Scope::new("support"))
+            .record_episode(&NewEpisode {
+                tenant: Some(TenantId(t1)),
+                scope: Scope::new("support"),
+                content: "another".into(),
+                reference_time: Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap(),
+                authority: None,
+            })
+            .await
+            .unwrap()
+            .0
+    };
+    let contribution = "insert into gnomon.contribution
+        (tenant_id, scope, node_id, episode_id, property, value, valid_from, valid_from_precision,
+         valid_to, valid_to_precision, episode_reference_time, episode_recorded_at, statement_id)
+      select $1, 'support', $2, $3, 'name', $4, $5::text::timestamptz, 'instant', 'infinity',
+             'unknown', ep.reference_time, ep.recorded_at, $6
+      from gnomon.episode ep where ep.id = $3";
+    let message = "a Contribution of a statement is of the statement's Node or Edge, Episode and \
+                   Valid time, and an End of validity or a Retraction states only null";
+    // (the Episode of the Contribution, its value, its start)
+    let forged = [
+        (second_episode, json!(null), "2024-03-01"), // another Episode's
+        (n.w.t1_support, json!("alive"), "2024-03-01"), // an End of validity states only null
+        (n.w.t1_support, json!(null), "2024-04-01"), // another Valid time
+    ];
+    for (episode, value, from) in forged {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+        let id: i64 = tx
+            .query_typed(
+                INSERT_STATEMENT_ROW,
+                &[
+                    (&t1, Type::UUID),
+                    (&n.n1, Type::UUID),
+                    (&n.w.t1_support, Type::UUID),
+                    (&n.open, Type::UUID),
+                ],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        let r = tx
+            .execute_typed(
+                contribution,
+                &[
+                    (&t1, Type::UUID),
+                    (&n.n1, Type::UUID),
+                    (&episode, Type::UUID),
+                    (&value, Type::JSONB),
+                    (&from, Type::TEXT),
+                    (&id, Type::INT8),
+                ],
+            )
+            .await;
+        assert_invalid_write(r, message);
+    }
+    // The statement's own Contribution is accepted.
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    let id: i64 = tx
+        .query_typed(
+            INSERT_STATEMENT_ROW,
+            &[
+                (&t1, Type::UUID),
+                (&n.n1, Type::UUID),
+                (&n.w.t1_support, Type::UUID),
+                (&n.open, Type::UUID),
+            ],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    tx.execute_typed(
+        contribution,
+        &[
+            (&t1, Type::UUID),
+            (&n.n1, Type::UUID),
+            (&n.w.t1_support, Type::UUID),
+            (&json!(null), Type::JSONB),
+            (&"2024-03-01", Type::TEXT),
+            (&id, Type::INT8),
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_caller_cannot_end_or_retract_in_another_tenant_or_scope_or_a_version_that_is_not_current(
+) {
+    let n = nodes().await;
+    let (t1, t2) = (n.w.t1, n.w.t2);
+    for role in [USER, WORKER] {
+        // Another Tenant's claims, naming tenant one.
+        for (sql, version) in [(END_VALIDITY, None), (RETRACT_VERSION, Some(n.open))] {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t2, &["support"])).await;
+            let r = match version {
+                None => {
+                    tx.query_typed(
+                        sql,
+                        &[
+                            (&t1, Type::UUID),
+                            (&n.n1, Type::UUID),
+                            (&n.w.t1_support, Type::UUID),
+                            (&"2024-03-01", Type::TEXT),
+                        ],
+                    )
+                    .await
+                }
+                Some(v) => {
+                    tx.query_typed(
+                        sql,
+                        &[
+                            (&t1, Type::UUID),
+                            (&n.n1, Type::UUID),
+                            (&n.w.t1_support, Type::UUID),
+                            (&v, Type::UUID),
+                        ],
+                    )
+                    .await
+                }
+            };
+            assert_refused(r, &format!("{role}: state about another Tenant's Node"));
+        }
+        // The right Tenant, but a Scope the claims do not grant.
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["billing"])).await;
+        let err = tx
+            .query_typed(
+                RETRACT_VERSION,
+                &[
+                    (&t1, Type::UUID),
+                    (&n.n1, Type::UUID),
+                    (&n.w.t1_billing, Type::UUID),
+                    (&n.open, Type::UUID),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{role}: {err:?}");
+
+        // A closed Version is history, and another Node's Version is not
+        // this Node's.
+        for version in [n.closed, n.n2_open] {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            let err = tx
+                .query_typed(
+                    RETRACT_VERSION,
+                    &[
+                        (&t1, Type::UUID),
+                        (&n.n1, Type::UUID),
+                        (&n.w.t1_support, Type::UUID),
+                        (&version, Type::UUID),
+                    ],
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{role}: {err:?}");
+        }
+    }
+    let rows = n
+        .w
+        .db
+        .admin()
+        .await
+        .query_typed("select count(*) from gnomon.statement", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, i64>(0), 0, "no refused call left a statement");
+}
+
+#[tokio::test]
+async fn a_correction_closes_the_earlier_version_and_no_caller_can_reopen_or_rewrite_it() {
+    let n = nodes().await;
+    let t1 = n.w.t1;
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    tx.query_typed(
+        "select status from gnomon.correct_node($1, $2, $3, null, null, null, null,
+           '{\"name\": \"corrected\"}', null)",
+        &[
+            (&t1, Type::UUID),
+            (&n.n1, Type::UUID),
+            (&n.w.t1_support, Type::UUID),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    // The earlier Version is closed, and its Recorded time is not rewritten.
+    let rows = n
+        .w
+        .db
+        .admin()
+        .await
+        .query_typed(
+            "select recorded_to < 'infinity', recorded_from < recorded_to
+             from gnomon.version where id = $1",
+            &[(&n.open, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    assert!(rows[0].get::<_, bool>(0));
+    for sql in [
+        "update gnomon.version set recorded_to = 'infinity' where id = $1",
+        "update gnomon.version set recorded_to = recorded_from + interval '1 microsecond'
+           where id = $1",
+        "delete from gnomon.version where id = $1",
+    ] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+        let r = tx.execute_typed(sql, &[(&n.open, Type::UUID)]).await;
+        assert!(r.is_err(), "{sql} was allowed: {r:?}");
+    }
+    let rows = n
+        .w
+        .db
+        .admin()
+        .await
+        .query_typed(
+            "select recorded_to < 'infinity' from gnomon.version where id = $1",
+            &[(&n.open, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    assert!(rows[0].get::<_, bool>(0), "the earlier Version is still closed");
+}
+
+#[tokio::test]
+async fn the_statement_functions_run_as_the_invoker_and_the_statement_table_is_not_a_definer() {
+    let w = world().await;
+    let rows = w
+        .db
+        .admin()
+        .await
+        .query_typed(
+            "select p.proname, p.prosecdef from pg_proc p
+             join pg_namespace s on s.oid = p.pronamespace and s.nspname = 'gnomon'
+             where p.proname in ('write_patch_as', 'correct_node', 'correct_edge', 'write_ending',
+                                 'end_validity', 'retract_version', 'list_statements',
+                                 'statement_check_insert')
+             order by 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 8);
+    for r in rows {
+        assert!(!r.get::<_, bool>(1), "{} is SECURITY DEFINER", r.get::<_, String>(0));
+    }
+    // ADR-0009 names three definers: Erasure, Kind registration and the
+    // merge-rule setter. Erasure is a later ticket, so two exist today.
+    let definers = w
+        .db
+        .admin()
+        .await
+        .query_typed(
+            "select count(*) from pg_proc p
+             join pg_namespace s on s.oid = p.pronamespace and s.nspname = 'gnomon'
+             where p.prosecdef",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(definers[0].get::<_, i64>(0), 2);
 }

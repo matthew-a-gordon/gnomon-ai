@@ -36,9 +36,9 @@ use crate::connect::ConnectOptions;
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Direction, EdgeId,
-    EdgeVersion, Episode, EpisodeId, Error, Kind, KindOf, MergeRule, NewEdge, NewEpisode, NewKind,
-    NewNode, NodeId, NodeVersion, Patch, Precision, Scope, Step, TenantId, Traversal, ValidTime,
-    VersionId, WriteOutcome, WriteStatus,
+    EdgeVersion, EndOfValidity, Episode, EpisodeId, Error, Kind, KindOf, MergeRule, NewEdge, NewEpisode, NewKind,
+    NewNode, NodeId, NodeVersion, Patch, Precision, Retraction, Scope, Statement as Held, StatementKind,
+    Step, TenantId, Traversal, ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -492,7 +492,7 @@ impl Caller<'_> {
         patch: &Patch,
     ) -> Result<(NodeId, WriteOutcome), Error> {
         let (id, outcome) = self
-            .run_writes(node.tenant, &[(Target::NewNode(node), patch)])
+            .run_writes(node.tenant, &[(Target::NewNode(node), patch)], false)
             .await?
             .remove(0);
         match id {
@@ -510,7 +510,7 @@ impl Caller<'_> {
         patch: &Patch,
     ) -> Result<WriteOutcome, Error> {
         let mut done = self
-            .run_writes(tenant.into(), &[(Target::Node(node), patch)])
+            .run_writes(tenant.into(), &[(Target::Node(node), patch)], false)
             .await?;
         Ok(done.remove(0).1)
     }
@@ -528,7 +528,7 @@ impl Caller<'_> {
             .map(|(node, patch)| (Target::Node(*node), patch))
             .collect();
         Ok(self
-            .run_writes(tenant.into(), &targets)
+            .run_writes(tenant.into(), &targets, false)
             .await?
             .into_iter()
             .map(|(_, outcome)| outcome)
@@ -548,7 +548,7 @@ impl Caller<'_> {
         patch: &Patch,
     ) -> Result<(EdgeId, WriteOutcome), Error> {
         let (id, outcome) = self
-            .run_writes(edge.tenant, &[(Target::NewEdge(edge), patch)])
+            .run_writes(edge.tenant, &[(Target::NewEdge(edge), patch)], false)
             .await?
             .remove(0);
         match id {
@@ -568,7 +568,7 @@ impl Caller<'_> {
         patch: &Patch,
     ) -> Result<WriteOutcome, Error> {
         let mut done = self
-            .run_writes(tenant.into(), &[(Target::Edge(edge), patch)])
+            .run_writes(tenant.into(), &[(Target::Edge(edge), patch)], false)
             .await?;
         Ok(done.remove(0).1)
     }
@@ -585,7 +585,7 @@ impl Caller<'_> {
             .map(|(edge, patch)| (Target::Edge(*edge), patch))
             .collect();
         Ok(self
-            .run_writes(tenant.into(), &targets)
+            .run_writes(tenant.into(), &targets, false)
             .await?
             .into_iter()
             .map(|(_, outcome)| outcome)
@@ -598,11 +598,12 @@ impl Caller<'_> {
         &self,
         tenant: Option<TenantId>,
         writes: &[(Target<'_>, &Patch)],
+        correct: bool,
     ) -> Result<Vec<(Versioned, WriteOutcome)>, Error> {
         let mut client = self.store.client.lock().await;
         let mut attempt = 0;
         loop {
-            match self.try_writes(&mut client, tenant, writes).await {
+            match self.try_writes(&mut client, tenant, writes, correct).await {
                 Err(e) if attempt < WRITE_RETRIES && is_retryable(&e) => attempt += 1,
                 done => return done,
             }
@@ -614,6 +615,7 @@ impl Caller<'_> {
         client: &mut Client,
         tenant: Option<TenantId>,
         writes: &[(Target<'_>, &Patch)],
+        correct: bool,
     ) -> Result<Vec<(Versioned, WriteOutcome)>, Error> {
         let (tx, tenant) = self.begin(client, tenant).await?;
         let statements = &self.store.statements;
@@ -655,7 +657,7 @@ impl Caller<'_> {
                     Versioned::Edge(EdgeId(rows[0].get(0)))
                 }
             };
-            done.push((of, write_patch(&tx, statements, tenant, of, patch).await?));
+            done.push((of, write_patch(&tx, statements, tenant, of, patch, correct).await?));
         }
         tx.commit().await?;
         Ok(done)
@@ -916,6 +918,227 @@ impl Caller<'_> {
         }
     }
 
+    /// Records a Correction of a Node: a patch that replaces what the
+    /// Node's earlier Version said over the same Valid time, because that
+    /// Version was wrong. The Node must have a current Version over the
+    /// patch's Valid time, or the Store refuses it with
+    /// [`Error::InvalidWrite`]. The earlier Version is closed in Recorded
+    /// time, so a read at an earlier known-at instant still returns it. The
+    /// Correction is held like a Contribution: under ranked merge a
+    /// Correction from a lower-Authority Episode does not replace values a
+    /// higher-Authority Episode supplied where their Valid times overlap,
+    /// and takes effect if that Episode is erased (ADR-0007).
+    pub async fn correct_node(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        node: NodeId,
+        patch: &Patch,
+    ) -> Result<WriteOutcome, Error> {
+        let mut done = self
+            .run_writes(tenant.into(), &[(Target::Node(node), patch)], true)
+            .await?;
+        Ok(done.remove(0).1)
+    }
+
+    /// Records a Correction of an Edge, as
+    /// [`correct_node`](Self::correct_node) does for a Node. The patch may
+    /// state no property value: it then corrects only that the Edge holds.
+    pub async fn correct_edge(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        edge: EdgeId,
+        patch: &Patch,
+    ) -> Result<WriteOutcome, Error> {
+        let mut done = self
+            .run_writes(tenant.into(), &[(Target::Edge(edge), patch)], true)
+            .await?;
+        Ok(done.remove(0).1)
+    }
+
+    /// Records an End of validity of a Node: what its current Version stated
+    /// was true and stopped being true at the stated instant. The Version is
+    /// replaced by one that ends there, and stays current As-of earlier
+    /// valid-at instants. The instant must fall inside a current Version, not
+    /// at its start, which is a Retraction.
+    pub async fn end_node_validity(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        node: NodeId,
+        end: &EndOfValidity,
+    ) -> Result<WriteOutcome, Error> {
+        self.write_ending(tenant.into(), Versioned::Node(node), Ending::End(end))
+            .await
+    }
+
+    /// Records an End of validity of an Edge: the Edge holds no Version from
+    /// the stated instant, whatever property values remain.
+    pub async fn end_edge_validity(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        edge: EdgeId,
+        end: &EndOfValidity,
+    ) -> Result<WriteOutcome, Error> {
+        self.write_ending(tenant.into(), Versioned::Edge(edge), Ending::End(end))
+            .await
+    }
+
+    /// Records a Retraction of a current Version of a Node: what it stated
+    /// was never true. The Version stops being current, and a read at an
+    /// earlier known-at instant still returns it.
+    pub async fn retract_node_version(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        node: NodeId,
+        retraction: &Retraction,
+    ) -> Result<WriteOutcome, Error> {
+        self.write_ending(
+            tenant.into(),
+            Versioned::Node(node),
+            Ending::Retract(retraction),
+        )
+        .await
+    }
+
+    /// Records a Retraction of a current Version of an Edge.
+    pub async fn retract_edge_version(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        edge: EdgeId,
+        retraction: &Retraction,
+    ) -> Result<WriteOutcome, Error> {
+        self.write_ending(
+            tenant.into(),
+            Versioned::Edge(edge),
+            Ending::Retract(retraction),
+        )
+        .await
+    }
+
+    async fn write_ending(
+        &self,
+        tenant: Option<TenantId>,
+        of: Versioned,
+        ending: Ending<'_>,
+    ) -> Result<WriteOutcome, Error> {
+        let id = of.id();
+        let is_edge = of.is_edge();
+        let mut client = self.store.client.lock().await;
+        let mut attempt = 0;
+        loop {
+            let (tx, tenant) = self.begin(&mut client, tenant).await?;
+            let rows = match ending {
+                Ending::End(end) => {
+                    let (at, precision) = end.at.parts();
+                    self.store
+                        .statements
+                        .query(
+                            &tx,
+                            "select status, recorded_at, versions
+                             from gnomon.end_validity($1, $2, $3, $4, $5, $6)",
+                            &[
+                                (&tenant.0, Type::UUID),
+                                (&id, Type::UUID),
+                                (&is_edge, Type::BOOL),
+                                (&end.episode.0, Type::UUID),
+                                (&at, Type::TIMESTAMPTZ),
+                                (&precision, Type::TEXT),
+                            ],
+                        )
+                        .await
+                }
+                Ending::Retract(r) => {
+                    self.store
+                        .statements
+                        .query(
+                            &tx,
+                            "select status, recorded_at, versions
+                             from gnomon.retract_version($1, $2, $3, $4, $5)",
+                            &[
+                                (&tenant.0, Type::UUID),
+                                (&id, Type::UUID),
+                                (&is_edge, Type::BOOL),
+                                (&r.episode.0, Type::UUID),
+                                (&r.version.0, Type::UUID),
+                            ],
+                        )
+                        .await
+                }
+            }
+            .map_err(Error::from_store);
+            let rows = match rows {
+                Err(e) if attempt < WRITE_RETRIES && is_retryable(&e) => {
+                    attempt += 1;
+                    continue;
+                }
+                other => other?,
+            };
+            tx.commit().await?;
+            return Ok(write_outcome(&rows[0]));
+        }
+    }
+
+    /// Lists the statements about a Node: its Corrections, Ends of validity
+    /// and Retractions, in the order they were recorded, with the Episode
+    /// that made each. A statement that lost on Authority is listed too,
+    /// because it stays held.
+    pub async fn list_node_statements(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        node: NodeId,
+    ) -> Result<Vec<Held>, Error> {
+        self.list_statements(tenant.into(), node.0).await
+    }
+
+    /// Lists the statements about an Edge, as
+    /// [`list_node_statements`](Self::list_node_statements) does for a Node.
+    pub async fn list_edge_statements(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        edge: EdgeId,
+    ) -> Result<Vec<Held>, Error> {
+        self.list_statements(tenant.into(), edge.0).await
+    }
+
+    async fn list_statements(
+        &self,
+        tenant: Option<TenantId>,
+        id: uuid::Uuid,
+    ) -> Result<Vec<Held>, Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant).await?;
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
+                "select kind, episode_id, version_id, nullif(valid_from, '-infinity'),
+                        valid_from_precision::text, nullif(valid_to, 'infinity'),
+                        valid_to_precision::text, recorded_at
+                 from gnomon.list_statements($1, $2)",
+                &[(&tenant.0, Type::UUID), (&id, Type::UUID)],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|r| Held {
+                kind: match r.get::<_, &str>(0) {
+                    "correction" => StatementKind::Correction,
+                    "end_of_validity" => StatementKind::EndOfValidity,
+                    "retraction" => StatementKind::Retraction,
+                    other => panic!("gnomon.list_statements returned kind {other:?}"),
+                },
+                episode: EpisodeId(r.get(1)),
+                version: r.get::<_, Option<uuid::Uuid>>(2).map(VersionId),
+                valid_time: ValidTime {
+                    from: bound(r.get(3), r.get(4)),
+                    to: bound(r.get(5), r.get(6)),
+                },
+                recorded_at: r.get(7),
+            })
+            .collect())
+    }
+
     /// Lists the Citations of a Version: each Episode it was derived from,
     /// with the property and the place they name.
     pub async fn list_citations(
@@ -949,6 +1172,13 @@ impl Caller<'_> {
     }
 }
 
+/// What an End of validity or a Retraction is made of.
+#[derive(Clone, Copy)]
+enum Ending<'a> {
+    End(&'a EndOfValidity),
+    Retract(&'a Retraction),
+}
+
 /// The Node or Edge a write or a bound statement is about, and the Store
 /// functions that write it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -978,6 +1208,23 @@ impl Versioned {
         }
     }
 
+    fn correct_sql(self) -> &'static str {
+        match self {
+            Versioned::Node(_) => {
+                "select status, recorded_at, versions
+                 from gnomon.correct_node($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+            }
+            Versioned::Edge(_) => {
+                "select status, recorded_at, versions
+                 from gnomon.correct_edge($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+            }
+        }
+    }
+
+    fn is_edge(self) -> bool {
+        matches!(self, Versioned::Edge(_))
+    }
+
     fn state_bound_sql(self) -> &'static str {
         match self {
             Versioned::Node(_) => {
@@ -998,6 +1245,7 @@ async fn write_patch(
     tenant: TenantId,
     of: Versioned,
     patch: &Patch,
+    correct: bool,
 ) -> Result<WriteOutcome, Error> {
     let id = of.id();
     let (from, to) = patch.valid_time.bounds();
@@ -1012,7 +1260,7 @@ async fn write_patch(
                 .collect(),
         )
     });
-    let sql = of.write_sql();
+    let sql = if correct { of.correct_sql() } else { of.write_sql() };
     let rows = statements
         .query(
             tx,
@@ -1031,18 +1279,21 @@ async fn write_patch(
         )
         .await
         .map_err(Error::from_store)?;
-    let r = &rows[0];
+    Ok(write_outcome(&rows[0]))
+}
+
+fn write_outcome(r: &Row) -> WriteOutcome {
     let status = match r.get::<_, &str>(0) {
         "written" => WriteStatus::Written,
         "unchanged" => WriteStatus::Unchanged,
         other => panic!("the Store's write returned status {other:?}"),
     };
     let opened: Vec<uuid::Uuid> = r.get(2);
-    Ok(WriteOutcome {
+    WriteOutcome {
         status,
         recorded_at: r.get(1),
         opened: opened.into_iter().map(VersionId).collect(),
-    })
+    }
 }
 
 /// A Node Version from the 14 columns of `row` from `at` on: ID, Node,

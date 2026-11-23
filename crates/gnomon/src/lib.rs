@@ -22,8 +22,9 @@ pub use connect::{ConnectOptions, Tls};
 pub use edge::{Direction, EdgeId, EdgeVersion, NewEdge, Step, Traversal};
 pub use kind::{Kind, KindOf, MergeRule, NewKind, ROOT_EDGE_KIND, ROOT_NODE_KIND};
 pub use node::{
-    AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, NewNode, NodeId,
-    NodeVersion, Patch, Precision, ValidTime, VersionId, WriteOutcome, WriteStatus,
+    AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, EndOfValidity,
+    NewNode, NodeId, NodeVersion, Patch, Precision, Retraction, Statement, StatementKind, ValidTime,
+    VersionId, WriteOutcome, WriteStatus,
 };
 pub use store::{Caller, Store};
 
