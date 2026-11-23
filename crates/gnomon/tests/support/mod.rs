@@ -103,6 +103,41 @@ pub fn user(
     }
 }
 
+/// Stores a Sentence of an Edge Version as the table's owner, as the
+/// function ticket #26 adds will, after the Version committed. The claims of
+/// the Version's Tenant and Scope are set for the insert, because the
+/// trigger that writes the Version's token rows reads it under them
+/// (migration 0016).
+pub async fn store_sentence(
+    owner: &mut tokio_postgres::Client,
+    tenant: gnomon::TenantId,
+    scope: &str,
+    version: uuid::Uuid,
+    sentence: &str,
+) {
+    let claims = serde_json::Value::Object(user(tenant, &[scope])).to_string();
+    let tx = owner.transaction().await.unwrap();
+    tx.query_typed(
+        "select set_config('request.jwt.claims', $1, true)",
+        &[(&claims, tokio_postgres::types::Type::TEXT)],
+    )
+    .await
+    .unwrap();
+    tx.execute_typed(
+        "insert into gnomon.sentence (tenant_id, scope, version_id, sentence)
+         values ($1, $2, $3, $4)",
+        &[
+            (&tenant.0, tokio_postgres::types::Type::UUID),
+            (&scope, tokio_postgres::types::Type::TEXT),
+            (&version, tokio_postgres::types::Type::UUID),
+            (&sentence, tokio_postgres::types::Type::TEXT),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
 /// Kind registration's signature, as grants and `regprocedure` name it.
 pub const REGISTER_KIND: &str =
     "gnomon.register_kind(uuid, text, text, text, jsonb, text[], text[], text[])";

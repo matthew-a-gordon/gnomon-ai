@@ -251,7 +251,10 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .await
         .unwrap()[0]
         .get(0);
-    assert_eq!(forty, 0, "the reopened Version keeps a word of its erased Sentence");
+    assert_eq!(
+        forty, 0,
+        "the reopened Version keeps a word of its erased Sentence"
+    );
     let derived = tables_derived_from_version_text(&admin).await;
     assert!(derived.iter().any(|t| t == "sentence"), "{derived:?}");
     assert!(derived.iter().any(|t| t == "search_token"), "{derived:?}");
@@ -608,6 +611,9 @@ async fn the_same_erasure_on_the_same_starting_data_always_removes_the_same_rows
         // No caller reads the list an Erasure of a Node, an Edge or a Scope
         // keeps while it runs, which is empty once it returns.
         .filter(|t| t != "schema_version" && t != "tenancy" && t != "erasure_reach")
+        // The BM25 counts change when the Erasure commits, not inside it.
+        // `assert_only_removed` checks them against the token rows.
+        .filter(|t| !support::erasure::BM25_COUNT_TABLES.contains(&t.as_str()))
         .collect();
 
     let mut runs = Vec::new();

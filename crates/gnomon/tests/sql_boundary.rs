@@ -10,6 +10,7 @@ mod support;
 use chrono::{TimeZone, Utc};
 use gnomon::{EpisodeId, NewEpisode, Scope, Store, TenantId};
 use serde_json::json;
+use support::erasure::BM25_COUNT_TABLES;
 use support::TestDb;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
@@ -349,7 +350,6 @@ const ERASURE_REACH: &str = "erasure_reach";
 
 /// The BM25 counts of each Scope, which only the token table's triggers
 /// write (migration 0016).
-const BM25_COUNT_TABLES: &[&str] = &["search_token_frequency", "search_scope_length"];
 
 #[tokio::test]
 async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_tenant_scope_policy()
@@ -438,20 +438,39 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
                     reach.starts_with("((tenant_id = gnomon.tenant_id()) AND "),
                     "gnomon.{name}: the reach is {reach}"
                 );
-                // The one write: an Erasure that deletes the token rows of
-                // an Edge in such a Scope lowers that Scope's BM25 counts
-                // (migration 0016). The counts' guard refuses any write but
-                // the token table's trigger's.
-                if BM25_COUNT_TABLES.contains(&name.as_str())
-                    && reach.contains("gnomon.erasure_reaches_scope(")
-                {
-                    assert!(
-                        check.is_none() || check.as_deref() == Some(reach),
-                        "gnomon.{name}: the reach's check is {check:?}"
-                    );
-                    continue;
-                }
                 assert_eq!(check, None, "gnomon.{name}: the definer's reach writes");
+                continue;
+            }
+            // The search index function, a definer, changes the BM25 counts
+            // only of a Scope whose changes its own transaction recorded,
+            // and records only its own transaction's changes (migration
+            // 0016). No caller writes either table.
+            if BM25_COUNT_TABLES.contains(&name.as_str()) && roles == ["gnomon_definer"] {
+                let (own_using, own_check) = if name == "search_count_delta" {
+                    (
+                        "((tenant_id = gnomon.tenant_id()) AND \
+                         (written_in = pg_current_xact_id_if_assigned()))",
+                        "((tenant_id = gnomon.tenant_id()) AND \
+                         (written_in = pg_current_xact_id()))",
+                    )
+                } else {
+                    (
+                        "((tenant_id = gnomon.tenant_id()) AND \
+                         gnomon.search_counts_pending(tenant_id, scope))",
+                        "((tenant_id = gnomon.tenant_id()) AND \
+                         gnomon.search_counts_pending(tenant_id, scope))",
+                    )
+                };
+                assert_eq!(
+                    using.as_deref(),
+                    Some(own_using),
+                    "gnomon.{name} the definer's USING"
+                );
+                assert_eq!(
+                    check.as_deref(),
+                    Some(own_check),
+                    "gnomon.{name} the definer's CHECK"
+                );
                 continue;
             }
             if let Some(using) = using {
@@ -465,8 +484,10 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
 }
 
 /// The only SECURITY DEFINER functions ADR-0009 allows: Kind registration,
-/// the setting of a Kind's merge rule, and Erasure.
+/// the setting of a Kind's merge rule, Erasure, and the trigger function that
+/// writes full-text Search's token rows and counts.
 const DEFINERS: &[&str] = &[
+    "gnomon.maintain_search_index(",
     "gnomon.register_kind(",
     "gnomon.set_merge_rule(",
     "gnomon.erase_episode(",
@@ -2001,15 +2022,15 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         .await
         .unwrap();
 
-    let operator = db.operator().await;
-    operator
-        .execute_typed(
-            "insert into gnomon.sentence (tenant_id, scope, version_id, sentence)
-             values ($1, 'support', $2, 'Ada knows herself.')",
-            &[(&first, Type::UUID), (&edge.opened[0].0, Type::UUID)],
-        )
-        .await
-        .unwrap();
+    let mut operator = db.operator().await;
+    support::store_sentence(
+        &mut operator,
+        TenantId(first),
+        "support",
+        edge.opened[0].0,
+        "Ada knows herself.",
+    )
+    .await;
     let tables = tenant_tables(&operator).await;
     for expected in [
         "citation",
@@ -2040,6 +2061,12 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
             .await
             .unwrap()[0]
             .get(0);
+        // A transaction's changes to the BM25 counts go at its commit.
+        if t == "search_count_delta" {
+            assert_eq!(n, 0, "committed changes to the counts are left");
+            before.push(n);
+            continue;
+        }
         assert!(
             n > 0,
             "the single-tenant deployment wrote no row into gnomon.{t}"
@@ -5605,13 +5632,17 @@ async fn a_caller_cannot_delete_a_stage_record_or_change_what_it_names() {
     assert_eq!(stage_rows(&w.db).await, before);
 }
 
-/// The token table of full-text Search and the BM25 counts of each Scope
-/// (ADR-0010, migration 0016).
+/// The token table of full-text Search, the BM25 counts of each Scope and
+/// each transaction's changes to them (ADR-0010, migration 0016).
 const SEARCH_TABLES: &[&str] = &[
     "search_token",
     "search_token_frequency",
     "search_scope_length",
+    "search_count_delta",
 ];
+
+/// The one trigger function that writes them, a definer (ADR-0009).
+const SEARCH_INDEX_FUNCTION: &str = "gnomon.maintain_search_index()";
 
 /// `world()` with a Node named "zebra" and something of its own in each
 /// Tenant's `support` and `billing` Scopes, written through the Store by
@@ -5640,10 +5671,7 @@ async fn searchable_world() -> World {
                 &gnomon::Patch::new(
                     EpisodeId(episode),
                     gnomon::ValidTime::UNKNOWN,
-                    match json!({ "name": name }) {
-                        serde_json::Value::Object(m) => m,
-                        _ => unreachable!(),
-                    },
+                    support::erasure::values(json!({ "name": name })),
                 ),
             )
             .await
@@ -5659,6 +5687,10 @@ async fn a_caller_reads_only_its_own_tenants_and_scopes_token_rows_and_counts() 
         let mut client = w.db.login().await;
         let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
         for table in SEARCH_TABLES {
+            // Every transaction's changes to the counts go at its commit.
+            if *table == "search_count_delta" {
+                continue;
+            }
             let seen: Vec<(Uuid, String)> = tx
                 .query_typed(
                     &format!("select distinct tenant_id, scope from gnomon.{table}"),
@@ -5695,7 +5727,7 @@ async fn a_caller_reads_only_its_own_tenants_and_scopes_token_rows_and_counts() 
         // says "zebra" and "support".
         let documents: i64 = tx
             .query_typed(
-                "select sum(documents)::bigint from gnomon.search_scope_length where tenant_id = $1",
+                "select sum(versions)::bigint from gnomon.search_scope_length where tenant_id = $1",
                 &[(&w.t1, Type::UUID)],
             )
             .await
@@ -5719,91 +5751,126 @@ async fn a_caller_cannot_write_the_token_rows_or_the_counts_directly_even_in_its
         .await
         .unwrap()[0]
         .get(0);
+    let t = w.t1;
+    let forgeries = |scope: &str| {
+        vec![
+            // A forged word for the caller's own Version.
+            format!(
+                "insert into gnomon.search_token (tenant_id, scope, token, version_id, tf, dl)
+                 values ('{t}', '{scope}', 'forged', '{own_version}', 1, 1)"
+            ),
+            format!("update gnomon.search_token set tf = 99 where scope = '{scope}'"),
+            format!("delete from gnomon.search_token where scope = '{scope}'"),
+            format!(
+                "insert into gnomon.search_token_frequency (tenant_id, scope, token, versions)
+                 values ('{t}', '{scope}', 'forged', 1000)"
+            ),
+            format!(
+                "update gnomon.search_token_frequency set versions = 1000 where scope = '{scope}'"
+            ),
+            format!("delete from gnomon.search_token_frequency where scope = '{scope}'"),
+            format!(
+                "insert into gnomon.search_scope_length (tenant_id, scope, versions, words)
+                 values ('{t}', 'elsewhere', 1000, 1000)"
+            ),
+            format!(
+                "update gnomon.search_scope_length set versions = 1000 where scope = '{scope}'"
+            ),
+            format!("delete from gnomon.search_scope_length where scope = '{scope}'"),
+            format!(
+                "insert into gnomon.search_count_delta (tenant_id, scope, token, versions, words)
+                 values ('{t}', '{scope}', null, 1000, 1000)"
+            ),
+            // The functions that write the token rows, called directly.
+            format!("select gnomon.index_search_text('{t}', array['{own_version}'::uuid], true)"),
+            format!("select * from gnomon.search_text_tokens('{t}', array['{own_version}'::uuid])"),
+        ]
+    };
     for role in [USER, WORKER] {
         for scope in ["support", "billing"] {
-            for sql in [
-                // A forged word for the caller's own Version.
-                format!(
-                    "insert into gnomon.search_token (tenant_id, scope, token, version_id, tf, dl)
-                     values ('{t}', '{scope}', 'forged', '{own_version}', 1, 1)",
-                    t = w.t1
-                ),
-                format!("update gnomon.search_token set tf = 99 where scope = '{scope}'"),
-                format!("delete from gnomon.search_token where scope = '{scope}'"),
-                format!(
-                    "insert into gnomon.search_token_frequency (tenant_id, scope, token, documents)
-                     values ('{t}', '{scope}', 'forged', 1000)",
-                    t = w.t1
-                ),
-                format!(
-                    "update gnomon.search_token_frequency set documents = 1000 where scope = '{scope}'"
-                ),
-                format!("delete from gnomon.search_token_frequency where scope = '{scope}'"),
-                format!(
-                    "insert into gnomon.search_scope_length (tenant_id, scope, documents, length)
-                     values ('{t}', 'elsewhere', 1000, 1000)",
-                    t = w.t1
-                ),
-                format!(
-                    "update gnomon.search_scope_length set documents = 1000 where scope = '{scope}'"
-                ),
-                format!("delete from gnomon.search_scope_length where scope = '{scope}'"),
-                // The re-index function, called directly rather than from a
-                // Sentence's trigger.
-                format!(
-                    "select gnomon.index_search_text('{t}', array['{own_version}'::uuid])",
-                    t = w.t1
-                ),
-            ] {
-                let mut client = w.db.login().await;
-                let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
-                assert_refused(tx.batch_execute(&sql).await, &format!("{role}: {sql}"));
+            for sql in forgeries(scope) {
+                // As the caller's own statement, and from a trigger of the
+                // caller's own on a temporary table, which every role may
+                // create.
+                let through_a_trigger = format!(
+                    "create temp table pulled (i int);
+                     create function pg_temp.pull() returns trigger language plpgsql as $f$
+                     begin
+                       execute $q${sql}$q$;
+                       return null;
+                     end $f$;
+                     create trigger pull after insert on pulled
+                       for each statement execute function pg_temp.pull();
+                     insert into pulled values (1);"
+                );
+                for attempt in [sql.clone(), through_a_trigger] {
+                    let mut client = w.db.login().await;
+                    let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+                    assert_refused(
+                        tx.batch_execute(&attempt).await,
+                        &format!("{role}: {attempt}"),
+                    );
+                }
             }
         }
-        // No caller can add a trigger of its own to the tables.
-        let mut client = w.db.login().await;
-        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
-        assert_refused(
-            tx.batch_execute(
-                "create trigger forged after insert on gnomon.search_token
-                 for each statement execute function gnomon.search_count_inserted()",
-            )
-            .await,
-            &format!("{role} adds a trigger"),
-        );
+        // No caller can call the trigger function, or attach it to a table
+        // of its own.
+        for sql in [
+            "create temp table pulled (i int);
+             create trigger pull after insert on pulled referencing new table as changed
+               for each statement execute function gnomon.maintain_search_index();",
+            "create trigger pull after insert on gnomon.search_token
+               for each statement execute function gnomon.maintain_search_index();",
+        ] {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+            assert_refused(tx.batch_execute(sql).await, &format!("{role}: {sql}"));
+        }
     }
     assert_eq!(support::erasure::rows_of(&admin, &tables).await, before);
 }
 
-/// The guard on the token table and the counts lets a write through only at
-/// a trigger depth of 2 or more, which a caller reaches only through a
-/// trigger. No caller role, and not the login role, can create anything in
-/// any schema, so no caller can make a trigger of its own that writes them.
-/// A deployment that grants its caller roles CREATE on a schema gives them
-/// that way (docs/testing.md).
 #[tokio::test]
-async fn no_caller_role_can_create_in_any_schema_so_no_trigger_of_its_own_writes_the_counts() {
+async fn the_search_index_function_is_a_definer_no_role_may_execute_and_callers_hold_only_select() {
     let w = world().await;
     let admin = w.db.admin().await;
-    let rows = admin
+    let row = admin
         .query_typed(
-            "select r.rolname::text, n.nspname::text from pg_namespace n cross join pg_roles r
-             where r.rolname in ('authenticated', 'gnomon_worker', $1)
-               and has_schema_privilege(r.oid, n.oid, 'CREATE') order by 1, 2",
-            &[(&support::LOGIN_ROLE, Type::TEXT)],
+            &format!(
+                "select p.prosecdef, p.proowner::regrole::text,
+                        array(select coalesce(nullif(a.grantee, 0)::regrole::text, 'public')
+                              from aclexplode(p.proacl) a where a.grantee <> p.proowner)
+                 from pg_proc p where p.oid = '{SEARCH_INDEX_FUNCTION}'::regprocedure"
+            ),
+            &[],
         )
         .await
         .unwrap();
-    let creators: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
-    assert_eq!(creators, vec![], "caller roles that may create in a schema");
-    let mut client = w.db.login().await;
-    for role in [USER, WORKER] {
-        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
-        assert_refused(
-            tx.batch_execute("create table public.forged (id int)")
-                .await,
-            &format!("{role} creates a table"),
-        );
-        tx.rollback().await.unwrap();
+    let (definer, owner, grantees): (bool, String, Vec<String>) =
+        (row[0].get(0), row[0].get(1), row[0].get(2));
+    assert!(definer);
+    assert_eq!(owner, "gnomon_definer");
+    assert_eq!(grantees, Vec::<String>::new(), "who may execute it");
+    for role in [USER, WORKER, support::LOGIN_ROLE] {
+        for table in SEARCH_TABLES {
+            let privileges: Vec<String> = admin
+                .query_typed(
+                    "select p from unnest(array['SELECT', 'INSERT', 'UPDATE', 'DELETE',
+                                              'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']) p
+                     where has_table_privilege($1, ('gnomon.' || $2)::regclass, p)",
+                    &[(&role, Type::TEXT), (table, Type::TEXT)],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            let expected: Vec<String> = if role == support::LOGIN_ROLE {
+                vec![]
+            } else {
+                vec!["SELECT".into()]
+            };
+            assert_eq!(privileges, expected, "{role} on gnomon.{table}");
+        }
     }
 }

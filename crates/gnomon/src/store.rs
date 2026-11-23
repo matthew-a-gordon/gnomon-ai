@@ -1055,7 +1055,7 @@ impl Caller<'_> {
 
     /// The full-text branch of Search (ADR-0010): the Versions whose
     /// searchable text holds a word of `query`, As-of `as_of`, best first,
-    /// at most `limit` of them. Each is ranked by BM25 from the term counts
+    /// at most `limit` of them. Each is ranked by BM25 from the word counts
     /// of the caller's allowed Scopes only, so another Scope's text never
     /// changes the order. Words are lower-cased and split as Postgres's
     /// `simple` text search configuration splits them, with no stemming and

@@ -646,19 +646,14 @@ async fn reads_and_traversal_return_each_edge_versions_sentence_or_none_until_on
     // Ticket #26 adds the function that stores a Sentence. Until then the
     // table's owner stores one, as that function will, after the Version
     // committed.
-    w.db.operator()
-        .await
-        .execute_typed(
-            "insert into gnomon.sentence (tenant_id, scope, version_id, sentence)
-             values ($1, $2, $3, 'Ada works at Acme.')",
-            &[
-                (&w.tenant.0, tokio_postgres::types::Type::UUID),
-                (&SCOPE, tokio_postgres::types::Type::TEXT),
-                (&v.id.0, tokio_postgres::types::Type::UUID),
-            ],
-        )
-        .await
-        .unwrap();
+    support::store_sentence(
+        &mut w.db.operator().await,
+        w.tenant,
+        SCOPE,
+        v.id.0,
+        "Ada works at Acme.",
+    )
+    .await;
 
     let read = w.read_edge(edge, now).await.unwrap();
     assert_eq!(read.sentence.as_deref(), Some("Ada works at Acme."));

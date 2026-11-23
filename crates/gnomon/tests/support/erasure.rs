@@ -459,24 +459,11 @@ impl World {
         self.store_sentence_in(SCOPE, version.0, sentence).await;
     }
 
-    /// Stores a Sentence of an Edge Version of `scope`, past RLS, as the
-    /// Pipeline would through a function a later ticket adds.
+    /// Stores a Sentence of an Edge Version of `scope`, as the Pipeline
+    /// would through a function a later ticket adds.
     pub async fn store_sentence_in(&self, scope: &str, version: Uuid, sentence: &str) {
-        self.db
-            .admin()
-            .await
-            .execute_typed(
-                "insert into gnomon.sentence (tenant_id, scope, version_id, sentence)
-                 values ($1, $2, $3, $4)",
-                &[
-                    (&self.tenant.0, Type::UUID),
-                    (&scope, Type::TEXT),
-                    (&version, Type::UUID),
-                    (&sentence, Type::TEXT),
-                ],
-            )
-            .await
-            .unwrap();
+        let mut admin = self.db.admin().await;
+        super::store_sentence(&mut admin, self.tenant, scope, version, sentence).await;
     }
 
     pub async fn sentence_of(&self, version: VersionId) -> Option<String> {
@@ -715,8 +702,13 @@ pub async fn assert_no_residue(admin: &Client, residue: &Residue<'_>) {
 pub const SEARCH_TOKEN: &str = "search_token";
 
 /// The BM25 counts of each Scope, which an Erasure lowers rather than
-/// deletes while the Scope holds other documents.
-pub const BM25_COUNT_TABLES: &[&str] = &["search_token_frequency", "search_scope_length"];
+/// deletes while the Scope holds other Versions, and the table of each
+/// transaction's changes to them, which its commit empties.
+pub const BM25_COUNT_TABLES: &[&str] = &[
+    "search_token_frequency",
+    "search_scope_length",
+    "search_count_delta",
+];
 
 /// The token rows an Erasure leaves: none of a Version it deleted, and for
 /// each recomputed Version that survives, exactly the rows its text as it
@@ -761,17 +753,23 @@ async fn assert_tokens_derived_anew(admin: &Client, residue: &Residue<'_>) {
 }
 
 /// Checks that the BM25 counts, read past RLS, are those the token rows give
-/// when counted again: each Scope's documents per word, and its documents
-/// and words.
+/// when counted again: each Scope's Versions per word, and its Versions and
+/// words. No committed transaction leaves a change to them behind.
 pub async fn assert_search_counts_match_the_token_rows(admin: &Client) {
+    let left: i64 = admin
+        .query_typed("select count(*) from gnomon.search_count_delta", &[])
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(left, 0, "committed changes to the counts are left");
     for (stored, recounted, what) in [
         (
-            "select scope, token, documents from gnomon.search_token_frequency",
+            "select scope, token, versions from gnomon.search_token_frequency",
             "select scope, token, count(*) from gnomon.search_token group by 1, 2",
             "the document frequencies",
         ),
         (
-            "select scope, documents::text, length from gnomon.search_scope_length",
+            "select scope, versions::text, words from gnomon.search_scope_length",
             "select scope, count(*)::text, sum(dl)::bigint
              from (select distinct scope, version_id, dl from gnomon.search_token) d group by 1",
             "the Scope totals",

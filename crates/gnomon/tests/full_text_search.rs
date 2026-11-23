@@ -6,7 +6,7 @@
 mod support;
 
 use gnomon::{AsOf, Caller, FullTextCandidate, KindOf, NewKind, ValidTime, Versioned};
-use gnomon::{NewNode, Patch, Scope};
+use gnomon::{NewEdge, NewNode, Patch, Scope};
 use serde_json::json;
 use support::erasure::{assert_search_counts_match_the_token_rows, at, values, World, SCOPE};
 use tokio_postgres::types::Type;
@@ -76,14 +76,14 @@ async fn candidates(
     query: &str,
     as_of: AsOf,
 ) -> Vec<FullTextCandidate> {
-    let found = caller
+    let hits = caller
         .search_full_text(w.tenant, query, as_of, 50)
         .await
         .unwrap();
-    for (i, c) in found.iter().enumerate() {
+    for (i, c) in hits.iter().enumerate() {
         assert_eq!(c.rank, i as i64 + 1, "ranks run from 1 in order");
     }
-    found
+    hits
 }
 
 fn now() -> AsOf {
@@ -119,7 +119,7 @@ async fn a_node_is_found_by_a_word_of_its_name() {
 async fn the_score_is_bm25_over_the_scope() {
     // Two Nodes of two words each. For "alpha": N = 2, df = 1, so
     // idf = ln(1 + (2 - 1 + 0.5) / (1 + 0.5)) = ln 2; tf = 1 and the length is
-    // the mean, so the term weight is 1 * 2.2 / (1 + 1.2) = 1. The score is ln 2.
+    // the mean, so the word's part is 1 * 2.2 / (1 + 1.2) = 1. The score is ln 2.
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
     let a = w
@@ -185,17 +185,17 @@ async fn only_what_a_kind_marks_as_searchable_is_indexed() {
     let supplies = w
         .caller()
         .create_edge(
-            &gnomon::NewEdge {
+            &NewEdge {
                 tenant: Some(w.tenant),
-                scope: gnomon::Scope::new(support::erasure::SCOPE),
+                scope: Scope::new(SCOPE),
                 kind: "supplies".into(),
                 source: customer,
                 target: acme,
             },
-            &gnomon::Patch::new(
+            &Patch::new(
                 e,
                 ValidTime::UNKNOWN,
-                support::erasure::values(json!({ "terms": "net thirty", "note": "hush" })),
+                values(json!({ "terms": "net thirty", "note": "hush" })),
             ),
         )
         .await
@@ -536,7 +536,7 @@ async fn ranking_does_not_change_when_a_scope_outside_the_callers_set_gains_the_
     assert_eq!(before[0].of, Versioned::Node(alpha));
     assert!(before.iter().any(|c| c.of == Versioned::Node(beta)));
 
-    // Another Scope of the Tenant gains many documents that say "alpha",
+    // Another Scope of the Tenant gains many Versions that say "alpha",
     // longer ones and shorter ones, which would make "alpha" common and the
     // mean length different if its counts were summed in.
     let g = w
@@ -568,7 +568,7 @@ async fn ranking_does_not_change_when_a_scope_outside_the_callers_set_gains_the_
 async fn counts(admin: &Client) -> (Vec<String>, Vec<String>) {
     let frequencies = admin
         .query_typed(
-            "select format('%s %s %s', scope, token, documents)
+            "select format('%s %s %s', scope, token, versions)
              from gnomon.search_token_frequency order by 1",
             &[],
         )
@@ -579,7 +579,7 @@ async fn counts(admin: &Client) -> (Vec<String>, Vec<String>) {
         .collect();
     let lengths = admin
         .query_typed(
-            "select format('%s %s %s', scope, documents, length)
+            "select format('%s %s %s', scope, versions, words)
              from gnomon.search_scope_length order by 1",
             &[],
         )
@@ -746,4 +746,90 @@ async fn writers_in_one_scope_sharing_words_all_commit_and_the_counts_stay_exact
     assert_search_counts_match_the_token_rows(&admin).await;
     let amber = found(&w.caller(), &w, "amber", now()).await;
     assert_eq!(amber.len(), 40);
+}
+
+/// Writes a Node's name in a raw transaction of the worker's, as the Store
+/// writes one patch.
+async fn write_name(
+    tx: &tokio_postgres::Transaction<'_>,
+    w: &World,
+    episode: gnomon::EpisodeId,
+    node: gnomon::NodeId,
+    name: &str,
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    tx.query_typed(
+        "select * from gnomon.write_node($1, $2, $3, null, 'unknown', null, 'unknown', $4, null)",
+        &[
+            (&w.tenant.0, Type::UUID),
+            (&node.0, Type::UUID),
+            (&episode.0, Type::UUID),
+            (&json!({ "name": name }), Type::JSONB),
+        ],
+    )
+    .await
+}
+
+/// Runs `statement` and fails as soon as any backend of the test's database
+/// waits on a lock, as the stage tests watch a claim. It asserts no timing.
+async fn without_waiting<T>(
+    admin: &Client,
+    statement: impl std::future::Future<Output = Result<T, tokio_postgres::Error>>,
+) -> T {
+    let watch = async {
+        loop {
+            let waiting: i64 = admin
+                .query_typed(
+                    "select count(*) from pg_stat_activity
+                     where datname = current_database() and wait_event_type = 'Lock'",
+                    &[],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+            if waiting > 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        done = statement => done.expect("the write succeeds"),
+        _ = watch => panic!("a writer waited on another writer's lock"),
+    }
+}
+
+#[tokio::test]
+async fn two_writers_of_several_statements_in_one_scope_never_wait_on_each_others_counts() {
+    // Each transaction writes two Nodes, one statement each, in the same
+    // Scope, and the second Node of each says the first word of the other.
+    // Counts changed statement by statement would lock the word's row and the
+    // Scope's row until commit, so the two transactions would wait on each
+    // other: a deadlock. The counts change at commit instead, in key order,
+    // and no writer waits on the other.
+    let w = World::new().await;
+    let e = w.episode(at(2024, 1, 1), None).await;
+    let mut nodes = Vec::new();
+    for _ in 0..4 {
+        nodes.push(
+            w.node("company", e, ValidTime::UNKNOWN, json!({ "name": "seed" }))
+                .await,
+        );
+    }
+    let admin = w.db.admin().await;
+    let mut c1 = w.db.login().await;
+    let mut c2 = w.db.login().await;
+    let t1 = w.raw(&mut c1).await;
+    let t2 = w.raw(&mut c2).await;
+    without_waiting(&admin, write_name(&t1, &w, e, nodes[0], "xenon")).await;
+    without_waiting(&admin, write_name(&t2, &w, e, nodes[1], "yttrium")).await;
+    without_waiting(&admin, write_name(&t1, &w, e, nodes[2], "yttrium krypton")).await;
+    without_waiting(&admin, write_name(&t2, &w, e, nodes[3], "xenon krypton")).await;
+    t1.commit().await.unwrap();
+    t2.commit().await.unwrap();
+
+    assert_search_counts_match_the_token_rows(&admin).await;
+    let caller = w.caller();
+    assert_eq!(found(&caller, &w, "krypton", now()).await.len(), 2);
+    assert_eq!(found(&caller, &w, "xenon", now()).await.len(), 2);
+    assert_eq!(found(&caller, &w, "seed", now()).await, vec![]);
 }

@@ -23,7 +23,7 @@ pub struct FullTextCandidate {
     pub version: VersionId,
     pub of: Versioned,
     pub scope: Scope,
-    /// The Version's BM25 score for the query, from the term counts of the
+    /// The Version's BM25 score for the query, from the word counts of the
     /// caller's allowed Scopes only.
     pub score: f64,
     /// Its place in the branch's list, from 1, by score and then by Version
