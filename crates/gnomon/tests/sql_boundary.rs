@@ -446,31 +446,27 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
             // and records only its own transaction's changes (migration
             // 0016). No caller writes either table.
             if BM25_COUNT_TABLES.contains(&name.as_str()) && roles == ["gnomon_definer"] {
+                let pending = format!(
+                    "((tenant_id = gnomon.tenant_id()) AND (EXISTS ( SELECT\n   \
+                     FROM gnomon.search_count_delta d\n  \
+                     WHERE ((d.tenant_id = {name}.tenant_id) AND \
+                     (d.written_in = pg_current_xact_id_if_assigned()) AND \
+                     (d.scope = {name}.scope)))))"
+                );
                 let (own_using, own_check) = if name == "search_count_delta" {
                     (
                         "((tenant_id = gnomon.tenant_id()) AND \
-                         (written_in = pg_current_xact_id_if_assigned()))",
+                         (written_in = pg_current_xact_id_if_assigned()))"
+                            .to_owned(),
                         "((tenant_id = gnomon.tenant_id()) AND \
-                         (written_in = pg_current_xact_id()))",
+                         (written_in = pg_current_xact_id()))"
+                            .to_owned(),
                     )
                 } else {
-                    (
-                        "((tenant_id = gnomon.tenant_id()) AND \
-                         gnomon.search_counts_pending(tenant_id, scope))",
-                        "((tenant_id = gnomon.tenant_id()) AND \
-                         gnomon.search_counts_pending(tenant_id, scope))",
-                    )
+                    (pending.clone(), pending)
                 };
-                assert_eq!(
-                    using.as_deref(),
-                    Some(own_using),
-                    "gnomon.{name} the definer's USING"
-                );
-                assert_eq!(
-                    check.as_deref(),
-                    Some(own_check),
-                    "gnomon.{name} the definer's CHECK"
-                );
+                assert_eq!(using, Some(own_using), "gnomon.{name} the definer's USING");
+                assert_eq!(check, Some(own_check), "gnomon.{name} the definer's CHECK");
                 continue;
             }
             if let Some(using) = using {

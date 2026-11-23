@@ -175,28 +175,34 @@ create policy search_count_delta_own on gnomon.search_count_delta
   using (tenant_id = gnomon.tenant_id() and written_in = pg_current_xact_id_if_assigned())
   with check (tenant_id = gnomon.tenant_id() and written_in = pg_current_xact_id());
 
--- Whether the current transaction recorded a change to the counts of
--- `p_scope`.
-create function gnomon.search_counts_pending(p_tenant_id uuid, p_scope text) returns boolean
-  language sql stable security invoker set search_path = ''
-  as $$
-    select exists (
-      select from gnomon.search_count_delta d
-      where d.tenant_id = p_tenant_id and d.written_in = pg_current_xact_id_if_assigned()
-        and d.scope = p_scope
-    )
-  $$;
-
 -- The definer changes the counts only of a Scope whose changes its own
--- transaction recorded.
+-- transaction recorded. The condition is a subquery, not a function call,
+-- because a function with a pinned search path costs a setting change on
+-- every row the policy checks.
 create policy search_token_frequency_pending on gnomon.search_token_frequency
   for all to gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and gnomon.search_counts_pending(tenant_id, scope))
-  with check (tenant_id = gnomon.tenant_id() and gnomon.search_counts_pending(tenant_id, scope));
+  using (tenant_id = gnomon.tenant_id()
+         and exists (select from gnomon.search_count_delta d
+                     where d.tenant_id = search_token_frequency.tenant_id
+                       and d.written_in = pg_current_xact_id_if_assigned()
+                       and d.scope = search_token_frequency.scope))
+  with check (tenant_id = gnomon.tenant_id()
+              and exists (select from gnomon.search_count_delta d
+                          where d.tenant_id = search_token_frequency.tenant_id
+                            and d.written_in = pg_current_xact_id_if_assigned()
+                            and d.scope = search_token_frequency.scope));
 create policy search_scope_length_pending on gnomon.search_scope_length
   for all to gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and gnomon.search_counts_pending(tenant_id, scope))
-  with check (tenant_id = gnomon.tenant_id() and gnomon.search_counts_pending(tenant_id, scope));
+  using (tenant_id = gnomon.tenant_id()
+         and exists (select from gnomon.search_count_delta d
+                     where d.tenant_id = search_scope_length.tenant_id
+                       and d.written_in = pg_current_xact_id_if_assigned()
+                       and d.scope = search_scope_length.scope))
+  with check (tenant_id = gnomon.tenant_id()
+              and exists (select from gnomon.search_count_delta d
+                          where d.tenant_id = search_scope_length.tenant_id
+                            and d.written_in = pg_current_xact_id_if_assigned()
+                            and d.scope = search_scope_length.scope));
 
 -- The definer's reach into Scopes the caller cannot see, as migration 0012
 -- gives it on the other tables of an Edge: it reads and deletes the token
@@ -289,66 +295,50 @@ create function gnomon.maintain_search_index() returns trigger
     t uuid;
     v_sign bigint;
     v_versions uuid[];
+    d record;
   begin
-    -- At commit: the transaction's changes to the counts, every word's row
-    -- and then every Scope's row. The rows that exist are locked in key
-    -- order. A change that empties a row deletes it, the rest are updated,
-    -- and new rows are inserted in key order. Then the changes go.
+    -- At commit: the transaction's changes to the counts of the Tenant that
+    -- fired it, one row at a time, every word's row in key order and then
+    -- every Scope's row. Each statement reaches one row by its key. A change
+    -- that empties a row deletes it. Then the changes go.
     if tg_level = 'ROW' then
-      perform from gnomon.search_token_frequency f
-        join gnomon.search_count_delta d
-          on d.tenant_id = f.tenant_id and d.scope = f.scope and d.token = f.token
-        where d.written_in = pg_current_xact_id()
-        order by f.tenant_id, f.scope, f.token
-        for update of f;
-      delete from gnomon.search_token_frequency f
-        using gnomon.search_count_delta d
-        where d.written_in = pg_current_xact_id()
-          and f.tenant_id = d.tenant_id and f.scope = d.scope and f.token = d.token
-          and f.versions + d.versions <= 0;
-      update gnomon.search_token_frequency f set versions = f.versions + d.versions
-        from gnomon.search_count_delta d
-        where d.written_in = pg_current_xact_id() and d.versions <> 0
-          and f.tenant_id = d.tenant_id and f.scope = d.scope and f.token = d.token;
-      insert into gnomon.search_token_frequency as f (tenant_id, scope, token, versions)
-        select d.tenant_id, d.scope, d.token, d.versions
-        from gnomon.search_count_delta d
-        where d.written_in = pg_current_xact_id() and d.token is not null and d.versions > 0
-          and not exists (select from gnomon.search_token_frequency x
-                          where x.tenant_id = d.tenant_id and x.scope = d.scope
-                            and x.token = d.token)
-        order by d.tenant_id, d.scope, d.token
-        on conflict (tenant_id, scope, token)
-          do update set versions = f.versions + excluded.versions;
-
-      perform from gnomon.search_scope_length s
-        join gnomon.search_count_delta d on d.tenant_id = s.tenant_id and d.scope = s.scope
-        where d.written_in = pg_current_xact_id() and d.token is null
-        order by s.tenant_id, s.scope
-        for update of s;
-      delete from gnomon.search_scope_length s
-        using gnomon.search_count_delta d
-        where d.written_in = pg_current_xact_id() and d.token is null
-          and s.tenant_id = d.tenant_id and s.scope = d.scope
-          and s.versions + d.versions <= 0;
-      update gnomon.search_scope_length s
-        set versions = s.versions + d.versions, words = s.words + d.words
-        from gnomon.search_count_delta d
-        where d.written_in = pg_current_xact_id() and d.token is null
-          and (d.versions <> 0 or d.words <> 0)
-          and s.tenant_id = d.tenant_id and s.scope = d.scope;
-      insert into gnomon.search_scope_length as s (tenant_id, scope, versions, words)
-        select d.tenant_id, d.scope, d.versions, d.words
-        from gnomon.search_count_delta d
-        where d.written_in = pg_current_xact_id() and d.token is null and d.versions > 0
-          and not exists (select from gnomon.search_scope_length x
-                          where x.tenant_id = d.tenant_id and x.scope = d.scope)
-        order by d.tenant_id, d.scope
-        on conflict (tenant_id, scope)
-          do update set versions = s.versions + excluded.versions,
-                        words = s.words + excluded.words;
-
-      delete from gnomon.search_count_delta d where d.written_in = pg_current_xact_id();
+      for d in
+        select x.* from gnomon.search_count_delta x
+        where x.tenant_id = new.tenant_id and x.written_in = new.written_in
+        order by x.token is null, x.scope, x.token
+      loop
+        if d.token is not null and d.versions > 0 then
+          insert into gnomon.search_token_frequency as f (tenant_id, scope, token, versions)
+            values (d.tenant_id, d.scope, d.token, d.versions)
+            on conflict (tenant_id, scope, token)
+              do update set versions = f.versions + excluded.versions;
+        elsif d.token is not null and d.versions < 0 then
+          update gnomon.search_token_frequency f set versions = f.versions + d.versions
+            where f.tenant_id = d.tenant_id and f.scope = d.scope and f.token = d.token
+              and f.versions + d.versions > 0;
+          if not found then
+            delete from gnomon.search_token_frequency f
+              where f.tenant_id = d.tenant_id and f.scope = d.scope and f.token = d.token;
+          end if;
+        elsif d.token is null and d.versions > 0 then
+          insert into gnomon.search_scope_length as l (tenant_id, scope, versions, words)
+            values (d.tenant_id, d.scope, d.versions, d.words)
+            on conflict (tenant_id, scope)
+              do update set versions = l.versions + excluded.versions,
+                            words = l.words + excluded.words;
+        elsif d.token is null and (d.versions < 0 or d.words <> 0) then
+          update gnomon.search_scope_length l
+            set versions = l.versions + d.versions, words = l.words + d.words
+            where l.tenant_id = d.tenant_id and l.scope = d.scope
+              and l.versions + d.versions > 0;
+          if not found then
+            delete from gnomon.search_scope_length l
+              where l.tenant_id = d.tenant_id and l.scope = d.scope;
+          end if;
+        end if;
+      end loop;
+      delete from gnomon.search_count_delta x
+        where x.tenant_id = new.tenant_id and x.written_in = new.written_in;
       return null;
     end if;
 
@@ -415,7 +405,7 @@ create trigger search_token_count_deleted after delete on gnomon.search_token
   referencing old table as changed
   for each statement execute function gnomon.maintain_search_index();
 -- Once per Scope a transaction changed, at commit. The first firing applies
--- every change of the transaction, and the rest find none left.
+-- every change of the transaction in its Tenant, and the rest find none left.
 create constraint trigger search_count_delta_apply after insert on gnomon.search_count_delta
   deferrable initially deferred
   for each row when (new.token is null)
@@ -542,7 +532,6 @@ begin
     from pg_proc p, aclexplode(p.proacl) a
     where p.oid in (
       'gnomon.kind_search(uuid, text)'::regprocedure,
-      'gnomon.search_counts_pending(uuid, text)'::regprocedure,
       'gnomon.search_text_tokens(uuid, uuid[])'::regprocedure,
       'gnomon.index_search_text(uuid, uuid[], boolean)'::regprocedure,
       'gnomon.maintain_search_index()'::regprocedure,
@@ -560,7 +549,6 @@ begin
       case when g.grantee = 0 then 'public' else g.grantee::regrole::text end);
   end loop;
   revoke all on function gnomon.kind_search(uuid, text) from public;
-  revoke all on function gnomon.search_counts_pending(uuid, text) from public;
   revoke all on function gnomon.search_text_tokens(uuid, uuid[]) from public;
   revoke all on function gnomon.index_search_text(uuid, uuid[], boolean) from public;
   revoke all on function gnomon.maintain_search_index() from public;
@@ -605,7 +593,6 @@ grant select, insert, update, delete on gnomon.search_token_frequency,
   gnomon.search_scope_length, gnomon.search_count_delta
   to gnomon_definer;
 grant execute on function gnomon.kind_search(uuid, text) to gnomon_definer;
-grant execute on function gnomon.search_counts_pending(uuid, text) to gnomon_definer;
 grant execute on function gnomon.search_text_tokens(uuid, uuid[]) to gnomon_definer;
 grant execute on function gnomon.index_search_text(uuid, uuid[], boolean) to gnomon_definer;
 grant maintain on gnomon.search_token, gnomon.search_token_frequency, gnomon.search_scope_length,
