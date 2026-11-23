@@ -13,9 +13,9 @@ The suite runs in four lanes, and none replaces another:
 1. A plain container of `pgvector/pgvector:pg17`.
 2. A plain container of `supabase/postgres` 17.x.
 3. The Supabase CLI local stack, with the migrations applied through the Supabase export target and the suite pointed at it through `GNOMON_TEST_DATABASE_URL`.
-4. PgBouncer and Supavisor in transaction mode at their default settings, again through `GNOMON_TEST_DATABASE_URL`.
+4. PgBouncer and Supavisor in transaction mode at their default settings, again through `GNOMON_TEST_DATABASE_URL`, which points at the pooler. The harness builds templates and creates test databases straight on the server behind it, through `GNOMON_TEST_DIRECT_DATABASE_URL`, so only callers go through the pooler.
 
-Lane 3 exists apart from lane 2 because the two test different things. The bare image tests the database. The CLI stack tests the path a Supabase consumer takes: migrations the CLI applies, the stack's own roles, and PostgREST and the pooler in front of the database.
+Lane 3 exists apart from lane 2 because the two test different things. The bare image tests the database. The CLI stack tests the path a Supabase consumer takes: migrations the CLI applies, the stack's own roles, and PostgREST in front of the database. Lane 3 runs with the stack's pooler off. Supavisor is lane 4's.
 
 ## Considered options
 
