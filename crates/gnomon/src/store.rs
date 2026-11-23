@@ -35,8 +35,9 @@ use tokio_postgres::{Client, Config, NoTls, Row, Statement, Transaction};
 use crate::connect::ConnectOptions;
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
-    AsOf, Bound, Citation, Episode, EpisodeId, Error, Kind, KindOf, NewEpisode, NewKind, NewNode,
-    NodeId, NodeVersion, Patch, Scope, TenantId, ValidTime, VersionId, WriteOutcome, WriteStatus,
+    AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Episode,
+    EpisodeId, Error, Kind, KindOf, NewEpisode, NewKind, NewNode, NodeId, NodeVersion, Patch,
+    Precision, Scope, TenantId, ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -546,7 +547,7 @@ impl Caller<'_> {
                 "select id, node_id, scope, kind, props,
                         nullif(valid_from, '-infinity'), valid_from_precision::text,
                         nullif(valid_to, 'infinity'), valid_to_precision::text,
-                        recorded_from, nullif(recorded_to, 'infinity')
+                        recorded_from, nullif(recorded_to, 'infinity'), uncertain, text_hash
                  from gnomon.read_node($1, $2, $3, $4)",
                 &[
                     (&tenant.0, Type::UUID),
@@ -574,8 +575,75 @@ impl Caller<'_> {
                 },
                 recorded_from: r.get(9),
                 recorded_to: r.get(10),
+                uncertain: r.get(11),
+                text_hash: r.get(12),
             }
         }))
+    }
+
+    /// States a bound of a current Version's Valid time, citing the
+    /// statement's Episode (ADR-0008). A bound the Version left unknown, or a
+    /// narrower precision within the same period, is a Refinement. A bound
+    /// outside that period, or a coarser one, contradicts the Version and is
+    /// recorded as a Correction. Either way the earlier Version stays
+    /// readable As-of before the statement.
+    pub async fn state_bound(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        node: NodeId,
+        statement: &BoundStatement,
+    ) -> Result<BoundOutcome, Error> {
+        let (at, precision) = statement.bound.parts();
+        let side = match statement.side {
+            BoundSide::Start => "from",
+            BoundSide::End => "to",
+        };
+        let tenant = tenant.into();
+        let mut client = self.store.client.lock().await;
+        let mut attempt = 0;
+        loop {
+            let (tx, tenant) = self.begin(&mut client, tenant).await?;
+            let rows = self
+                .store
+                .statements
+                .query(
+                    &tx,
+                    "select change, recorded_at, versions
+                     from gnomon.state_bound($1, $2, $3, $4, $5, $6, $7)",
+                    &[
+                        (&tenant.0, Type::UUID),
+                        (&node.0, Type::UUID),
+                        (&statement.episode.0, Type::UUID),
+                        (&statement.version.0, Type::UUID),
+                        (&side, Type::TEXT),
+                        (&at, Type::TIMESTAMPTZ),
+                        (&precision, Type::TEXT),
+                    ],
+                )
+                .await
+                .map_err(Error::from_store);
+            let rows = match rows {
+                Err(e) if attempt < WRITE_RETRIES && is_retryable(&e) => {
+                    attempt += 1;
+                    continue;
+                }
+                other => other?,
+            };
+            tx.commit().await?;
+            let r = &rows[0];
+            let change = match r.get::<_, &str>(0) {
+                "refinement" => BoundChange::Refinement,
+                "correction" => BoundChange::Correction,
+                "unchanged" => BoundChange::Unchanged,
+                other => panic!("gnomon.state_bound returned change {other:?}"),
+            };
+            let opened: Vec<uuid::Uuid> = r.get(2);
+            return Ok(BoundOutcome {
+                change,
+                recorded_at: r.get(1),
+                opened: opened.into_iter().map(VersionId).collect(),
+            });
+        }
     }
 
     /// Lists the Citations of a Version: each Episode it was derived from,
@@ -619,6 +687,7 @@ async fn write_patch(
     patch: &Patch,
 ) -> Result<WriteOutcome, Error> {
     let (from, to) = patch.valid_time.instants();
+    let ((from, from_precision), (to, to_precision)) = (from.parts(), to.parts());
     let values = Value::Object(patch.values.clone());
     let places = (!patch.places.is_empty()).then(|| {
         Value::Object(
@@ -630,13 +699,16 @@ async fn write_patch(
         )
     });
     let rows = statements.query(tx,
-            "select status, recorded_at, versions from gnomon.write_node($1, $2, $3, $4, $5, $6, $7)",
+            "select status, recorded_at, versions
+             from gnomon.write_node($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             &[
                 (&tenant.0, Type::UUID),
                 (&node.0, Type::UUID),
                 (&patch.episode.0, Type::UUID),
                 (&from, Type::TIMESTAMPTZ),
+                (&from_precision, Type::TEXT),
                 (&to, Type::TIMESTAMPTZ),
+                (&to_precision, Type::TEXT),
                 (&values, Type::JSONB),
                 (&places, Type::JSONB),
             ],
@@ -666,9 +738,10 @@ fn is_retryable(e: &Error) -> bool {
 
 /// A Valid-time bound as the Store returns it: unknown, or an instant.
 fn bound(at: Option<DateTime<Utc>>, precision: &str) -> Bound {
-    match (precision, at) {
-        ("unknown", _) | (_, None) => Bound::Unknown,
-        (_, Some(t)) => Bound::At(t),
+    match (Precision::from_sql(precision), at) {
+        (None, _) | (_, None) => Bound::Unknown,
+        (Some(Precision::Instant), Some(t)) => Bound::At(t),
+        (Some(precision), Some(at)) => Bound::Period { at, precision },
     }
 }
 

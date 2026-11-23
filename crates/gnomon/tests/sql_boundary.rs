@@ -442,6 +442,7 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
         "gnomon.read_kind(",
         "gnomon.create_node(",
         "gnomon.write_node(",
+        "gnomon.state_bound(",
         "gnomon.read_node(",
         "gnomon.list_citations(",
         "gnomon.default_tenant()",
@@ -837,7 +838,7 @@ async fn nodes() -> Nodes {
     }
 }
 
-const WRITE_NODE: &str = "select status from gnomon.write_node($1, $2, $3, null, null, $4, null)";
+const WRITE_NODE: &str = "select status from gnomon.write_node($1, $2, $3, null, null, null, null, $4, null)";
 
 async fn write_node(
     tx: &Transaction<'_>,
@@ -1815,7 +1816,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         })
         .await
         .unwrap();
-    single
+    let (node, written) = single
         .create_node(
             &gnomon::NewNode {
                 tenant: None,
@@ -1830,6 +1831,23 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         )
         .await
         .unwrap();
+    // A Refinement writes a bound statement.
+    single
+        .state_bound(
+            None,
+            node,
+            &gnomon::BoundStatement {
+                episode,
+                version: written.opened[0],
+                side: gnomon::BoundSide::Start,
+                bound: gnomon::Bound::Period {
+                    at: Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap(),
+                    precision: gnomon::Precision::Month,
+                },
+            },
+        )
+        .await
+        .unwrap();
 
     let operator = db.operator().await;
     let tables = tenant_tables(&operator).await;
@@ -1841,6 +1859,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         "kind_rule",
         "node",
         "version",
+        "bound_statement",
     ] {
         assert!(
             tables.iter().any(|t| t == expected),
@@ -1878,5 +1897,408 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
             seen, n,
             "gnomon.{t}: the first Tenant sees {seen} of {n} rows"
         );
+    }
+}
+
+// Bound precision, Refinement and the Correction a contradiction becomes
+// (ADR-0007, ADR-0008). A bound statement is select and insert only, its kind
+// is decided by a trigger, and a statement moves no committed row.
+
+/// The ID of the Contribution behind tenant one's first Version, and the
+/// Episode and Reference time a statement about it cites.
+async fn first_contribution(n: &Nodes) -> (i64, chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
+    let row = n
+        .w
+        .db
+        .admin()
+        .await
+        .query_typed(
+            "select c.id, c.episode_reference_time, c.episode_recorded_at
+             from gnomon.contribution c where c.node_id = $1 order by c.id limit 1",
+            &[(&n.n1, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    (row[0].get(0), row[0].get(1), row[0].get(2))
+}
+
+const INSERT_STATEMENT: &str = "insert into gnomon.bound_statement
+    (tenant_id, scope, node_id, episode_id, contribution_id, side, bound_at, bound_precision,
+     episode_reference_time, episode_recorded_at)
+  values ($1, 'support', $2, $3, $4, 'from', $5::text::timestamptz, $6::text::gnomon.time_precision,
+     $7, $8)";
+
+async fn insert_statement(
+    tx: &Transaction<'_>,
+    n: &Nodes,
+    contribution: (i64, chrono::DateTime<Utc>, chrono::DateTime<Utc>),
+    bound: &str,
+    precision: &str,
+) -> Result<u64, tokio_postgres::Error> {
+    tx.execute_typed(
+        INSERT_STATEMENT,
+        &[
+            (&n.w.t1, Type::UUID),
+            (&n.n1, Type::UUID),
+            (&n.w.t1_support, Type::UUID),
+            (&contribution.0, Type::INT8),
+            (&bound, Type::TEXT),
+            (&precision, Type::TEXT),
+            (&contribution.1, Type::TIMESTAMPTZ),
+            (&contribution.2, Type::TIMESTAMPTZ),
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_caller_cannot_choose_the_kind_of_a_bound_statement_or_change_or_delete_one() {
+    let n = nodes().await;
+    let c = first_contribution(&n).await;
+    for role in [USER, WORKER] {
+        // The kind and the Recorded time are not the caller's to give.
+        for (column, value) in [("kind", "'refinement'"), ("recorded_at", "'2000-01-01'")] {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+            let r = tx
+                .execute_typed(
+                    &format!(
+                        "insert into gnomon.bound_statement
+                           (tenant_id, scope, node_id, episode_id, contribution_id, side,
+                            bound_at, bound_precision, episode_reference_time,
+                            episode_recorded_at, {column})
+                         values ($1, 'support', $2, $3, $4, 'from', '2024-03-01', 'month',
+                            $5, $6, {value})"
+                    ),
+                    &[
+                        (&n.w.t1, Type::UUID),
+                        (&n.n1, Type::UUID),
+                        (&n.w.t1_support, Type::UUID),
+                        (&c.0, Type::INT8),
+                        (&c.1, Type::TIMESTAMPTZ),
+                        (&c.2, Type::TIMESTAMPTZ),
+                    ],
+                )
+                .await;
+            assert_refused(r, &format!("{role}: insert a statement with its {column}"));
+        }
+        // A statement, once recorded, is neither changed nor deleted.
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+        // The second role narrows what the first stated.
+        let (bound, precision) = if role == USER {
+            ("2024-03-09", "month")
+        } else {
+            ("2024-03-05", "day")
+        };
+        insert_statement(&tx, &n, c, bound, precision).await.unwrap();
+        tx.commit().await.unwrap();
+        for (sql, what) in [
+            ("update gnomon.bound_statement set bound_at = '2030-01-01'", "update a statement"),
+            ("update gnomon.bound_statement set kind = 'correction'", "relabel a statement"),
+            ("delete from gnomon.bound_statement", "delete a statement"),
+        ] {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+            assert_refused(tx.execute_typed(sql, &[]).await, &format!("{role}: {what}"));
+        }
+    }
+    let rows = n
+        .w
+        .db
+        .admin()
+        .await
+        .query_typed(
+            "select count(*), min(bound_at)::text from gnomon.bound_statement",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, i64>(0), 2);
+    assert_eq!(rows[0].get::<_, String>(1), "2024-03-01 00:00:00+00");
+}
+
+#[tokio::test]
+async fn a_caller_inserting_a_bound_statement_directly_gets_the_kind_the_earlier_bound_decides() {
+    let n = nodes().await;
+    let c = first_contribution(&n).await;
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    // The first Contribution's start was unknown: any bound refines it.
+    insert_statement(&tx, &n, c, "2024-03-17 12:00+00", "month").await.unwrap();
+    // Inside March, narrower: still a Refinement.
+    insert_statement(&tx, &n, c, "2024-03-17 12:00+00", "day").await.unwrap();
+    // April is outside March 17: a contradiction, so a Correction.
+    insert_statement(&tx, &n, c, "2024-04-02", "day").await.unwrap();
+    // Coarser than the day it replaces: also a Correction.
+    insert_statement(&tx, &n, c, "2024-04-01", "month").await.unwrap();
+    let rows = tx
+        .query_typed(
+            "select kind, bound_at::text from gnomon.bound_statement order by id",
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(
+        got,
+        [
+            ("refinement", "2024-03-01 00:00:00+00"),
+            ("refinement", "2024-03-17 00:00:00+00"),
+            ("correction", "2024-04-02 00:00:00+00"),
+            ("correction", "2024-04-01 00:00:00+00"),
+        ]
+        .map(|(k, b)| (k.to_owned(), b.to_owned()))
+    );
+    // Stating the bound the Contribution already has changes nothing.
+    let err = insert_statement(&tx, &n, c, "2024-04-20", "month")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_caller_cannot_empty_a_contributions_valid_time_with_a_bound_statement() {
+    let n = nodes().await;
+    let c = first_contribution(&n).await;
+    // The Contribution's end is open, so give it one first, then try to start
+    // after it.
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    tx.execute_typed(
+        "insert into gnomon.bound_statement
+           (tenant_id, scope, node_id, episode_id, contribution_id, side, bound_at,
+            bound_precision, episode_reference_time, episode_recorded_at)
+         values ($1, 'support', $2, $3, $4, 'to', '2024-03-01', 'day', $5, $6)",
+        &[
+            (&n.w.t1, Type::UUID),
+            (&n.n1, Type::UUID),
+            (&n.w.t1_support, Type::UUID),
+            (&c.0, Type::INT8),
+            (&c.1, Type::TIMESTAMPTZ),
+            (&c.2, Type::TIMESTAMPTZ),
+        ],
+    )
+    .await
+    .unwrap();
+    let err = insert_statement(&tx, &n, c, "2024-03-01", "day").await.unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_caller_cannot_state_a_bound_in_another_tenant_or_scope_or_of_closed_history() {
+    let n = nodes().await;
+    let call = "select change from gnomon.state_bound($1, $2, $3, $4, 'from', '2024-03-01', 'month')";
+    // Another Tenant's claims, naming tenant one.
+    for role in [USER, WORKER] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(n.w.t2, &["support"])).await;
+        let r = tx
+            .query_typed(
+                call,
+                &[
+                    (&n.w.t1, Type::UUID),
+                    (&n.n1, Type::UUID),
+                    (&n.w.t1_support, Type::UUID),
+                    (&n.open, Type::UUID),
+                ],
+            )
+            .await;
+        assert_refused(r, &format!("{role}: state a bound of another Tenant's Node"));
+        // The right Tenant, but a Scope the claims do not grant: the Node is
+        // not visible.
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(n.w.t1, &["billing"])).await;
+        let err = tx
+            .query_typed(
+                call,
+                &[
+                    (&n.w.t1, Type::UUID),
+                    (&n.n1, Type::UUID),
+                    (&n.w.t1_billing, Type::UUID),
+                    (&n.open, Type::UUID),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{role}: {err:?}");
+    }
+    // A closed Version is history: a statement about it is refused.
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    let err = tx
+        .query_typed(
+            call,
+            &[
+                (&n.w.t1, Type::UUID),
+                (&n.n1, Type::UUID),
+                (&n.w.t1_support, Type::UUID),
+                (&n.closed, Type::UUID),
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_refinement_leaves_committed_history_as_it_was_and_gives_callers_no_new_rights() {
+    let n = nodes().await;
+    let admin = n.w.db.admin().await;
+    let snapshot = || async {
+        admin
+            .query(
+                "select id::text, props::text, valid_from::text, valid_from_precision::text,
+                        valid_to::text, recorded_from::text, recorded_to::text, text_hash
+                 from gnomon.version where node_id = $1 order by recorded_from, id",
+                &[&n.n1],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (0..8).map(|i| r.get::<_, Option<String>>(i)).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+    let before = snapshot().await;
+
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    let row = tx
+        .query_typed(
+            "select change, versions from gnomon.state_bound($1, $2, $3, $4, 'from', '2024-03-17', 'day')",
+            &[
+                (&n.w.t1, Type::UUID),
+                (&n.n1, Type::UUID),
+                (&n.w.t1_support, Type::UUID),
+                (&n.open, Type::UUID),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row[0].get::<_, String>(0), "refinement");
+    tx.commit().await.unwrap();
+
+    let after = snapshot().await;
+    // The Versions that were there before are the same rows, apart from the
+    // end of the Recorded time of the one the statement closed.
+    for old in &before {
+        let new = after.iter().find(|r| r[0] == old[0]).expect("a row survives");
+        assert_eq!(new[..6], old[..6], "committed history is not rewritten");
+        assert_eq!(new[7], old[7]);
+    }
+    assert_eq!(after.len(), before.len() + 1);
+    let opened = after.iter().find(|r| !before.iter().any(|b| b[0] == r[0])).unwrap();
+    let was = before.iter().find(|b| b[0] == Some(n.open.to_string())).unwrap();
+    assert_eq!(opened[7], was[7], "a Refinement shares the text hash");
+
+    // The statement added no right to rewrite history.
+    for role in [USER, WORKER] {
+        let rights = admin
+            .query_typed(
+                "select has_table_privilege($1, 'gnomon.bound_statement', 'UPDATE'),
+                        has_table_privilege($1, 'gnomon.bound_statement', 'DELETE'),
+                        has_table_privilege($1, 'gnomon.bound_statement', 'TRUNCATE'),
+                        has_table_privilege($1, 'gnomon.version', 'DELETE'),
+                        has_column_privilege($1, 'gnomon.version', 'valid_from', 'UPDATE'),
+                        has_column_privilege($1, 'gnomon.version', 'valid_from_precision', 'UPDATE'),
+                        has_column_privilege($1, 'gnomon.version', 'props', 'UPDATE'),
+                        has_column_privilege($1, 'gnomon.version', 'recorded_to', 'UPDATE'),
+                        has_column_privilege($1, 'gnomon.version', 'text_hash', 'INSERT'),
+                        has_column_privilege($1, 'gnomon.version', 'text_hash', 'UPDATE'),
+                        has_column_privilege($1, 'gnomon.contribution', 'valid_from', 'UPDATE')",
+                &[(&role, Type::TEXT)],
+            )
+            .await
+            .unwrap();
+        let got: Vec<bool> = (0..11).map(|i| rights[0].get(i)).collect();
+        assert_eq!(
+            got,
+            [false, false, false, true, false, false, false, true, false, false, false],
+            "{role}"
+        );
+    }
+    // Nor can a caller rewrite a Version's bound by hand.
+    for (sql, what) in [
+        ("update gnomon.version set valid_from = '2030-01-01' where id = $1", "move a bound"),
+        (
+            "update gnomon.version set valid_from_precision = 'year' where id = $1",
+            "change a bound's precision",
+        ),
+    ] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+        assert_refused(
+            tx.execute_typed(sql, &[(&n.closed, Type::UUID)]).await,
+            what,
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_stated_bound_is_the_start_of_its_period_in_utc_whatever_the_sessions_time_zone() {
+    let n = nodes().await;
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    // 23:00 UTC on March 31 is April 1 in Auckland.
+    tx.batch_execute("set local timezone = 'Pacific/Auckland'").await.unwrap();
+    let node: Uuid = tx
+        .query_typed(
+            "select gnomon.create_node($1, 'support', 'node')",
+            &[(&n.w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    tx.query_typed(
+        "select status from gnomon.write_node($1, $2, $3,
+           '2024-03-31 23:00+00', 'month', '2025-12-31 23:00+00', 'year', '{\"name\": \"x\"}', null)",
+        &[
+            (&n.w.t1, Type::UUID),
+            (&node, Type::UUID),
+            (&n.w.t1_support, Type::UUID),
+        ],
+    )
+    .await
+    .unwrap();
+    let row = tx
+        .query_typed(
+            "select (valid_from at time zone 'UTC')::text, valid_from_precision::text,
+                    (valid_to at time zone 'UTC')::text, valid_to_precision::text
+             from gnomon.version where node_id = $1",
+            &[(&node, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row[0].get::<_, String>(0), "2024-03-01 00:00:00");
+    assert_eq!(row[0].get::<_, String>(1), "month");
+    assert_eq!(row[0].get::<_, String>(2), "2025-01-01 00:00:00");
+    assert_eq!(row[0].get::<_, String>(3), "year");
+}
+
+#[tokio::test]
+async fn a_write_with_a_precision_that_does_not_fit_its_bound_is_refused() {
+    let n = nodes().await;
+    for (bounds, what) in [
+        ("'2024-03-01', 'unknown', null, null", "a stated bound of unknown precision"),
+        ("null, 'month', null, null", "an unknown bound with a precision"),
+        ("'2024-03-01', 'fortnight', null, null", "a precision that does not exist"),
+        ("'2024-03-17', 'month', '2024-03-20', 'month'", "a period that is empty once truncated"),
+    ] {
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+        let err = tx
+            .query_typed(
+                &format!(
+                    "select status from gnomon.write_node($1, $2, $3, {bounds}, '{{\"name\": \"x\"}}', null)"
+                ),
+                &[
+                    (&n.w.t1, Type::UUID),
+                    (&n.n1, Type::UUID),
+                    (&n.w.t1_support, Type::UUID),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{what}: {err:?}");
     }
 }

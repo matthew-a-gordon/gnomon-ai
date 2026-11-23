@@ -20,8 +20,8 @@ use uuid::Uuid;
 pub use connect::{ConnectOptions, Tls};
 pub use kind::{Kind, KindOf, NewKind, ROOT_EDGE_KIND, ROOT_NODE_KIND};
 pub use node::{
-    AsOf, Bound, Citation, NewNode, NodeId, NodeVersion, Patch, ValidTime, VersionId, WriteOutcome,
-    WriteStatus,
+    AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, NewNode, NodeId,
+    NodeVersion, Patch, Precision, ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
 pub use store::{Caller, Store};
 

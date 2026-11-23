@@ -35,6 +35,37 @@ impl fmt::Display for VersionId {
     }
 }
 
+/// How exactly a source states a Valid-time bound (ADR-0008). `unknown`, the
+/// coarsest, is [`Bound::Unknown`], so it is not listed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Precision {
+    Year,
+    Month,
+    Day,
+    Instant,
+}
+
+impl Precision {
+    pub(crate) fn as_sql(self) -> &'static str {
+        match self {
+            Precision::Year => "year",
+            Precision::Month => "month",
+            Precision::Day => "day",
+            Precision::Instant => "instant",
+        }
+    }
+
+    pub(crate) fn from_sql(s: &str) -> Option<Precision> {
+        Some(match s {
+            "year" => Precision::Year,
+            "month" => Precision::Month,
+            "day" => Precision::Day,
+            "instant" => Precision::Instant,
+            _ => return None,
+        })
+    }
+}
+
 /// One bound of a Valid time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bound {
@@ -43,13 +74,23 @@ pub enum Bound {
     Unknown,
     /// An instant, the bound's start in UTC.
     At(DateTime<Utc>),
+    /// A period the source names, such as "March 2024". A write may give any
+    /// instant inside the period. The Store keeps the start of the period in
+    /// UTC, and a read returns that start.
+    Period {
+        at: DateTime<Utc>,
+        precision: Precision,
+    },
 }
 
 impl Bound {
-    fn instant(self) -> Option<DateTime<Utc>> {
+    /// The bound's instant and precision as the Store's SQL takes them: an
+    /// unknown bound is `(None, None)`.
+    pub(crate) fn parts(self) -> (Option<DateTime<Utc>>, Option<&'static str>) {
         match self {
-            Bound::Unknown => None,
-            Bound::At(t) => Some(t),
+            Bound::Unknown => (None, None),
+            Bound::At(t) => (Some(t), Some(Precision::Instant.as_sql())),
+            Bound::Period { at, precision } => (Some(at), Some(precision.as_sql())),
         }
     }
 }
@@ -78,6 +119,14 @@ impl ValidTime {
         }
     }
 
+    /// From `from`, a bound of any precision, on, with an open end.
+    pub fn since_bound(from: Bound) -> ValidTime {
+        ValidTime {
+            from,
+            to: Bound::Unknown,
+        }
+    }
+
     /// From `from` on, with an open end.
     pub fn since(from: DateTime<Utc>) -> ValidTime {
         ValidTime {
@@ -86,10 +135,9 @@ impl ValidTime {
         }
     }
 
-    /// The bounds as the Store's SQL takes them: an instant, or `None` for an
-    /// unknown bound.
-    pub(crate) fn instants(self) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
-        (self.from.instant(), self.to.instant())
+    /// The bounds, which the Store's SQL takes as an instant and a precision.
+    pub(crate) fn instants(self) -> (Bound, Bound) {
+        (self.from, self.to)
     }
 }
 
@@ -197,6 +245,57 @@ pub struct NodeVersion {
     pub recorded_from: DateTime<Utc>,
     /// When it stopped, or `None` while it is current.
     pub recorded_to: Option<DateTime<Utc>>,
+    /// Whether the read's valid-at instant falls inside the period of one of
+    /// this Version's imprecise bounds, so that the Version may not yet have
+    /// held (ADR-0008).
+    pub uncertain: bool,
+    /// The hash of the Version's text. Versions with the same text share it,
+    /// so a Refinement shares the earlier Version's and needs no new
+    /// embedding.
+    pub text_hash: String,
+}
+
+/// Which bound of a Version's Valid time a statement is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundSide {
+    Start,
+    End,
+}
+
+/// What one Episode states about one bound of one current Version: a bound
+/// the Version left unknown or coarse, or one that contradicts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundStatement {
+    /// The Episode the statement cites. It must be in the Node's Scope.
+    pub episode: EpisodeId,
+    /// The current Version whose bound is stated.
+    pub version: VersionId,
+    pub side: BoundSide,
+    /// The stated bound, which must be [`Bound::At`] or [`Bound::Period`].
+    pub bound: Bound,
+}
+
+/// How the Store recorded a [`BoundStatement`] (ADR-0008).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundChange {
+    /// The bound was unknown, or the statement narrows its precision within
+    /// the same period. The earlier Version was incomplete, not wrong.
+    Refinement,
+    /// The bound falls outside the earlier period, or is coarser than it:
+    /// the earlier Version was wrong about its Valid time.
+    Correction,
+    /// The statement gives the bound the Version already has.
+    Unchanged,
+}
+
+/// The result of one [`BoundStatement`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundOutcome {
+    pub change: BoundChange,
+    /// The statement's Recorded time: when its transaction started.
+    pub recorded_at: DateTime<Utc>,
+    /// The Versions the statement opened.
+    pub opened: Vec<VersionId>,
 }
 
 /// The link from a Version to an Episode it was derived from.

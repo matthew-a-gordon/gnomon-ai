@@ -50,6 +50,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0005_tenancy_modes",
         template: include_str!("../migrations/0005_tenancy_modes.sql"),
     },
+    Migration {
+        version: 6,
+        name: "0006_bound_precision",
+        template: include_str!("../migrations/0006_bound_precision.sql"),
+    },
 ];
 
 /// The schema version this build of the Store expects: the last migration's.
@@ -588,7 +593,10 @@ mod tests {
             if target == Target::Alembic {
                 let source = std::fs::read_to_string(&written[0]).unwrap();
                 let (revision, down) = alembic::revisions(&source);
-                assert_eq!(revision.as_deref(), Some("gnomon_0006"));
+                assert_eq!(
+                    revision.as_deref(),
+                    Some(format!("gnomon_{:04}", SCHEMA_VERSION + 1).as_str())
+                );
                 assert_eq!(down, vec![format!("gnomon_{:04}", SCHEMA_VERSION)]);
             }
         }
