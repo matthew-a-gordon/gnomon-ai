@@ -41,8 +41,7 @@ struct World {
 }
 
 impl World {
-    /// A deployment that granted no one Kind registration, as a fresh one
-    /// does.
+    /// A fresh deployment, which has granted no one Kind registration.
     async fn new() -> World {
         let db = TestDb::migrated().await;
         let store = Store::connect(&db.login_url(), &support::connect_options())
@@ -181,48 +180,56 @@ fn node_kind(tenant: TenantId, name: &str) -> NewKind {
     }
 }
 
+/// Asserts that `world`'s Tenant reads both reserved Kinds, and that its root
+/// Kinds and the registered Kinds in `registered` are not symmetric.
+async fn assert_reserved_kinds(world: &World, registered: &[&str]) {
+    for name in RESERVED {
+        let kind = world
+            .caller()
+            .read_kind(world.tenant, name)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name} is missing from a Tenant's Ontology"));
+        assert_eq!(
+            kind,
+            Kind {
+                tenant: world.tenant,
+                name: name.into(),
+                of: KindOf::Edge {
+                    source: vec![ROOT_NODE_KIND.into()],
+                    target: vec![ROOT_NODE_KIND.into()],
+                },
+                parent: Some(ROOT_EDGE_KIND.into()),
+                ancestors: vec![ROOT_EDGE_KIND.into()],
+                properties: json!({ "type": "object", "properties": {}, "required": [] }),
+                rules: Default::default(),
+                search: vec!["sentence".into()],
+                symmetric: true,
+            },
+        );
+    }
+    for name in [ROOT_EDGE_KIND, ROOT_NODE_KIND].iter().chain(registered) {
+        let kind = world.caller().read_kind(world.tenant, name).await.unwrap();
+        assert!(!kind.unwrap().symmetric, "{name} is symmetric");
+    }
+}
+
 #[tokio::test]
 async fn both_kinds_exist_in_every_ontology_without_registration_and_join_any_node_kinds() {
+    // A fresh deployment, which has granted no one Kind registration, reads
+    // both Kinds.
     let w = World::new().await;
-    // One Tenant registers Node Kinds of its own first. The other appears
-    // only now, long after the migrations ran, and registers nothing.
+    assert_reserved_kinds(&w, &[]).await;
+    // The Tenant then registers Node Kinds of its own, which leave the
+    // reserved Kinds as they were.
     w.db.grant_kind_registration("gnomon_worker").await;
     w.register(node_kind(w.tenant, "person")).await.unwrap();
     w.register(node_kind(w.tenant, "company")).await.unwrap();
+    assert_reserved_kinds(&w, &["person", "company"]).await;
+    // Another Tenant first appears now, long after the migrations ran, and
+    // registers nothing.
     let later = w.another_tenant().await;
-
-    for world in [&w, &later] {
-        for name in RESERVED {
-            let kind = world
-                .caller()
-                .read_kind(world.tenant, name)
-                .await
-                .unwrap()
-                .unwrap_or_else(|| panic!("{name} is missing from a Tenant's Ontology"));
-            assert_eq!(
-                kind,
-                Kind {
-                    tenant: world.tenant,
-                    name: name.into(),
-                    of: KindOf::Edge {
-                        source: vec![ROOT_NODE_KIND.into()],
-                        target: vec![ROOT_NODE_KIND.into()],
-                    },
-                    parent: Some(ROOT_EDGE_KIND.into()),
-                    ancestors: vec![ROOT_EDGE_KIND.into()],
-                    properties: json!({ "type": "object", "properties": {}, "required": [] }),
-                    rules: Default::default(),
-                    search: vec!["sentence".into()],
-                    symmetric: true,
-                },
-            );
-        }
-        // The root Kinds and a registered Kind are not symmetric.
-        for name in [ROOT_EDGE_KIND, ROOT_NODE_KIND] {
-            let kind = world.caller().read_kind(world.tenant, name).await.unwrap();
-            assert!(!kind.unwrap().symmetric, "{name} is symmetric");
-        }
-    }
+    assert_reserved_kinds(&later, &[]).await;
 
     // Any Node Kind to any Node Kind, in either Tenant.
     let (ada, acme, root) = (
@@ -523,7 +530,7 @@ async fn reads_and_traversal_do_not_collapse_two_nodes_joined_by_same_as() {
         .unwrap();
 
     let now = AsOf::current(day(15));
-    let name = |v: &gnomon::NodeVersion| Value::Object(v.values.clone());
+    let held = |v: &gnomon::NodeVersion| Value::Object(v.values.clone());
     let (va, vb) = (
         w.caller()
             .read_node(w.tenant, a, now)
@@ -536,13 +543,13 @@ async fn reads_and_traversal_do_not_collapse_two_nodes_joined_by_same_as() {
             .unwrap()
             .unwrap(),
     );
-    assert_eq!(name(&va), json!({ "name": "Ada", "aliases": ["Countess"] }));
-    assert_eq!(name(&vb), json!({ "name": "A. Lovelace" }));
+    assert_eq!(held(&va), json!({ "name": "Ada", "aliases": ["Countess"] }));
+    assert_eq!(held(&vb), json!({ "name": "A. Lovelace" }));
 
     let batch = w.caller().read_nodes(w.tenant, &[a, b], now).await.unwrap();
     assert_eq!(
-        batch.iter().map(|v| (v.node, name(v))).collect::<Vec<_>>(),
-        vec![(a, name(&va)), (b, name(&vb))]
+        batch.iter().map(|v| (v.node, held(v))).collect::<Vec<_>>(),
+        vec![(a, held(&va)), (b, held(&vb))]
     );
 
     let steps = w
@@ -553,7 +560,7 @@ async fn reads_and_traversal_do_not_collapse_two_nodes_joined_by_same_as() {
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0].neighbour, b);
     assert_eq!(
-        steps[0].neighbour_version.as_ref().map(name),
-        Some(name(&vb))
+        steps[0].neighbour_version.as_ref().map(held),
+        Some(held(&vb))
     );
 }

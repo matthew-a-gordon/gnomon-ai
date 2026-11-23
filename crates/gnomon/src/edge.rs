@@ -137,7 +137,9 @@ impl Traversal {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Step {
     /// [`Direction::Outgoing`] or [`Direction::Incoming`]: how the Edge was
-    /// followed from the Node.
+    /// followed from the Node. An Edge of a symmetric Kind has no direction,
+    /// so this is the direction the traversal asked for, or outgoing for
+    /// [`Direction::Both`], whichever end the Node is.
     pub direction: Direction,
     /// The Edge's Version at the traversal's As-of instants.
     pub edge: EdgeVersion,
