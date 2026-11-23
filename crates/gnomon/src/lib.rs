@@ -13,6 +13,7 @@ mod node;
 mod search;
 mod stage;
 mod store;
+mod summary;
 mod vacuum;
 
 use std::fmt;
@@ -37,6 +38,9 @@ pub use node::{
 pub use search::{FullTextCandidate, VectorCandidate, Versioned};
 pub use stage::{StageError, StageOutcome, StageRecord, StageStatus, StageUsage, StageWrite};
 pub use store::{Caller, Store};
+pub use summary::{
+    Community, CommunityId, DerivedCitation, NewCommunity, NewSummary, Summary, SummaryId,
+};
 pub use vacuum::{VacuumMode, VacuumReport};
 
 /// The SQLSTATE Kind registration raises for a definition outside the

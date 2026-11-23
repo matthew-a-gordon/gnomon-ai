@@ -10,8 +10,9 @@ mod support;
 use std::time::Duration;
 
 use gnomon::{
-    AsOf, Bound, BoundSide, BoundStatement, EndOfValidity, EpisodeId, MergeRule, NewEdge,
-    NewEpisode, NewNode, Patch, Precision, Retraction, Scope, ValidTime,
+    AsOf, Bound, BoundSide, BoundStatement, DerivedCitation, EndOfValidity, EpisodeId, MergeRule,
+    NewCommunity, NewEdge, NewEpisode, NewNode, NewSummary, Patch, Precision, Retraction, Scope,
+    ValidTime,
 };
 use serde_json::{json, Value};
 use support::erasure::{
@@ -171,6 +172,52 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
             .await
             .unwrap();
     }
+    // Summaries and Communities the Pipeline would have written (ADR-0014,
+    // ADR-0015). a's first Summary cites E and its regeneration F alone, so a
+    // closed row cites E. A Community of a and c cites E and F, and one of c
+    // cites F alone. Every row that cites E goes, closed or open.
+    let summarize = |content: String, cites: Vec<EpisodeId>| NewSummary {
+        scope: Scope::new(SCOPE),
+        node: a,
+        content,
+        as_of_valid: at(2024, 4, 1),
+        citations: cites.into_iter().map(DerivedCitation::of).collect(),
+    };
+    let e_summary = w
+        .caller()
+        .write_summary(
+            w.tenant,
+            &summarize(format!("{MARKER}: a's plan"), vec![e, f]),
+        )
+        .await
+        .unwrap();
+    let f_summary = w
+        .caller()
+        .write_summary(w.tenant, &summarize("a is on basic".into(), vec![f]))
+        .await
+        .unwrap();
+    let group =
+        |members: Vec<gnomon::NodeId>, content: String, cites: Vec<EpisodeId>| NewCommunity {
+            scope: Scope::new(SCOPE),
+            replaces: vec![],
+            members,
+            content,
+            as_of_valid: at(2024, 4, 1),
+            citations: cites.into_iter().map(DerivedCitation::of).collect(),
+        };
+    let e_group = w
+        .caller()
+        .write_community(
+            w.tenant,
+            &group(vec![a, c], format!("{MARKER}: a and Acme"), vec![f, e]),
+        )
+        .await
+        .unwrap();
+    let f_group = w
+        .caller()
+        .write_community(w.tenant, &group(vec![c], "Acme".into(), vec![f]))
+        .await
+        .unwrap();
     // Last, E is retracted, which marks it and retracts what only it cites.
     w.caller().retract_episode(w.tenant, e).await.unwrap();
 
@@ -234,11 +281,13 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
     for expected in [
         "bound_statement",
         "citation",
+        "community_citation",
         "contribution",
         "episode_retraction",
         "stage_record",
         "stage_usage",
         "statement",
+        "summary_citation",
     ] {
         assert!(
             referencing.iter().any(|t| t == expected),
@@ -251,6 +300,26 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .await
         .unwrap()
         .is_none());
+    // The Summary and Community that cite E are gone with their members, and
+    // those that cite F alone stand.
+    for (table, id) in [("summary", e_summary.0), ("community", e_group.0)] {
+        assert!(
+            !w.exists(table, id).await,
+            "{table} {id} cites E and stands"
+        );
+    }
+    for (table, id) in [("summary", f_summary.0), ("community", f_group.0)] {
+        assert!(w.exists(table, id).await, "{table} {id} cites F alone");
+    }
+    let members: i64 = admin
+        .query_typed(
+            "select count(*) from gnomon.community_member where community_id = $1",
+            &[(&e_group.0, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(members, 0, "the erased Community's members stand");
     assert!(w.stage_records_of(SCOPE, e).await.is_empty());
     assert_eq!(w.stage_records_of(SCOPE, f).await, f_stages);
 

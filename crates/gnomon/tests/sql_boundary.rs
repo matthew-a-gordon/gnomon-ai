@@ -2046,6 +2046,35 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         )
         .await
         .unwrap();
+    // A Summary of the Node and a Community holding it, each citing the
+    // Episode (ADR-0014, migration 0018).
+    single
+        .write_summary(
+            None,
+            &gnomon::NewSummary {
+                scope: Scope::new("support"),
+                node,
+                content: "Ada is 36.".into(),
+                as_of_valid: Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap(),
+                citations: vec![gnomon::DerivedCitation::of(episode)],
+            },
+        )
+        .await
+        .unwrap();
+    single
+        .write_community(
+            None,
+            &gnomon::NewCommunity {
+                scope: Scope::new("support"),
+                replaces: vec![],
+                members: vec![node],
+                content: "Ada, on her own.".into(),
+                as_of_valid: Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap(),
+                citations: vec![gnomon::DerivedCitation::of(episode)],
+            },
+        )
+        .await
+        .unwrap();
     let tables = tenant_tables(&operator).await;
     for expected in [
         "citation",
@@ -2065,6 +2094,11 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         "statement",
         "embedding",
         "embedding_bit",
+        "summary",
+        "summary_citation",
+        "community",
+        "community_member",
+        "community_citation",
     ] {
         assert!(
             tables.iter().any(|t| t == expected),
@@ -6361,4 +6395,546 @@ async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_c
         .map(|r| r.get(0))
         .collect();
     assert_eq!(ids, vec![version.id.0]);
+}
+
+// Summaries and Communities (ADR-0009, ADR-0014, ADR-0015, migration 0018).
+// Callers write them through invoker functions or directly, and every check
+// is the tables' own: RLS, column grants, foreign keys that carry the Scope,
+// and guard triggers. Only Erasure deletes committed rows, and its reach
+// into a Scope the caller cannot see covers only the Summaries of a Node it
+// listed.
+
+/// The Graph fixture with a committed Summary of `n1` in support and one in
+/// billing, a Summary of billing's Node in billing, and a Community of
+/// support holding `n1`, each citing its own Scope's Episode.
+struct Derived {
+    g: Graph,
+    support_summary: Uuid,
+    billing_summary: Uuid,
+    billing_node_summary: Uuid,
+    community: Uuid,
+}
+
+async fn derived() -> Derived {
+    let g = graph().await;
+    let store = Store::connect(&g.n.w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let t1 = TenantId(g.n.w.t1);
+    let both = store.as_user(
+        serde_json::from_value(json!({
+            "role": "authenticated",
+            "app_metadata": { "tenant_id": g.n.w.t1.to_string(), "scopes": ["support", "billing"] }
+        }))
+        .unwrap(),
+    );
+    let at = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
+    let summary = |scope: &str, node: Uuid, episode: Uuid, content: &str| gnomon::NewSummary {
+        scope: Scope::new(scope),
+        node: gnomon::NodeId(node),
+        content: content.into(),
+        as_of_valid: at,
+        citations: vec![gnomon::DerivedCitation::of(EpisodeId(episode))],
+    };
+    let mut ids = Vec::new();
+    for s in [
+        summary("support", g.n.n1, g.n.w.t1_support, "n1 in support"),
+        summary("billing", g.n.n1, g.n.w.t1_billing, "n1 in billing"),
+        summary(
+            "billing",
+            g.billing_node,
+            g.n.w.t1_billing,
+            "billing's Node",
+        ),
+    ] {
+        ids.push(both.write_summary(t1, &s).await.unwrap().0);
+    }
+    let community = both
+        .write_community(
+            t1,
+            &gnomon::NewCommunity {
+                scope: Scope::new("support"),
+                replaces: vec![],
+                members: vec![gnomon::NodeId(g.n.n1)],
+                content: "n1 alone".into(),
+                as_of_valid: at,
+                citations: vec![gnomon::DerivedCitation::of(EpisodeId(g.n.w.t1_support))],
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+    Derived {
+        support_summary: ids[0],
+        billing_summary: ids[1],
+        billing_node_summary: ids[2],
+        community,
+        g,
+    }
+}
+
+/// Every row of the five tables, counted past RLS.
+async fn derived_rows(db: &TestDb) -> Vec<i64> {
+    let admin = db.admin().await;
+    let mut counts = Vec::new();
+    for t in [
+        "summary",
+        "summary_citation",
+        "community",
+        "community_member",
+        "community_citation",
+    ] {
+        counts.push(
+            admin
+                .query_typed(&format!("select count(*) from gnomon.{t}"), &[])
+                .await
+                .unwrap()[0]
+                .get(0),
+        );
+    }
+    counts
+}
+
+#[tokio::test]
+async fn a_caller_cannot_rewrite_or_delete_a_committed_summary_or_community_or_what_it_cites_or_holds(
+) {
+    let d = derived().await;
+    let t1 = d.g.n.w.t1;
+    let before = derived_rows(&d.g.n.w.db).await;
+    let s = d.support_summary;
+    let k = d.community;
+    for role in [USER, WORKER] {
+        for (sql, what) in [
+            (
+                "update gnomon.summary set content = 'rewritten' where id = $1",
+                "rewriting a Summary",
+            ),
+            (
+                "update gnomon.summary set node_id = node_id where id = $1",
+                "moving a Summary",
+            ),
+            (
+                "update gnomon.summary set recorded_to = '2000-01-01' where id = $1",
+                "closing a Summary in the past",
+            ),
+            (
+                "update gnomon.summary set recorded_to = 'infinity' where id = $1",
+                "touching a Summary's open end",
+            ),
+            (
+                "delete from gnomon.summary where id = $1",
+                "deleting a Summary",
+            ),
+            (
+                "delete from gnomon.summary_citation where summary_id = $1",
+                "deleting a Summary's Citation",
+            ),
+            (
+                "update gnomon.community set content = 'rewritten' where id = $1",
+                "rewriting a Community",
+            ),
+            (
+                "update gnomon.community set recorded_to = '2000-01-01' where id = $1",
+                "closing a Community in the past",
+            ),
+            (
+                "delete from gnomon.community where id = $1",
+                "deleting a Community",
+            ),
+            (
+                "delete from gnomon.community_member where community_id = $1",
+                "deleting a Community's Node",
+            ),
+            (
+                "delete from gnomon.community_citation where community_id = $1",
+                "deleting a Community's Citation",
+            ),
+            (
+                "update gnomon.summary_citation set place = 'forged' where summary_id = $1",
+                "rewriting a Summary's Citation",
+            ),
+        ] {
+            let id = if sql.contains("community") { k } else { s };
+            let mut client = d.g.n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            let r = tx.query_typed(sql, &[(&id, Type::UUID)]).await;
+            assert_refused(r, &format!("{role} {what}"));
+        }
+    }
+    assert_eq!(derived_rows(&d.g.n.w.db).await, before);
+}
+
+#[tokio::test]
+async fn a_caller_inserting_directly_cannot_choose_the_recorded_time_or_skip_the_scope_and_citation_checks(
+) {
+    let d = derived().await;
+    let w = &d.g.n.w;
+    let (t1, n1) = (w.t1, d.g.n.n1);
+    let before = derived_rows(&w.db).await;
+    let insert_summary =
+        "insert into gnomon.summary (tenant_id, scope, node_id, content, as_of_valid)
+                          values ($1, $2, $3, 'direct', '2024-06-01') returning id";
+
+    // Gnomon assigns the ID, the Recorded time and the transaction mark.
+    for column in ["id", "recorded_from", "recorded_to", "written_in"] {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+        let r = tx
+            .query_typed(
+                &format!(
+                    "insert into gnomon.summary (tenant_id, scope, node_id, content, as_of_valid, {column})
+                     select $1, 'support', $2, 'direct', '2024-06-01', {column} from gnomon.summary
+                     where id = $3"
+                ),
+                &[(&t1, Type::UUID), (&n1, Type::UUID), (&d.support_summary, Type::UUID)],
+            )
+            .await;
+        assert_refused(r, &format!("choosing a Summary's {column}"));
+    }
+
+    let mut client = w.db.login().await;
+    let mut tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    // A Summary of a Node of billing, which this caller cannot see, or of
+    // another Tenant's Node.
+    for node in [d.g.billing_node, d.g.n.n2] {
+        let sp = tx.savepoint("node").await.unwrap();
+        let r = sp
+            .query_typed(
+                insert_summary,
+                &[
+                    (&t1, Type::UUID),
+                    (&"support", Type::TEXT),
+                    (&node, Type::UUID),
+                ],
+            )
+            .await;
+        assert_invalid_write(r, &format!("Node {node} is not visible to the caller"));
+        sp.rollback().await.unwrap();
+    }
+    // A Summary in a Scope the caller cannot see.
+    let sp = tx.savepoint("scope").await.unwrap();
+    let r = sp
+        .query_typed(
+            insert_summary,
+            &[
+                (&t1, Type::UUID),
+                (&"billing", Type::TEXT),
+                (&n1, Type::UUID),
+            ],
+        )
+        .await;
+    assert_refused(r, "a Summary in billing");
+    sp.rollback().await.unwrap();
+    // A second current Summary of n1 in support.
+    let sp = tx.savepoint("second").await.unwrap();
+    let r = sp
+        .query_typed(
+            insert_summary,
+            &[
+                (&t1, Type::UUID),
+                (&"support", Type::TEXT),
+                (&n1, Type::UUID),
+            ],
+        )
+        .await;
+    assert_invalid_write(
+        r,
+        &format!(
+            "Node {n1} has a Summary in Scope support whose Recorded time a new one would \
+             overlap; close it first"
+        ),
+    );
+    sp.rollback().await.unwrap();
+    // A Citation added to the committed Summary.
+    let sp = tx.savepoint("cite").await.unwrap();
+    let r = sp
+        .query_typed(
+            "insert into gnomon.summary_citation
+               (tenant_id, scope, summary_id, episode_id, episode_reference_time, episode_recorded_at)
+             select e.tenant_id, e.scope, $2, e.id, e.reference_time, e.recorded_at
+             from gnomon.episode e where e.id = $1",
+            &[(&w.t1_support, Type::UUID), (&d.support_summary, Type::UUID)],
+        )
+        .await;
+    assert_invalid_write(
+        r,
+        &format!(
+            "a Summary's Citations and Nodes are written with it, and {} was written earlier",
+            d.support_summary
+        ),
+    );
+    sp.rollback().await.unwrap();
+    tx.rollback().await.unwrap();
+
+    // A new Summary of billing's Node, written by a caller of both Scopes,
+    // citing an Episode of support: the foreign key carries billing.
+    let both = claims(t1, &["support", "billing"]);
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &both).await;
+    let id: Uuid = tx
+        .query_typed(
+            insert_summary,
+            &[
+                (&t1, Type::UUID),
+                (&"support", Type::TEXT),
+                (&d.g.billing_node, Type::UUID),
+            ],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let r = tx
+        .query_typed(
+            "insert into gnomon.summary_citation
+               (tenant_id, scope, summary_id, episode_id, episode_reference_time, episode_recorded_at)
+             select e.tenant_id, 'support', $2, e.id, e.reference_time, e.recorded_at
+             from gnomon.episode e where e.id = $1",
+            &[(&w.t1_billing, Type::UUID), (&id, Type::UUID)],
+        )
+        .await;
+    match r {
+        Err(e) => assert_eq!(e.code(), Some(&SqlState::FOREIGN_KEY_VIOLATION), "{e:?}"),
+        Ok(v) => panic!("a Summary of support cited billing's Episode: {v:?}"),
+    }
+    tx.rollback().await.unwrap();
+
+    // A Summary that cites nothing does not commit.
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &both).await;
+    let id: Uuid = tx
+        .query_typed(
+            insert_summary,
+            &[
+                (&t1, Type::UUID),
+                (&"support", Type::TEXT),
+                (&d.g.billing_node, Type::UUID),
+            ],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let e = tx.commit().await.unwrap_err();
+    assert_eq!(
+        e.code().map(|c| c.code()),
+        Some(gnomon::INVALID_WRITE),
+        "{e:?}"
+    );
+    assert_eq!(
+        e.as_db_error().unwrap().message(),
+        format!("Summary {id} cites no Episode")
+    );
+
+    // A Community of support that holds billing's Node, which its caller
+    // sees: the foreign key carries support (ADR-0014).
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &both).await;
+    let k: Uuid = tx
+        .query_typed(
+            "insert into gnomon.community (tenant_id, scope, content, as_of_valid)
+             values ($1, 'support', 'direct', '2024-06-01') returning id",
+            &[(&t1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let r = tx
+        .query_typed(
+            "insert into gnomon.community_member (tenant_id, scope, community_id, node_id)
+             values ($1, 'support', $2, $3)",
+            &[
+                (&t1, Type::UUID),
+                (&k, Type::UUID),
+                (&d.g.billing_node, Type::UUID),
+            ],
+        )
+        .await;
+    match r {
+        Err(e) => assert_eq!(e.code(), Some(&SqlState::FOREIGN_KEY_VIOLATION), "{e:?}"),
+        Ok(v) => panic!("a Community of support held billing's Node: {v:?}"),
+    }
+    tx.rollback().await.unwrap();
+    // A Node added to the committed Community.
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &both).await;
+    let r = tx
+        .query_typed(
+            "insert into gnomon.community_member (tenant_id, scope, community_id, node_id)
+             values ($1, 'support', $2, $3)",
+            &[
+                (&t1, Type::UUID),
+                (&d.community, Type::UUID),
+                (&n1, Type::UUID),
+            ],
+        )
+        .await;
+    assert_invalid_write(
+        r,
+        &format!(
+            "a Community's Citations and Nodes are written with it, and {} was written earlier",
+            d.community
+        ),
+    );
+    tx.rollback().await.unwrap();
+
+    assert_eq!(derived_rows(&w.db).await, before);
+}
+
+#[tokio::test]
+async fn a_caller_sees_and_writes_no_summary_or_community_of_another_tenant_or_scope() {
+    let d = derived().await;
+    let w = &d.g.n.w;
+    // Each caller sees the Summaries of its own Scopes, and reads only those
+    // of n1 through the read function, which takes the Tenant it is given
+    // and still reads under the caller's claims.
+    let mut billing = vec![d.billing_summary, d.billing_node_summary];
+    billing.sort();
+    for (tenant, scopes, expected, of_n1) in [
+        (w.t1, vec!["support"], vec![d.support_summary], 1),
+        (w.t1, vec!["billing"], billing, 1),
+        (w.t2, vec!["support", "billing"], vec![], 0),
+    ] {
+        for role in [USER, WORKER] {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(tenant, &scopes)).await;
+            let seen = visible_ids(&tx, "select id from gnomon.summary order by id", &[]).await;
+            assert_eq!(seen, expected, "{role} of {scopes:?}");
+            for t in [
+                "summary_citation",
+                "community",
+                "community_member",
+                "community_citation",
+            ] {
+                let n: i64 = tx
+                    .query_typed(
+                        &format!(
+                            "select count(*) from gnomon.{t} where tenant_id <> $1 \
+                             or not (scope = any($2))"
+                        ),
+                        &[(&tenant, Type::UUID), (&scopes, Type::TEXT_ARRAY)],
+                    )
+                    .await
+                    .unwrap()[0]
+                    .get(0);
+                assert_eq!(
+                    n, 0,
+                    "{role} of {scopes:?} sees gnomon.{t} rows outside them"
+                );
+            }
+            let read: i64 = tx
+                .query_typed(
+                    "select count(*) from gnomon.read_summaries($1, $2, 'infinity', null)",
+                    &[(&w.t1, Type::UUID), (&d.g.n.n1, Type::UUID)],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+            assert_eq!(read, of_n1, "{role} of {scopes:?} reads n1's Summaries");
+        }
+    }
+
+    // The write functions refuse another Tenant and a Scope the caller
+    // cannot see.
+    for (tenant, scope, what) in [
+        (w.t2, "support", "another Tenant"),
+        (w.t1, "billing", "a Scope it cannot see"),
+    ] {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, WORKER, &claims(w.t1, &["support"])).await;
+        let r = tx
+            .query_typed(
+                "select gnomon.write_summary($1, $2, $3, 'forged', '2024-06-01', array[$4], null, null)",
+                &[
+                    (&tenant, Type::UUID),
+                    (&scope, Type::TEXT),
+                    (&d.g.n.n1, Type::UUID),
+                    (&w.t1_support, Type::UUID),
+                ],
+            )
+            .await;
+        match r {
+            Err(e) => assert!(
+                e.code() == Some(&SqlState::INSUFFICIENT_PRIVILEGE)
+                    || e.code().map(|c| c.code()) == Some(gnomon::INVALID_WRITE),
+                "{what}: {e:?}"
+            ),
+            Ok(v) => panic!("a Summary was written in {what}: {v:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_caller_reaches_a_summary_through_the_erasure_reach_and_an_erasure_reaches_only_its_nodes_summaries(
+) {
+    let d = derived().await;
+    let w = &d.g.n.w;
+    let t1 = w.t1;
+    for role in [USER, WORKER] {
+        for (sql, what) in [
+            (
+                "select gnomon.erasure_reaches_summary($1, $2)",
+                "the Summary reach check",
+            ),
+            (
+                "select gnomon.erase_summaries_and_communities($1, array[$2], '{}')",
+                "the Summary deletes",
+            ),
+        ] {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support", "billing"])).await;
+            let r = tx
+                .query_typed(sql, &[(&t1, Type::UUID), (&d.billing_summary, Type::UUID)])
+                .await;
+            assert_refused(r, &format!("{role} {what}"));
+        }
+    }
+
+    // The worker of support erases n1. In the same transaction it still sees
+    // no Summary of billing, though its Erasure reached one.
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    tx.query_typed(ERASE_NODE, &[(&t1, Type::UUID), (&d.g.n.n1, Type::UUID)])
+        .await
+        .unwrap();
+    let seen: i64 = tx
+        .query_typed(
+            "select count(*) from gnomon.summary where scope = 'billing'",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(
+        seen, 0,
+        "the worker sees billing's Summaries after an Erasure"
+    );
+    tx.commit().await.unwrap();
+
+    // n1's Summaries in both Scopes and its Community are gone. billing's
+    // Node, whose Edge to n1 went too, was not listed, so its Summary stands.
+    let admin = w.db.admin().await;
+    for (table, id, stands) in [
+        ("summary", d.support_summary, false),
+        ("summary", d.billing_summary, false),
+        ("community", d.community, false),
+        ("summary", d.billing_node_summary, true),
+    ] {
+        let n = admin
+            .query_typed(
+                &format!("select from gnomon.{table} where id = $1"),
+                &[(&id, Type::UUID)],
+            )
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(n == 1, stands, "{table} {id}");
+    }
+    let cited: i64 = admin
+        .query_typed(
+            "select count(*) from gnomon.summary_citation where summary_id = $1",
+            &[(&d.billing_node_summary, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(cited, 1, "the unlisted Summary lost its Citation");
 }

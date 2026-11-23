@@ -36,13 +36,14 @@ use tokio_postgres::{Client, Config, NoTls, Row, Statement, Transaction};
 use crate::connect::ConnectOptions;
 use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
-    AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Direction, EdgeId,
-    EdgeVersion, EndOfValidity, Episode, EpisodeErasure, EpisodeId, EpisodeRetraction, Error,
-    FullTextCandidate, GraphErasure, Kind, KindOf, MergeRule, NewEdge, NewEpisode, NewKind,
-    NewNode, NodeId, NodeVersion, Patch, Precision, Retraction, Scope, StageError, StageOutcome,
-    StageRecord, StageStatus, StageUsage, StageWrite, StatementKind, Step, TenantId, Traversal,
-    VacuumMode, VacuumReport, ValidTime, VectorCandidate, VersionId, Versioned, WriteOutcome,
-    WriteStatus,
+    AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Community,
+    CommunityId, DerivedCitation, Direction, EdgeId, EdgeVersion, EndOfValidity, Episode,
+    EpisodeErasure, EpisodeId, EpisodeRetraction, Error, FullTextCandidate, GraphErasure, Kind,
+    KindOf, MergeRule, NewCommunity, NewEdge, NewEpisode, NewKind, NewNode, NewSummary, NodeId,
+    NodeVersion, Patch, Precision, Retraction, Scope, StageError, StageOutcome, StageRecord,
+    StageStatus, StageUsage, StageWrite, StatementKind, Step, Summary, SummaryId, TenantId,
+    Traversal, VacuumMode, VacuumReport, ValidTime, VectorCandidate, VersionId, Versioned,
+    WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -2253,4 +2254,230 @@ async fn write_stage(
         }
     }
     Ok(())
+}
+
+/// Summaries and Communities (ADR-0014, ADR-0015, migration 0018).
+impl Caller<'_> {
+    /// Writes a Summary of a Node and returns its ID. The Node's current
+    /// Summary in the same Scope, if it has one, is closed at the start of
+    /// this call's transaction and stays readable As-of an earlier known-at
+    /// instant (ADR-0015).
+    ///
+    /// The write commits the stage records this Caller is
+    /// [`recording`](Self::recording), since a Summary is a stage's output.
+    /// A Scope or Node the caller cannot see, no Citation, or a Citation of an
+    /// Episode the caller cannot see or of another Scope than the Summary's,
+    /// fails with [`Error::InvalidWrite`] (ADR-0014).
+    pub async fn write_summary(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        summary: &NewSummary,
+    ) -> Result<SummaryId, Error> {
+        let (episodes, properties, places) = citation_columns(&summary.citations);
+        let params: [(&(dyn ToSql + Sync), Type); 7] = [
+            (&summary.scope.as_str(), Type::TEXT),
+            (&summary.node.0, Type::UUID),
+            (&summary.content, Type::TEXT),
+            (&summary.as_of_valid, Type::TIMESTAMPTZ),
+            (&episodes, Type::UUID_ARRAY),
+            (&properties, Type::TEXT_ARRAY),
+            (&places, Type::TEXT_ARRAY),
+        ];
+        let id = self
+            .write_derived(
+                tenant.into(),
+                "select gnomon.write_summary($1, $2, $3, $4, $5, $6, $7, $8)",
+                &params,
+            )
+            .await?;
+        Ok(SummaryId(id))
+    }
+
+    /// Writes a Community of Nodes with its Summary and returns its ID. The
+    /// current Communities it names in `replaces` are closed, as
+    /// [`write_summary`](Self::write_summary) closes a Summary. It commits
+    /// the recorded stage records as `write_summary` does.
+    ///
+    /// Every Node must be one the caller sees in the Community's own Scope,
+    /// and a Node of another Scope is refused even when the caller sees it
+    /// (ADR-0014). That, no Node, a Community in `replaces` that is not a
+    /// current one of the Scope, and the refusals of `write_summary`, fail
+    /// with [`Error::InvalidWrite`].
+    pub async fn write_community(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        community: &NewCommunity,
+    ) -> Result<CommunityId, Error> {
+        let (episodes, properties, places) = citation_columns(&community.citations);
+        let replaces: Vec<uuid::Uuid> = community.replaces.iter().map(|c| c.0).collect();
+        let members: Vec<uuid::Uuid> = community.members.iter().map(|n| n.0).collect();
+        let params: [(&(dyn ToSql + Sync), Type); 8] = [
+            (&community.scope.as_str(), Type::TEXT),
+            (&replaces, Type::UUID_ARRAY),
+            (&members, Type::UUID_ARRAY),
+            (&community.content, Type::TEXT),
+            (&community.as_of_valid, Type::TIMESTAMPTZ),
+            (&episodes, Type::UUID_ARRAY),
+            (&properties, Type::TEXT_ARRAY),
+            (&places, Type::TEXT_ARRAY),
+        ];
+        let id = self
+            .write_derived(
+                tenant.into(),
+                "select gnomon.write_community($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                &params,
+            )
+            .await?;
+        Ok(CommunityId(id))
+    }
+
+    /// Runs one Summary or Community write, with the Tenant first, in a
+    /// transaction that also writes the recorded stage records, retrying it
+    /// as a graph write is retried.
+    async fn write_derived(
+        &self,
+        tenant: Option<TenantId>,
+        sql: &'static str,
+        params: &[(&(dyn ToSql + Sync), Type)],
+    ) -> Result<uuid::Uuid, Error> {
+        let stages = self.take_stages();
+        let mut client = self.store.client.lock().await;
+        let mut attempt = 0;
+        loop {
+            let (tx, tenant) = self.begin(&mut client, tenant).await?;
+            let mut all: Vec<(&(dyn ToSql + Sync), Type)> = vec![(&tenant.0, Type::UUID)];
+            all.extend(params.iter().cloned());
+            let written = match self.store.statements.query(&tx, sql, &all).await {
+                Ok(rows) => self
+                    .commit_with(tx, tenant, &stages)
+                    .await
+                    .map(|()| rows[0].get(0)),
+                Err(e) => Err(Error::from_store(e)),
+            };
+            match written {
+                Err(e) if attempt < WRITE_RETRIES && is_retryable(&e) => attempt += 1,
+                done => return done,
+            }
+        }
+    }
+
+    /// Reads the Summaries of a Node As-of `as_of`: in each of the caller's
+    /// Scopes, the one held at the known-at instant, if it was written for a
+    /// valid-at instant on or before `as_of.valid_at` (ADR-0015). They come in
+    /// order of Scope. A Node the caller cannot see has none.
+    pub async fn read_summaries(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        node: NodeId,
+        as_of: AsOf,
+    ) -> Result<Vec<Summary>, Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
+                "select id, scope, node_id, content, as_of_valid, recorded_from, recorded_to,
+                        cited_episodes, cited_properties, cited_places
+                 from gnomon.read_summaries($1, $2, $3, $4)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&node.0, Type::UUID),
+                    (&as_of.valid_at, Type::TIMESTAMPTZ),
+                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|r| Summary {
+                id: SummaryId(r.get(0)),
+                scope: Scope::new(r.get::<_, String>(1)),
+                node: NodeId(r.get(2)),
+                content: r.get(3),
+                as_of_valid: r.get(4),
+                recorded_from: r.get(5),
+                recorded_to: r.get(6),
+                citations: derived_citations(r, 7),
+            })
+            .collect())
+    }
+
+    /// Reads the Communities that hold a Node As-of `as_of`, as
+    /// [`read_summaries`](Self::read_summaries) reads Summaries, in order of
+    /// Scope and then of ID.
+    pub async fn read_communities(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        node: NodeId,
+        as_of: AsOf,
+    ) -> Result<Vec<Community>, Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
+                "select id, scope, members, content, as_of_valid, recorded_from, recorded_to,
+                        cited_episodes, cited_properties, cited_places
+                 from gnomon.read_communities($1, $2, $3, $4)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&node.0, Type::UUID),
+                    (&as_of.valid_at, Type::TIMESTAMPTZ),
+                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|r| Community {
+                id: CommunityId(r.get(0)),
+                scope: Scope::new(r.get::<_, String>(1)),
+                members: r
+                    .get::<_, Vec<uuid::Uuid>>(2)
+                    .into_iter()
+                    .map(NodeId)
+                    .collect(),
+                content: r.get(3),
+                as_of_valid: r.get(4),
+                recorded_from: r.get(5),
+                recorded_to: r.get(6),
+                citations: derived_citations(r, 7),
+            })
+            .collect())
+    }
+}
+
+/// The three parallel arrays the write functions take for Citations.
+type CitationColumns = (Vec<uuid::Uuid>, Vec<Option<String>>, Vec<Option<String>>);
+
+fn citation_columns(citations: &[DerivedCitation]) -> CitationColumns {
+    (
+        citations.iter().map(|c| c.episode.0).collect(),
+        citations.iter().map(|c| c.property.clone()).collect(),
+        citations.iter().map(|c| c.place.clone()).collect(),
+    )
+}
+
+/// The Citations in the three array columns of `row` from `at` on: the
+/// Episodes, the properties and the places.
+fn derived_citations(row: &Row, at: usize) -> Vec<DerivedCitation> {
+    let episodes: Vec<uuid::Uuid> = row.get(at);
+    let properties: Vec<Option<String>> = row.get(at + 1);
+    let places: Vec<Option<String>> = row.get(at + 2);
+    episodes
+        .into_iter()
+        .zip(properties)
+        .zip(places)
+        .map(|((episode, property), place)| DerivedCitation {
+            episode: EpisodeId(episode),
+            property,
+            place,
+        })
+        .collect()
 }

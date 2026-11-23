@@ -110,6 +110,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0017_vector_search",
         template: include_str!("../migrations/0017_vector_search.sql"),
     },
+    Migration {
+        version: 18,
+        name: "0018_summaries_and_communities",
+        template: include_str!("../migrations/0018_summaries_and_communities.sql"),
+    },
 ];
 
 /// The schema version this build of the Store expects: the last migration's.

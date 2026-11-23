@@ -26,10 +26,14 @@ const MARKER: &str = "vacuumed-7f3e";
 
 /// The tables an Erasure deletes from or rewrites today: those migration
 /// 0013's header lists, the token table and BM25 counts of migration 0016,
-/// and the full and quantized embeddings of migration 0017.
+/// the full and quantized embeddings of migration 0017, and the Summaries
+/// and Communities of migration 0018.
 const ERASED_TABLES: &[&str] = &[
     "gnomon.bound_statement",
     "gnomon.citation",
+    "gnomon.community",
+    "gnomon.community_citation",
+    "gnomon.community_member",
     "gnomon.contribution",
     "gnomon.edge",
     "gnomon.embedding",
@@ -45,6 +49,8 @@ const ERASED_TABLES: &[&str] = &[
     "gnomon.stage_record",
     "gnomon.stage_usage",
     "gnomon.statement",
+    "gnomon.summary",
+    "gnomon.summary_citation",
     "gnomon.version",
 ];
 
@@ -147,6 +153,35 @@ async fn an_episode_written_everywhere(w: &World) -> gnomon::EpisodeId {
         .unwrap();
     w.write_stage_records(SCOPE, e, &format!("{MARKER}-model"))
         .await;
+    // A Summary of the account and a Community of it and Acme, each citing E
+    // (migration 0018).
+    w.caller()
+        .write_summary(
+            w.tenant,
+            &gnomon::NewSummary {
+                scope: gnomon::Scope::new(SCOPE),
+                node: acct,
+                content: format!("{MARKER}: the account's plan"),
+                as_of_valid: at(2024, 4, 1),
+                citations: vec![gnomon::DerivedCitation::of(e)],
+            },
+        )
+        .await
+        .unwrap();
+    w.caller()
+        .write_community(
+            w.tenant,
+            &gnomon::NewCommunity {
+                scope: gnomon::Scope::new(SCOPE),
+                replaces: vec![],
+                members: vec![acct, acme],
+                content: format!("{MARKER}: the account and Acme"),
+                as_of_valid: at(2024, 4, 1),
+                citations: vec![gnomon::DerivedCitation::of(e)],
+            },
+        )
+        .await
+        .unwrap();
     // The embedding of every Version's values (ADR-0010).
     let mut rng = support::vectors::Rng::new(13);
     for row in
