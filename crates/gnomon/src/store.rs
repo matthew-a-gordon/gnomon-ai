@@ -15,11 +15,12 @@
 //! into another caller's call. `gnomon.call_tenant` checks the call's Tenant
 //! against the claims, or picks the default Tenant for a call that names
 //! none in single-tenant mode, and the call goes on with the Tenant it
-//! returns (ADR-0005). Every parameterized statement goes through
+//! returns (ADR-0005). By default every parameterized statement goes through
 //! `query_typed`, which sends the unnamed statement, because named statements
-//! fail on transaction-mode poolers at their default settings (the
-//! `prototype/pooler-prepared-statements` branch, ADR-0001).
-//! Named statements are never sent.
+//! fail on some transaction-mode poolers at their default settings (the
+//! `prototype/pooler-prepared-statements` branch, ADR-0001). Named
+//! statements are sent only when the deployment turns them on with
+//! [`ConnectOptions::named_statements`].
 
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};

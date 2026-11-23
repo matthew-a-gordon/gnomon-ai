@@ -35,6 +35,18 @@ Run the same command again after you upgrade gnomon. It adds only the new migrat
 
 Every gnomon object lives in the `gnomon` schema. Keep that schema out of PostgREST's exposed schemas, so clients reach the Store only through gnomon.
 
+## Connecting
+
+The Store connects as a login role of your deployment, which may switch to the `authenticated` and `gnomon_worker` roles:
+
+```rust
+let store = Store::connect(&url, &ConnectOptions::default()).await?;
+```
+
+By default the Store connects with TLS and verifies the server's certificate and host name against the platform's trusted roots. The connection string's `sslmode` cannot turn that off. A managed Postgres often signs its servers with a CA of its own. Trust that CA with `ConnectOptions::default().tls(Tls::trust_pem(ca_pem)?)`. `Tls::unverified()` encrypts without verifying the certificate, and `Tls::plaintext()` turns TLS off. Use either only where you have decided you need it.
+
+The Store works through transaction-mode poolers such as PgBouncer and Supavisor at their default settings. Every call is one transaction that sets its role and its claims locally, and every statement is sent unnamed. Named prepared statements are an opt-in, `ConnectOptions::named_statements(true)`. Turn them on only behind a pooler that supports them: PgBouncer 1.21 or later with `max_prepared_statements` above 0, or Supavisor with named prepared statements enabled. Elsewhere calls fail.
+
 ## Development
 
 `docs/testing.md` explains how to run the test suites. They need Docker and start their own Postgres containers.
