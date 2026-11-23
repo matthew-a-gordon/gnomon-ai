@@ -4703,19 +4703,12 @@ async fn no_caller_reaches_the_erasure_list_or_its_parts_and_an_erasure_widens_n
 
 const MAINTAINER: &str = "gnomon_maintainer";
 
-/// Every gnomon table, from the catalog.
+/// Every gnomon table, from the catalog, schema-qualified.
 async fn every_gnomon_table(client: &Client) -> Vec<String> {
-    client
-        .query_typed(
-            "select format('%I.%I', 'gnomon', relname) from pg_class
-             where relnamespace = 'gnomon'::regnamespace and relkind in ('r', 'p')
-             order by relname",
-            &[],
-        )
+    support::erasure::gnomon_tables(client)
         .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get(0))
+        .into_iter()
+        .map(|t| format!("gnomon.{t}"))
         .collect()
 }
 

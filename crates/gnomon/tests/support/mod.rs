@@ -47,7 +47,7 @@ const LOGIN_PASSWORD: &str = "gnomon-test-login";
 /// `gnomon_maintainer` with INHERIT and without SET, as migration 0013 tells
 /// a deployment to grant it, and may switch to `authenticated` only for the
 /// Store's schema check. It shares the login role's password.
-pub const MAINTENANCE_ROLE: &str = "gnomon_test_maintenance";
+pub const MAINTENANCE_LOGIN_ROLE: &str = "gnomon_test_maintenance";
 
 /// The settings the suites connect the Store with.
 ///
@@ -371,15 +371,15 @@ impl Server {
                    if not exists (select from pg_roles where rolname = '{LOGIN_ROLE}') then
                      create role {LOGIN_ROLE} login noinherit password '{LOGIN_PASSWORD}';
                    end if;
-                   if not exists (select from pg_roles where rolname = '{MAINTENANCE_ROLE}') then
-                     create role {MAINTENANCE_ROLE} login noinherit password '{LOGIN_PASSWORD}';
+                   if not exists (select from pg_roles where rolname = '{MAINTENANCE_LOGIN_ROLE}') then
+                     create role {MAINTENANCE_LOGIN_ROLE} login noinherit password '{LOGIN_PASSWORD}';
                    end if;
                    if exists (select from pg_roles where rolname = 'gnomon_maintainer') then
-                     grant gnomon_maintainer to {MAINTENANCE_ROLE} with inherit true, set false;
+                     grant gnomon_maintainer to {MAINTENANCE_LOGIN_ROLE} with inherit true, set false;
                    end if;
                  end $$;
                  grant authenticated, gnomon_worker to {LOGIN_ROLE};
-                 grant authenticated to {MAINTENANCE_ROLE};"
+                 grant authenticated to {MAINTENANCE_LOGIN_ROLE};"
             ))
             .await
             .expect("create the login role");
@@ -505,7 +505,7 @@ impl TestDb {
             .expect("the Store connects")
     }
 
-    /// The Store, connected as [`MAINTENANCE_ROLE`] through the callers'
+    /// The Store, connected as [`MAINTENANCE_LOGIN_ROLE`] through the callers'
     /// path, the pooler in a pooler lane, to run the vacuum call.
     pub async fn maintenance_store(&self) -> gnomon::Store {
         gnomon::Store::connect(&self.maintenance_url(), &connect_options())
@@ -517,7 +517,7 @@ impl TestDb {
     pub fn maintenance_url(&self) -> String {
         let (host, port) = self.server.callers_host_port();
         login_url(
-            &server::pooled_user(MAINTENANCE_ROLE),
+            &server::pooled_user(MAINTENANCE_LOGIN_ROLE),
             &host,
             port,
             &self.name,

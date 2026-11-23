@@ -8,6 +8,11 @@
 //! `VACUUM` as a simple query of one statement, outside any transaction. A
 //! transaction-mode pooler runs it as a transaction of its own, and it sets
 //! nothing that outlives it. Migration 0013 says the rest.
+//!
+//! A table an Erasure touched is named in its result, as
+//! [`EpisodeErasure::touched_tables`](crate::EpisodeErasure::touched_tables).
+//! It names tables, never rows, so it gives the caller no ID from a Scope it
+//! cannot see.
 
 use chrono::{DateTime, Utc};
 
@@ -40,7 +45,7 @@ impl VacuumMode {
 /// What the vacuum call did. It is returned once every table has been
 /// vacuumed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Vacuum {
+pub struct VacuumReport {
     /// The tables vacuumed, schema-qualified, in order of name.
     pub tables: Vec<String>,
     pub mode: VacuumMode,

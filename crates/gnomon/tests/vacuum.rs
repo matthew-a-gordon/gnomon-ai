@@ -24,8 +24,8 @@ use tokio_postgres::Client;
 /// Text only the erased rows hold, so a scan of every page can find a copy.
 const MARKER: &str = "vacuumed-7f3e";
 
-/// The tables the brief for this ticket lists as written by Erasure: those
-/// an Erasure deletes from or rewrites.
+/// The tables an Erasure deletes from or rewrites today, as migration 0013's
+/// header lists them.
 const ERASED_TABLES: &[&str] = &[
     "gnomon.bound_statement",
     "gnomon.citation",
@@ -292,20 +292,19 @@ async fn a_table_a_later_migration_adds_is_vacuumed_with_no_change_to_the_call()
     let e = w.episode_saying(at(2024, 1, 1), None, MARKER).await;
     w.node("account", e, ValidTime::UNKNOWN, json!({ "plan": MARKER }))
         .await;
-    admin
-        .execute(
-            "insert into gnomon.later_summary values ($1, $2, $3)",
-            &[&w.tenant.0, &e.0, &MARKER],
-        )
-        .await
-        .unwrap();
-    admin
-        .execute(
-            "insert into gnomon.later_summary_token values ($1, $2, $3)",
-            &[&w.tenant.0, &e.0, &MARKER],
-        )
-        .await
-        .unwrap();
+    for table in ["later_summary", "later_summary_token"] {
+        admin
+            .query_typed(
+                &format!("insert into gnomon.{table} values ($1, $2, $3)"),
+                &[
+                    (&w.tenant.0, Type::UUID),
+                    (&e.0, Type::UUID),
+                    (&MARKER, Type::TEXT),
+                ],
+            )
+            .await
+            .unwrap();
+    }
 
     let erasure = w.erase(e).await;
 
@@ -464,7 +463,9 @@ async fn a_plain_vacuum_may_leave_the_erased_bytes_in_free_space_and_a_full_one_
     println!("pages holding the marker after the plain call: {after_plain:?}");
     assert!(
         !after_plain.is_empty(),
-        "a plain VACUUM frees the space and does not overwrite it"
+        "a plain VACUUM frees the space and does not overwrite it. If this fails, \
+         Postgres now overwrites freed space, and VacuumMode::Full may no longer be \
+         needed to leave no copy on a page"
     );
 
     let full = maintenance

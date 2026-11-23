@@ -9,33 +9,38 @@
 -- well.
 --
 -- `VACUUM` cannot run inside a transaction block, and so not inside a
--- function. The call is therefore the Rust core's, not a function here: the
--- Store sends each `VACUUM` as a simple query of one statement, outside any
--- transaction, on its own connection (`Store::vacuum_erasure` and
--- `Store::vacuum_erasures`). Through a transaction-mode pooler that is a
--- transaction of its own on whichever server connection the pooler picks, and
--- it sets nothing that outlives it.
+-- function. The call is therefore the Rust core's, not a function here
+-- (`Store::vacuum_erasure` and `Store::vacuum_erasures`). The Store sends each
+-- `VACUUM` as a simple query of one statement, outside any transaction, on
+-- its connection. Through a transaction-mode pooler that is a transaction of
+-- its own on whichever server connection the pooler picks. It sets nothing
+-- that outlives it.
 --
 -- The call is not a definer (ADR-0009). It runs as the login role the
 -- deployment connects it with, which holds the privilege through the NOLOGIN
 -- role `gnomon_maintainer`. This migration creates that role and grants it
 -- `MAINTAIN` (PostgreSQL 17) on every table an Erasure touches, USAGE on the
 -- schema and EXECUTE on the function below, and nothing else: it reads no
--- row. The deployment grants it to the login role that runs the call:
+-- row. The deployment connects a Store for the call as a login role of its
+-- own, and grants that role two things:
 --
 --   grant gnomon_maintainer to <login role> with inherit true, set false;
+--   grant authenticated to <login role>;
 --
 -- INHERIT is needed because the call cannot `SET ROLE` on a pooled
--- connection, and SET FALSE keeps the login role from becoming it. No caller
--- role gets it. It is not `gnomon_definer`: a login role that inherited the
--- definer would hold Erasure's privileges and its policies outside Erasure.
+-- connection. SET FALSE keeps the login role from becoming the maintenance
+-- role. `authenticated` is for the schema check `Store::connect` runs as an
+-- end user. No caller role gets `gnomon_maintainer`. It is not
+-- `gnomon_definer`: a login role that inherited the definer would hold
+-- Erasure's privileges and its policies outside Erasure.
 --
 -- Which tables. `gnomon.erasure_vacuum_tables()` reads them from the
--- catalog, so a table a later migration adds cannot be missed: every gnomon
--- table `gnomon_definer` may delete from or update, which are the tables an
--- Erasure deletes from or rewrites, and every gnomon table a foreign key
--- deletes from or updates when one of those changes (ON DELETE or ON UPDATE
--- CASCADE, SET NULL or SET DEFAULT), recursively. Today those are the
+-- catalog, so a table a later migration adds cannot be missed. An Erasure
+-- runs as `gnomon_definer`, so it deletes from or rewrites only the gnomon
+-- tables the definer may delete from or update. The function lists those.
+-- It also lists every gnomon table a foreign key changes when one of them
+-- changes (ON DELETE or ON UPDATE CASCADE, SET NULL or SET DEFAULT), and so
+-- on recursively. Today those are the
 -- Episodes, Nodes, Edges, Contributions, Versions, Citations, statements,
 -- bound statements, Retraction marks, Sentences and `erasure_reach`. A later
 -- migration that adds a table an Erasure deletes from grants the definer
@@ -119,7 +124,25 @@ create function gnomon.erasure_vacuum_tables()
     order by c.relname
   $$;
 
-revoke all on function gnomon.erasure_vacuum_tables() from public;
+-- Grants. Every grant a default privilege made on the new function is
+-- revoked first, so it holds only the grant below.
+do $$
+declare
+  g record;
+begin
+  for g in
+    select a.grantee
+    from pg_proc p, aclexplode(p.proacl) a
+    where p.oid = 'gnomon.erasure_vacuum_tables()'::regprocedure and a.grantee <> p.proowner
+  loop
+    execute format(
+      'revoke all on function gnomon.erasure_vacuum_tables() from %s',
+      case when g.grantee = 0 then 'public' else g.grantee::regrole::text end);
+  end loop;
+  revoke all on function gnomon.erasure_vacuum_tables() from public;
+end
+$$;
+
 grant usage on schema gnomon to gnomon_maintainer;
 grant execute on function gnomon.erasure_vacuum_tables() to gnomon_maintainer;
 

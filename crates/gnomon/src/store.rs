@@ -39,7 +39,7 @@ use crate::{
     EdgeVersion, EndOfValidity, Episode, EpisodeErasure, EpisodeId, EpisodeRetraction, Error,
     GraphErasure, Kind, KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId,
     NodeVersion, Patch, Precision, Retraction, Scope, StatementKind, Step, TenantId, Traversal,
-    Vacuum, VacuumMode, ValidTime, VersionId, WriteOutcome, WriteStatus,
+    VacuumMode, VacuumReport, ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -179,11 +179,13 @@ impl Store {
     /// The call is not a Store function and runs as no caller role:
     /// `VACUUM` cannot run inside a transaction block, so each table's
     /// `VACUUM` goes as a simple query of one statement, outside any
-    /// transaction, as the login role the Store connected as. Through a
-    /// transaction-mode pooler that is a transaction of its own. The login
-    /// role must hold `gnomon_maintainer`, which migration 0013 grants
-    /// `MAINTAIN` on every table an Erasure touches; the deployment grants it
-    /// `with inherit true, set false`.
+    /// transaction, on this Store's connection, as the login role it
+    /// connected as. Through a transaction-mode pooler that is a transaction
+    /// of its own. A deployment connects a Store for the call as a login
+    /// role of its own. It grants that role `gnomon_maintainer` with
+    /// `with inherit true, set false`, and `authenticated` for the schema
+    /// check [`Store::connect`] runs. Migration 0013 grants
+    /// `gnomon_maintainer` `MAINTAIN` on every table an Erasure touches.
     ///
     /// It refuses with [`Error::VacuumRefused`], and vacuums nothing, when a
     /// table is not one an Erasure touches or the login role may not vacuum
@@ -194,12 +196,12 @@ impl Store {
         &self,
         tables: &[String],
         mode: VacuumMode,
-    ) -> Result<Vacuum, Error> {
+    ) -> Result<VacuumReport, Error> {
         let mut client = self.client.lock().await;
         let erasure_tables = self.erasure_vacuum_tables(&mut client).await?;
         let unknown: Vec<&str> = tables
             .iter()
-            .filter(|t| !erasure_tables.iter().any(|(name, _)| name == *t))
+            .filter(|t| !erasure_tables.iter().any(|e| &e.name == *t))
             .map(String::as_str)
             .collect();
         if !unknown.is_empty() {
@@ -211,29 +213,27 @@ impl Store {
         }
         let chosen = erasure_tables
             .into_iter()
-            .filter(|(name, _)| tables.contains(name))
+            .filter(|e| tables.contains(&e.name))
             .collect();
-        vacuum(&client, chosen, mode).await
+        vacuum_tables(&client, chosen, mode).await
     }
 
-    /// Vacuums every table any Erasure touches, and so every table touched
-    /// by every Erasure since the call last ran, and returns once every one
-    /// is vacuumed. It runs and refuses as
+    /// Vacuums every table any Erasure touches, and returns once every one
+    /// is vacuumed. That covers every table touched by every Erasure since
+    /// the call last ran, without a record of past Erasures, which would be
+    /// a trace of them. It runs and refuses as
     /// [`vacuum_erasure`](Self::vacuum_erasure) does. The tables come from
     /// the catalog (`gnomon.erasure_vacuum_tables()`), so a table a later
     /// migration adds is among them.
-    pub async fn vacuum_erasures(&self, mode: VacuumMode) -> Result<Vacuum, Error> {
+    pub async fn vacuum_erasures(&self, mode: VacuumMode) -> Result<VacuumReport, Error> {
         let mut client = self.client.lock().await;
         let erasure_tables = self.erasure_vacuum_tables(&mut client).await?;
-        vacuum(&client, erasure_tables, mode).await
+        vacuum_tables(&client, erasure_tables, mode).await
     }
 
     /// Every table an Erasure touches, and whether the login role may
     /// vacuum it, read in a transaction of its own.
-    async fn erasure_vacuum_tables(
-        &self,
-        client: &mut Client,
-    ) -> Result<Vec<(String, bool)>, Error> {
+    async fn erasure_vacuum_tables(&self, client: &mut Client) -> Result<Vec<ErasureTable>, Error> {
         let tx = client.transaction().await?;
         let rows = self
             .statements
@@ -244,21 +244,36 @@ impl Store {
             )
             .await?;
         tx.commit().await?;
-        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+        Ok(rows
+            .iter()
+            .map(|r| ErasureTable {
+                name: r.get(0),
+                maintainable: r.get(1),
+            })
+            .collect())
     }
+}
+
+/// A table an Erasure touches, as `gnomon.erasure_vacuum_tables()` lists it.
+struct ErasureTable {
+    /// Schema-qualified and quoted by the catalog's `format('%I.%I')`, so it
+    /// can go into a `VACUUM` statement as it is.
+    name: String,
+    /// Whether the login role may vacuum it.
+    maintainable: bool,
 }
 
 /// Vacuums `tables`, each with its own `VACUUM` outside any transaction,
 /// after checking that the login role may vacuum every one.
-async fn vacuum(
+async fn vacuum_tables(
     client: &Client,
-    tables: Vec<(String, bool)>,
+    tables: Vec<ErasureTable>,
     mode: VacuumMode,
-) -> Result<Vacuum, Error> {
+) -> Result<VacuumReport, Error> {
     let refused: Vec<&str> = tables
         .iter()
-        .filter(|(_, maintainable)| !maintainable)
-        .map(|(name, _)| name.as_str())
+        .filter(|t| !t.maintainable)
+        .map(|t| t.name.as_str())
         .collect();
     if !refused.is_empty() {
         return Err(Error::VacuumRefused(format!(
@@ -267,15 +282,16 @@ async fn vacuum(
             refused.join(", ")
         )));
     }
-    let tables: Vec<String> = tables.into_iter().map(|(name, _)| name).collect();
+    let tables: Vec<String> = tables.into_iter().map(|t| t.name).collect();
     for table in &tables {
-        // The name is the catalog's own, quoted by `format('%I.%I')`.
         client
             .batch_execute(&format!("vacuum ({}) {table}", mode.options()))
             .await?;
     }
+    // Outside a transaction too, so not through `Statements`, which runs in
+    // one. `query_typed` sends the unnamed statement.
     let row = client.query_typed("select clock_timestamp()", &[]).await?;
-    Ok(Vacuum {
+    Ok(VacuumReport {
         tables,
         mode,
         finished_at: row[0].get(0),
