@@ -136,7 +136,7 @@ impl ValidTime {
     }
 
     /// The bounds, which the Store's SQL takes as an instant and a precision.
-    pub(crate) fn instants(self) -> (Bound, Bound) {
+    pub(crate) fn bounds(self) -> (Bound, Bound) {
         (self.from, self.to)
     }
 }

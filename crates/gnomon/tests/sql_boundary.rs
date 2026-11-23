@@ -2302,3 +2302,36 @@ async fn a_write_with_a_precision_that_does_not_fit_its_bound_is_refused() {
         assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{what}: {err:?}");
     }
 }
+
+#[tokio::test]
+async fn a_caller_cannot_file_a_bound_statement_under_another_nodes_name() {
+    let n = nodes().await;
+    let c = first_contribution(&n).await;
+    let mut client = n.w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    let other: Uuid = tx
+        .query_typed(
+            "select gnomon.create_node($1, 'support', 'node')",
+            &[(&n.w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let err = tx
+        .execute_typed(
+            INSERT_STATEMENT,
+            &[
+                (&n.w.t1, Type::UUID),
+                (&other, Type::UUID),
+                (&n.w.t1_support, Type::UUID),
+                (&c.0, Type::INT8),
+                (&"2024-03-01", Type::TEXT),
+                (&"month", Type::TEXT),
+                (&c.1, Type::TIMESTAMPTZ),
+                (&c.2, Type::TIMESTAMPTZ),
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{err:?}");
+}

@@ -686,7 +686,7 @@ async fn write_patch(
     node: NodeId,
     patch: &Patch,
 ) -> Result<WriteOutcome, Error> {
-    let (from, to) = patch.valid_time.instants();
+    let (from, to) = patch.valid_time.bounds();
     let ((from, from_precision), (to, to_precision)) = (from.parts(), to.parts());
     let values = Value::Object(patch.values.clone());
     let places = (!patch.places.is_empty()).then(|| {

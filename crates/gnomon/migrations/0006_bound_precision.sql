@@ -171,6 +171,18 @@ create function gnomon.bound_statement_check_insert() returns trigger
     if new.bound_at in ('-infinity', 'infinity') or new.bound_precision = 'unknown' then
       return new; -- The check constraints refuse it.
     end if;
+    -- A direct insert serialises with writes and Erasure on the Node (ADR-0007).
+    perform pg_catalog.pg_advisory_xact_lock(gnomon.node_lock_key(new.tenant_id, new.node_id));
+    -- The statement names the Contribution's own Node, so that a caller who
+    -- inserts directly cannot file it under a Node the write path locks.
+    if exists (
+      select from gnomon.contribution c
+      where c.tenant_id = new.tenant_id and c.id = new.contribution_id
+        and c.node_id <> new.node_id
+    ) then
+      raise exception using errcode = 'GNW01',
+        message = 'a statement names the Node of the Contribution it is about';
+    end if;
     select * into earlier from gnomon.contribution_bound(
       new.tenant_id, new.contribution_id, new.side);
     if earlier.bound_at is null then
