@@ -132,7 +132,6 @@ create table gnomon.sentence (
   scope text not null,
   version_id uuid not null,
   sentence text not null check (sentence <> ''),
-  recorded_at timestamptz not null default transaction_timestamp(),
   primary key (tenant_id, scope, version_id),
   foreign key (tenant_id, scope, version_id)
     references gnomon.version (tenant_id, scope, id) on delete cascade
@@ -207,7 +206,8 @@ create function gnomon.check_edge_value(p_tenant_id uuid, p_kind text, p_propert
   end
   $$;
 
--- The Kinds a Node of `p_kind` belongs to: its own and every ancestor.
+-- The Kinds a Node or an Edge of `p_kind` belongs to: its own and every
+-- ancestor.
 create function gnomon.kind_lineage(p_tenant_id uuid, p_kind text)
   returns text[]
   language sql stable security invoker set search_path = ''
@@ -298,7 +298,8 @@ create or replace function gnomon.contribution_check_insert() returns trigger
       end if;
     end if;
     -- A Node, Edge or Episode the caller cannot see fails a foreign key or
-    -- the policy, and so does a row naming both or neither.
+    -- the policy, and a row naming both or neither fails the check
+    -- constraint.
     return new;
   end
   $$;
@@ -1202,6 +1203,9 @@ create function gnomon.uncertain_at(
 -- Reads an Edge As-of a valid-at and a known-at instant, as `read_node`
 -- reads a Node, with its Kind, its endpoints and its Sentence, or a null
 -- Sentence until one is stored. A null known-at reads the current belief.
+-- The read follows the rule of `traverse`: an Edge with an endpoint the
+-- caller cannot see reads as no Edge, so a read never names a Node outside
+-- the caller's Scopes.
 create function gnomon.read_edge(
   p_tenant_id uuid,
   p_edge_id uuid,
@@ -1235,6 +1239,8 @@ create function gnomon.read_edge(
            v.text_hash, s.sentence
     from gnomon.version v
     join gnomon.edge e on e.tenant_id = v.tenant_id and e.id = v.edge_id
+    join gnomon.node src on src.tenant_id = e.tenant_id and src.id = e.source_id
+    join gnomon.node tgt on tgt.tenant_id = e.tenant_id and tgt.id = e.target_id
     left join gnomon.sentence s
       on s.tenant_id = v.tenant_id and s.scope = v.scope and s.version_id = v.id
     where v.tenant_id = p_tenant_id and v.edge_id = p_edge_id
@@ -1292,17 +1298,22 @@ create function gnomon.read_nodes(
     order by w.ord
   $$;
 
--- Traverses the Edges of a Node As-of a valid-at and a known-at instant:
--- each Edge that joins the Node and held a Version then, with that Version,
--- its Sentence or a null one, the direction it was followed in, the
--- neighbouring Node and the neighbour's Version then, or nulls where the
--- neighbour held none, as a bare identity does.
+-- Traverses the Edges of a Node As-of a valid-at and a known-at instant.
+-- Each row is one Edge that joins the Node and held a Version then. It holds
+-- that Version, with its Sentence or a null one, and the direction the Edge
+-- was followed in. It also holds the neighbouring Node and that Node's
+-- Version then. The neighbour's columns are null where it held no Version,
+-- as a bare identity holds none: temporal referential integrity is not
+-- enforced (ADR-0008).
 --
 --   p_direction  `out` follows Edges from the Node, `in` Edges to it, and
 --                `both` either. An Edge from the Node to itself is returned
 --                once, as `out`.
---   p_kinds      only Edges of these Edge Kinds or of Kinds below them, or
---                null for every Edge.
+--   p_kinds      only Edges of these Edge Kinds or of Kinds below them. Null
+--                or empty follows every Edge.
+--
+-- The As-of conditions are written out in each read, not called as a
+-- function, so that they stay index conditions (ADR-0004).
 --
 -- Only Edges and Nodes the caller can see are returned: an Edge whose
 -- neighbour is in a Scope the caller cannot see is left out, and a Node the

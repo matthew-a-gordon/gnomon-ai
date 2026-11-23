@@ -495,7 +495,10 @@ impl Caller<'_> {
             .run_writes(node.tenant, &[(Target::NewNode(node), patch)])
             .await?
             .remove(0);
-        Ok((NodeId(id), outcome))
+        match id {
+            Versioned::Node(node) => Ok((node, outcome)),
+            Versioned::Edge(_) => unreachable!("a new Node's write is about the Node"),
+        }
     }
 
     /// Writes a patch of property values for a Node, citing the patch's
@@ -548,7 +551,10 @@ impl Caller<'_> {
             .run_writes(edge.tenant, &[(Target::NewEdge(edge), patch)])
             .await?
             .remove(0);
-        Ok((EdgeId(id), outcome))
+        match id {
+            Versioned::Edge(edge) => Ok((edge, outcome)),
+            Versioned::Node(_) => unreachable!("a new Edge's write is about the Edge"),
+        }
     }
 
     /// Writes a patch of property values for an Edge, citing the patch's
@@ -592,7 +598,7 @@ impl Caller<'_> {
         &self,
         tenant: Option<TenantId>,
         writes: &[(Target<'_>, &Patch)],
-    ) -> Result<Vec<(uuid::Uuid, WriteOutcome)>, Error> {
+    ) -> Result<Vec<(Versioned, WriteOutcome)>, Error> {
         let mut client = self.store.client.lock().await;
         let mut attempt = 0;
         loop {
@@ -608,14 +614,14 @@ impl Caller<'_> {
         client: &mut Client,
         tenant: Option<TenantId>,
         writes: &[(Target<'_>, &Patch)],
-    ) -> Result<Vec<(uuid::Uuid, WriteOutcome)>, Error> {
+    ) -> Result<Vec<(Versioned, WriteOutcome)>, Error> {
         let (tx, tenant) = self.begin(client, tenant).await?;
         let statements = &self.store.statements;
         let mut done = Vec::with_capacity(writes.len());
         for (target, patch) in writes {
-            let (id, of) = match target {
-                Target::Node(node) => (node.0, Versioned::Node),
-                Target::Edge(edge) => (edge.0, Versioned::Edge),
+            let of = match target {
+                Target::Node(node) => Versioned::Node(*node),
+                Target::Edge(edge) => Versioned::Edge(*edge),
                 Target::NewNode(new) => {
                     let rows = statements
                         .query(
@@ -629,7 +635,7 @@ impl Caller<'_> {
                         )
                         .await
                         .map_err(Error::from_store)?;
-                    (rows[0].get(0), Versioned::Node)
+                    Versioned::Node(NodeId(rows[0].get(0)))
                 }
                 Target::NewEdge(new) => {
                     let rows = statements
@@ -646,13 +652,10 @@ impl Caller<'_> {
                         )
                         .await
                         .map_err(Error::from_store)?;
-                    (rows[0].get(0), Versioned::Edge)
+                    Versioned::Edge(EdgeId(rows[0].get(0)))
                 }
             };
-            done.push((
-                id,
-                write_patch(&tx, statements, tenant, of, id, patch).await?,
-            ));
+            done.push((of, write_patch(&tx, statements, tenant, of, patch).await?));
         }
         tx.commit().await?;
         Ok(done)
@@ -837,7 +840,7 @@ impl Caller<'_> {
         node: NodeId,
         statement: &BoundStatement,
     ) -> Result<BoundOutcome, Error> {
-        self.state_bound_of(tenant.into(), Versioned::Node, node.0, statement)
+        self.state_bound_of(tenant.into(), Versioned::Node(node), statement)
             .await
     }
 
@@ -850,7 +853,7 @@ impl Caller<'_> {
         edge: EdgeId,
         statement: &BoundStatement,
     ) -> Result<BoundOutcome, Error> {
-        self.state_bound_of(tenant.into(), Versioned::Edge, edge.0, statement)
+        self.state_bound_of(tenant.into(), Versioned::Edge(edge), statement)
             .await
     }
 
@@ -858,24 +861,15 @@ impl Caller<'_> {
         &self,
         tenant: Option<TenantId>,
         of: Versioned,
-        id: uuid::Uuid,
         statement: &BoundStatement,
     ) -> Result<BoundOutcome, Error> {
+        let id = of.id();
         let (at, precision) = statement.bound.parts();
         let side = match statement.side {
             BoundSide::Start => "from",
             BoundSide::End => "to",
         };
-        let sql = match of {
-            Versioned::Node => {
-                "select change, recorded_at, versions
-                 from gnomon.state_bound($1, $2, $3, $4, $5, $6, $7)"
-            }
-            Versioned::Edge => {
-                "select change, recorded_at, versions
-                 from gnomon.state_edge_bound($1, $2, $3, $4, $5, $6, $7)"
-            }
-        };
+        let sql = of.state_bound_sql();
         let mut client = self.store.client.lock().await;
         let mut attempt = 0;
         loop {
@@ -955,11 +949,47 @@ impl Caller<'_> {
     }
 }
 
-/// Whether a write or a statement is about a Node or an Edge.
+/// The Node or Edge a write or a bound statement is about, and the Store
+/// functions that write it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Versioned {
-    Node,
-    Edge,
+    Node(NodeId),
+    Edge(EdgeId),
+}
+
+impl Versioned {
+    fn id(self) -> uuid::Uuid {
+        match self {
+            Versioned::Node(node) => node.0,
+            Versioned::Edge(edge) => edge.0,
+        }
+    }
+
+    fn write_sql(self) -> &'static str {
+        match self {
+            Versioned::Node(_) => {
+                "select status, recorded_at, versions
+                 from gnomon.write_node($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+            }
+            Versioned::Edge(_) => {
+                "select status, recorded_at, versions
+                 from gnomon.write_edge($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+            }
+        }
+    }
+
+    fn state_bound_sql(self) -> &'static str {
+        match self {
+            Versioned::Node(_) => {
+                "select change, recorded_at, versions
+                 from gnomon.state_bound($1, $2, $3, $4, $5, $6, $7)"
+            }
+            Versioned::Edge(_) => {
+                "select change, recorded_at, versions
+                 from gnomon.state_edge_bound($1, $2, $3, $4, $5, $6, $7)"
+            }
+        }
+    }
 }
 
 async fn write_patch(
@@ -967,9 +997,9 @@ async fn write_patch(
     statements: &Statements,
     tenant: TenantId,
     of: Versioned,
-    id: uuid::Uuid,
     patch: &Patch,
 ) -> Result<WriteOutcome, Error> {
+    let id = of.id();
     let (from, to) = patch.valid_time.bounds();
     let ((from, from_precision), (to, to_precision)) = (from.parts(), to.parts());
     let values = Value::Object(patch.values.clone());
@@ -982,16 +1012,7 @@ async fn write_patch(
                 .collect(),
         )
     });
-    let sql = match of {
-        Versioned::Node => {
-            "select status, recorded_at, versions
-             from gnomon.write_node($1, $2, $3, $4, $5, $6, $7, $8, $9)"
-        }
-        Versioned::Edge => {
-            "select status, recorded_at, versions
-             from gnomon.write_edge($1, $2, $3, $4, $5, $6, $7, $8, $9)"
-        }
-    };
+    let sql = of.write_sql();
     let rows = statements
         .query(
             tx,

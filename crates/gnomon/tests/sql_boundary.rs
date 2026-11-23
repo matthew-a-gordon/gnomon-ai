@@ -2832,6 +2832,29 @@ async fn a_caller_inserting_an_edge_directly_cannot_skip_its_kinds_endpoint_rule
 async fn a_caller_cannot_read_or_traverse_another_tenants_or_scopes_edges() {
     let e = edges().await;
     let (t1, t2) = (e.n.w.t1, e.n.w.t2);
+    // A caller who sees both of Tenant one's Scopes joins its support Node to
+    // its billing Node with an Edge in support.
+    let store = Store::connect(&e.n.w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let (crossing, _) = store
+        .as_user(support::user(TenantId(t1), &["support", "billing"]))
+        .create_edge(
+            &gnomon::NewEdge {
+                tenant: Some(TenantId(t1)),
+                scope: Scope::new("support"),
+                kind: gnomon::ROOT_EDGE_KIND.into(),
+                source: gnomon::NodeId(e.n.n1),
+                target: gnomon::NodeId(e.billing_node),
+            },
+            &gnomon::Patch::new(
+                EpisodeId(e.n.w.t1_support),
+                gnomon::ValidTime::UNKNOWN,
+                Default::default(),
+            ),
+        )
+        .await
+        .unwrap();
     for role in [USER, WORKER] {
         let mut client = e.n.w.db.login().await;
         let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
@@ -2865,6 +2888,25 @@ async fn a_caller_cannot_read_or_traverse_another_tenants_or_scopes_edges() {
                 assert!(rows.is_empty(), "{role} read Tenant two through {sql}");
             }
         }
+        // A caller of support alone reads no Edge that names the billing
+        // Node, by ID or by traversal.
+        let rows = tx
+            .query_typed(
+                "select id from gnomon.read_edge($1, $2, now(), null)",
+                &[(&t1, Type::UUID), (&crossing.0, Type::UUID)],
+            )
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "{role} read an Edge to a Node outside its Scopes");
+        let rows = tx
+            .query_typed(
+                "select neighbour_id from gnomon.traverse($1, $2, now(), null, 'both', null)",
+                &[(&t1, Type::UUID), (&e.n.n1, Type::UUID)],
+            )
+            .await
+            .unwrap();
+        let neighbours: Vec<Uuid> = rows.iter().map(|r| r.get(0)).collect();
+        assert_eq!(neighbours, vec![e.n.n1], "{role} traversed out of its Scopes");
         // Tenant one's own Node in billing is out of this caller's Scopes.
         let rows = tx
             .query_typed(

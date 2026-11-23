@@ -37,9 +37,7 @@ struct World {
 }
 
 impl World {
-    /// A Tenant whose Ontology has the Node Kinds `person`, `employee` below
-    /// it and `company`, and the Edge Kind `works_at` from a `person` to a
-    /// `company`, which declares `role`, with `leads` below it.
+    /// A Tenant whose worker may register Kinds.
     async fn new() -> World {
         let db = TestDb::migrated().await;
         db.grant_kind_registration("gnomon_worker").await;
@@ -62,6 +60,9 @@ impl World {
         self.store.as_user(support::user(self.tenant, scopes))
     }
 
+    /// Registers the Node Kinds `person`, `employee` below it and `company`,
+    /// and the Edge Kind `works_at` from a `person` to a `company`, which
+    /// declares `role`, with `leads` below it.
     async fn ontology(&self) {
         for (name, parent, of, properties) in [
             ("person", None, KindOf::Node, json!({})),
@@ -544,13 +545,15 @@ async fn an_edges_endpoints_may_be_in_any_scope_of_the_tenant_the_caller_can_see
     }
 
     // A worker of `support` alone cannot see `shared`, so traversal from its
-    // own Node leaves the Edge out, and the Edge to it cannot be followed.
+    // own Node leaves the Edge out, and reading the Edge finds nothing, so no
+    // read names the Node it cannot see.
     let steps = w
         .caller()
         .traverse(w.tenant, mine, AsOf::current(day(5)), &Traversal::all())
         .await
         .unwrap();
     assert!(steps.is_empty(), "{steps:?}");
+    assert_eq!(w.read_edge(edge, AsOf::current(day(5))).await, None);
 }
 
 #[tokio::test]
