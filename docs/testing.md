@@ -167,10 +167,10 @@ The search index trigger writes a Node Version's name rows in the write's own tr
 
 ## Search's smoke check
 
-`search.rs` ends with a smoke check of the whole fused Search (migration 0020). It loads `GNOMON_SEARCH_SMOKE_ROWS` texts, 2,000 by default, through `support::vectors::load`, derives their token rows with `gnomon.index_search_text` under the worker's claims, inserts one Edge per Node with a Citation each as the superuser with `session_replication_role = replica`, vacuums, and prints the p50 and p95 of 20 Searches. It asserts no timing, so it passes on a loaded machine. To compare with prototype 5's 66 ms p95 at 50,000 visible rows:
+`search.rs` ends with a smoke check of the whole fused Search (migration 0020). It loads `GNOMON_SEARCH_SMOKE_ROWS` texts, 2,000 by default, through `support::vectors::load`, derives their token rows with `gnomon.index_search_text` under the worker's claims, inserts one Edge per Node with a Citation each as the superuser with `session_replication_role = replica`, vacuums, and prints the p50 and p95 of 20 Searches, each by a name's number, a word one text holds, and an embedding. It asserts no timing, so it passes on a loaded machine. To compare with prototype 5's 66 ms p95 at 50,000 visible rows:
 
 ```sh
-GNOMON_SEARCH_SMOKE_ROWS=92000 cargo nextest run --test search smoke --no-capture
+GNOMON_SEARCH_SMOKE_ROWS=92000 cargo test -p gnomon --test search smoke -- --nocapture
 ```
 
-About 54% of the texts are visible at the current belief, so 92,000 texts give about 50,000 visible rows. The load takes several minutes in a debug build.
+About 54% of the texts are visible at the current belief, so 92,000 texts give about 50,000 visible rows. The load takes longer than the 180 seconds the nextest profile allows a test, so this run uses `cargo test`.

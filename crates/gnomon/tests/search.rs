@@ -867,7 +867,11 @@ async fn smoke_check_prints_the_time_of_a_fused_search() {
     for i in 0..21 {
         let centre = rng.below(centres.len());
         let q = rng.near(&centres[centre], 0.6);
-        let text = format!("text {}", rng.below(rows));
+        // A name's number, which one text holds. Every name holds "text",
+        // and a word every text holds makes the full-text branch score every
+        // posting of the Scope (migration 0016), as prototype 5 avoided by
+        // querying mid-frequency words.
+        let text = format!("{}", rng.below(rows));
         let started = std::time::Instant::now();
         let results = search(&w, &SearchRequest::text(&text, current()).with_embedding(&q), 10).await;
         let took = started.elapsed();
