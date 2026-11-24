@@ -99,6 +99,10 @@ pub struct Server {
     pub(super) login_user: String,
     pub(super) migration_role: Option<String>,
     lock_path: PathBuf,
+    /// What the performance suite records about the server: the image, and
+    /// the container's memory cap when the harness set one.
+    pub image: String,
+    pub memory_cap: Option<String>,
 }
 
 /// Holds the server's cross-process lock until dropped.
@@ -139,6 +143,8 @@ impl Server {
                 migration_role,
                 login_user: login_user(),
                 lock_path: lock_path(&format!("url-{host}-{port}")),
+                image: "external server (GNOMON_TEST_DATABASE_URL)".into(),
+                memory_cap: None,
             };
             server.wait_ready().await;
             return server;
@@ -170,6 +176,8 @@ impl Server {
             migration_role: image.migration_role.map(str::to_owned),
             login_user: login_user(),
             lock_path,
+            image: format!("{}:{}", image.name, image.tag),
+            memory_cap: env("GNOMON_TEST_MEMORY"),
         };
         server.wait_ready().await;
         server
@@ -278,6 +286,13 @@ async fn start_container(image: &TestImage, prefix: &str, container_name: &str) 
         "gnomon-test-db".to_owned(),
     ];
     cmd.extend(image.cmd.iter().map(|s| (*s).to_owned()));
+    // The performance suite (ticket #21) passes server settings here, such as
+    // `-c shared_buffers=1GB`, split on whitespace.
+    if let Some(args) = env("GNOMON_TEST_POSTGRES_ARGS") {
+        cmd.extend(args.split_whitespace().map(str::to_owned));
+    }
+    let memory = env("GNOMON_TEST_MEMORY").map(|m| parse_bytes(&m));
+    let on_disk = env("GNOMON_TEST_DATA_DIR").as_deref() == Some("disk");
     let container = GenericImage::new(image.name, image.tag)
         .with_exposed_port(5432.tcp())
         .with_entrypoint("bash")
@@ -290,7 +305,7 @@ async fn start_container(image: &TestImage, prefix: &str, container_name: &str) 
         .with_startup_timeout(Duration::from_secs(180))
         // Shared by every test process; the watcher removes it, not Drop.
         .with_reuse(ReuseDirective::Always)
-        .with_host_config_modifier(|host: &mut HostConfig| {
+        .with_host_config_modifier(move |host: &mut HostConfig| {
             host.auto_remove = Some(true);
             // Loopback only, with a port Docker picks.
             host.publish_all_ports = Some(false);
@@ -301,10 +316,20 @@ async fn start_container(image: &TestImage, prefix: &str, container_name: &str) 
                     host_port: Some(String::new()),
                 }]),
             )]));
-            host.tmpfs = Some(HashMap::from([(
-                "/var/lib/postgresql/data".to_owned(),
-                "rw".to_owned(),
-            )]));
+            // A tmpfs counts against the container's memory cap, so a
+            // capped run keeps its data on disk, in the image's anonymous
+            // volume, which Docker removes with the container.
+            if !on_disk {
+                host.tmpfs = Some(HashMap::from([(
+                    "/var/lib/postgresql/data".to_owned(),
+                    "rw".to_owned(),
+                )]));
+            }
+            if let Some(bytes) = memory {
+                host.memory = Some(bytes);
+                // No swap beyond the cap, so the cap is real.
+                host.memory_swap = Some(bytes);
+            }
         })
         .start()
         .await
@@ -313,4 +338,20 @@ async fn start_container(image: &TestImage, prefix: &str, container_name: &str) 
         .get_host_port_ipv4(5432.tcp())
         .await
         .expect("the container publishes 5432")
+}
+
+/// A size such as `4g`, `512m` or a plain number of bytes.
+fn parse_bytes(s: &str) -> i64 {
+    let s = s.trim().to_ascii_lowercase();
+    let (digits, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: i64 = digits
+        .parse()
+        .unwrap_or_else(|_| panic!("GNOMON_TEST_MEMORY={s:?} is not a size such as 4g"));
+    n * match unit {
+        "" | "b" => 1,
+        "k" | "kb" => 1 << 10,
+        "m" | "mb" => 1 << 20,
+        "g" | "gb" => 1 << 30,
+        _ => panic!("GNOMON_TEST_MEMORY={s:?} is not a size such as 4g"),
+    }
 }

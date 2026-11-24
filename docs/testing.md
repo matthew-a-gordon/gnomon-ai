@@ -1,6 +1,6 @@
 # Testing
 
-The suite runs with plain `cargo test` or with `cargo nextest run`, and every test passes under both. ADR-0020 records why the suite is built this way.
+The suite runs with plain `cargo test` or with `cargo nextest run`, and every test passes under both. ADR-0020 records why the suite is built this way. The performance suite is separate and runs only on demand: see "The performance suite" below.
 
 ## What runs where
 
@@ -176,3 +176,40 @@ GNOMON_SEARCH_SMOKE_ROWS=92000 cargo test -p gnomon --test search smoke -- --noc
 ```
 
 About 54% of the texts are visible at the current belief, so 92,000 texts give about 50,000 visible rows. The load takes longer than the 180 seconds the nextest profile allows a test, so this run uses `cargo test`.
+
+## The performance suite
+
+`crates/gnomon/tests/performance.rs` is on demand and apart from everything above (ticket #21, ADR-0020: no `criterion`, an on-demand suite that asserts budgets). Cargo builds it only with the `performance` feature, so a plain `cargo test` or `cargo nextest run` of the workspace never builds or runs it.
+
+```sh
+scripts/perf.sh                 # both images, then the 4 GiB case on each; about an hour on a quiet machine
+scripts/perf.sh search          # fused Search at 50,000 and 200,000 visible rows, on both images
+scripts/perf.sh patch           # bounded patch writes, on both images
+scripts/perf.sh capped          # 200,000 visible rows in a container capped at 4 GiB, on both images
+PERF_IMAGES=pgvector scripts/perf.sh search
+
+# one case, on one image, with the settings the script uses (see scripts/perf.sh)
+GNOMON_TEST_CONTAINER_PREFIX=gnomon-t21 GNOMON_TEST_DATA_DIR=disk \
+  cargo test -p gnomon --features performance --test performance fused_search -- --nocapture --test-threads=1
+```
+
+It asserts:
+
+- the whole fused Search, `Caller::search` by text and vector, under 100 ms at p95 up to 50,000 visible rows and under 250 ms up to 200,000 (ADR-0010), on the data shape of prototype 5 (`origin/prototype/exact-search`);
+- a bounded patch write of about 1 to 11 ms at p50, growing with the Node's Contribution count (10, 100 and 500), as prototype 4 measured (`origin/prototype/recompute-cost`, FINDINGS.md). The ceiling asserted is 11 ms at p50 for each size, and the p50 must rise from 10 to 100 to 500 Contributions.
+
+How a case measures:
+
+- Search takes 10 discarded warm-up calls, then 100 timed ones, each a fresh text word and a fresh query vector near one of 200 subtopic centres. A patch write takes three Nodes' worth of discarded warm-up writes, then 60 timed writes: three bounded patches (two properties, a 14-day Valid time) to each of 20 Nodes. Each time includes the commit.
+- The data set is built with set-based SQL (`support/perf_data.sql`, `generate_series`) into a database named `gnomon_perf_<texts>_<hash of the migrations and the SQL>`. It stays on the server, so a rerun against a container that is still up skips the build. About 54% of the texts are visible at the current belief, so 92,600 texts give about 50,000 visible rows and 370,400 give about 200,000. A case refuses to run if its data set is not within 5% of the size it names.
+- The server runs with prototype 5's settings. `scripts/perf.sh` sets them through `GNOMON_TEST_POSTGRES_ARGS`: `shared_buffers` 8 GB, `work_mem` 64 MB, no parallel workers, `fsync` off and autovacuum off, with the tables vacuumed and frozen after the load. The capped container uses prototype 5's capped settings: `shared_buffers` 1 GB, `effective_cache_size` 3 GB, `work_mem` 16 MB. Durable commit cost is not in the patch numbers, as in prototype 4.
+
+Three variables for the harness exist for this suite:
+
+- `GNOMON_TEST_MEMORY`, such as `4g`, caps the container's memory, with no swap beyond the cap. It sets `--memory` and `--memory-swap` through the container request.
+- `GNOMON_TEST_DATA_DIR=disk` keeps the data in the image's anonymous volume instead of a tmpfs, which would count against the cap. `scripts/perf.sh` removes the volume with the container.
+- `GNOMON_TEST_POSTGRES_ARGS` appends arguments to the server's command line.
+
+Each case writes a JSON record to `target/tmp/performance/` and prints a summary. The record holds the date, the image, the Postgres and pgvector versions, the CPU count, the host's memory, the container's memory cap (and `docker inspect`'s view of it), the server settings, the one-minute load average and the I/O pressure from `/proc/pressure/io` before and after, and the numbers. When the load average was at or above half the CPU count, or tasks waited on I/O a tenth of the time or more, the output says `THIS RUN WAS LOADED`. A budget that fails on a loaded machine is rerun when the machine is quieter. The budgets stay as they are.
+
+Lane 3 (the Supabase CLI stack) is not needed: the `supabase/postgres` image is the server under test, and the budgets do not depend on PostgREST or the CLI's roles. The cases take a lock, so they never overlap, but the run still shares the machine with whatever else runs on it.

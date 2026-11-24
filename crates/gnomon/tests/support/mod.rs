@@ -23,6 +23,8 @@
 
 pub mod alembic;
 pub mod erasure;
+pub mod perf;
+
 pub mod server;
 pub mod tls;
 pub mod vectors;
@@ -458,6 +460,25 @@ impl TestDb {
         let server = Server::get().await;
         server.template(DEFAULT_DIMENSION).await;
         Self::create(server, None).await
+    }
+
+    /// Renames this database to `name` and stops managing it: it is not
+    /// dropped when `self` goes. The performance suite keeps its loaded
+    /// data this way, so a run builds it once. Every connection to the
+    /// database must be closed first.
+    pub async fn keep_as(self, name: &str) {
+        let server = self.server;
+        server
+            .admin("postgres")
+            .await
+            .batch_execute(&format!(
+                "alter database {} rename to {}",
+                quote_ident(&self.name),
+                quote_ident(name)
+            ))
+            .await
+            .expect("rename the database to keep");
+        std::mem::forget(self);
     }
 
     /// The superuser, connected to this database. Only setup and tamper
