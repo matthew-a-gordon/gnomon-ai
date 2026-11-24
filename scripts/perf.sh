@@ -45,7 +45,7 @@ stage() { # <image> <prefix> <memory or ""> <postgres args> <cargo test filters.
 status=0
 for image in $images; do
   case "$what" in
-    search|all) stage "$image" gnomon-t21 "" "$uncapped_args" fused_search || status=1 ;;
+    search|all) stage "$image" gnomon-t21 "" "$uncapped_args" ${PERF_FILTER:-fused_search} || status=1 ;;
   esac
   case "$what" in
     patch|all) stage "$image" gnomon-t21 "" "$uncapped_args" bounded_patch || status=1 ;;

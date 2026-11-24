@@ -261,6 +261,12 @@ pub fn texts_for_visible(visible: usize) -> usize {
     (visible as f64 / 0.54).round() as usize
 }
 
+/// The one Tenant every data set is built for, so a data set found in the
+/// server by a later run belongs to the Tenant that run names.
+fn data_tenant() -> gnomon::TenantId {
+    gnomon::TenantId(uuid::Uuid::from_u128(0x2100_0000_0000_4000_8000_0000_0000_0021))
+}
+
 fn dataset_name(texts: usize) -> String {
     let mut h = DefaultHasher::new();
     super::exported(DEFAULT_DIMENSION).hash(&mut h);
@@ -293,7 +299,7 @@ impl Dataset {
                 "select count(*) filter (where valid_from <= $1 and $1 < valid_to
                                          and recorded_to = 'infinity'),
                         count(*)
-                 from gnomon.version",
+                 from gnomon.version where node_id is not null",
                 &[(&valid_at(), Type::TIMESTAMPTZ)],
             )
             .await
@@ -302,7 +308,7 @@ impl Dataset {
             db: name,
             texts,
             visible: row[0].get(0),
-            versions: row[1].get(1),
+            versions: row[0].get(1),
         }
     }
 
@@ -314,7 +320,7 @@ impl Dataset {
     }
 
     pub fn tenant(&self) -> gnomon::TenantId {
-        super::tenant()
+        data_tenant()
     }
 
     pub fn claims(&self) -> String {
@@ -354,7 +360,7 @@ async fn build(texts: usize, name: &str) {
     let started = std::time::Instant::now();
     let db = TestDb::migrated().await;
     db.grant_kind_registration("gnomon_worker").await;
-    let tenant = super::tenant();
+    let tenant = data_tenant();
     {
         let store = gnomon::Store::connect(&db.login_url(), &super::connect_options())
             .await
@@ -476,12 +482,12 @@ async fn embeddings(db: &TestDb, sql: &str, tenant: gnomon::TenantId) {
     // The section holds the statement to run per batch, after a marker line.
     let (setup, per_batch) = sql.split_once("-- per batch\n").unwrap();
     admin.batch_execute(setup).await.unwrap();
-    let batches: i64 = admin
+    let batches: i32 = admin
         .query_typed("select max(batch) + 1 from perf.vers", &[])
         .await
         .unwrap()[0]
         .get(0);
-    let next = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
     let mut tasks = vec![];
     for _ in 0..WORKERS {
         let (next, claims, per_batch) = (next.clone(), claims.clone(), per_batch.to_owned());
@@ -500,7 +506,7 @@ async fn embeddings(db: &TestDb, sql: &str, tenant: gnomon::TenantId) {
                 )
                 .await
                 .unwrap();
-                tx.execute_typed(&per_batch, &[(&tenant.0, Type::UUID), (&(batch as i32), Type::INT4)])
+                tx.execute_typed(&per_batch, &[(&tenant.0, Type::UUID), (&batch, Type::INT4)])
                     .await
                     .unwrap_or_else(|e| panic!("store embeddings of batch {batch}: {e:?}"));
                 tx.commit().await.unwrap();

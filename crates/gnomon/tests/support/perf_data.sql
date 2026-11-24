@@ -54,18 +54,19 @@ create unlogged table perf.node as
   from d;
 create unlogged table perf.vers as
   select *, ((row_number() over (order by node_i, seq) - 1) / 500)::int as batch from (
-    select e.id, e.node_i, e.text_id, e.seq,
-           e.rstart + sum(e.off) over (partition by e.node_i order by e.seq) * interval '1 day' as rf,
-           lead(e.rstart + sum(e.off) over (partition by e.node_i order by e.seq) * interval '1 day')
-             over (partition by e.node_i order by e.seq) as rt
+    select f.id, f.node_i, f.text_id, f.seq, f.rf,
+           lead(f.rf) over (partition by f.node_i order by f.seq) as rt
     from (
-      select gen_random_uuid() as id, t.node_i, t.text_id, t.rstart,
-             row_number() over (partition by t.node_i order by t.text_id, r.rep) as seq,
-             case when row_number() over (partition by t.node_i order by t.text_id, r.rep) = 1
-                  then 0 else 1 + floor(random() * 60) end as off
-      from (select n.i as node_i, x.id as text_id, n.rstart, 1 + (random() < 0.3)::int as reps
-            from perf.node n, generate_series(n.first_text + 1, n.first_text + n.chain) x(id)) t,
-           generate_series(1, t.reps) r(rep)) e) z;
+      select e.id, e.node_i, e.text_id, e.seq,
+             e.rstart + sum(e.off) over (partition by e.node_i order by e.seq) * interval '1 day' as rf
+      from (
+        select gen_random_uuid() as id, t.node_i, t.text_id, t.rstart,
+               row_number() over (partition by t.node_i order by t.text_id, r.rep) as seq,
+               case when row_number() over (partition by t.node_i order by t.text_id, r.rep) = 1
+                    then 0 else 1 + floor(random() * 60) end as off
+        from (select n.i as node_i, x.id as text_id, n.rstart, 1 + (random() < 0.3)::int as reps
+              from perf.node n, generate_series(n.first_text + 1, n.first_text + n.chain) x(id)) t,
+             generate_series(1, t.reps) r(rep)) e) f) z;
 create index on perf.vers (batch);
 -- @@
 begin;
