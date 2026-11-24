@@ -26,8 +26,8 @@ const MARKER: &str = "vacuumed-7f3e";
 
 /// The tables an Erasure deletes from or rewrites today: those migration
 /// 0013's header lists, the token table and BM25 counts of migration 0016,
-/// the full and quantized embeddings of migration 0017, and the Summaries
-/// and Communities of migration 0018.
+/// the full and quantized embeddings of migration 0017, the Summaries and
+/// Communities of migration 0018, and the name rows of migration 0019.
 const ERASED_TABLES: &[&str] = &[
     "gnomon.bound_statement",
     "gnomon.citation",
@@ -42,6 +42,7 @@ const ERASED_TABLES: &[&str] = &[
     "gnomon.episode_retraction",
     "gnomon.erasure_reach",
     "gnomon.node",
+    "gnomon.node_name",
     "gnomon.search_scope_length",
     "gnomon.search_token",
     "gnomon.search_token_frequency",
@@ -114,6 +115,14 @@ async fn an_episode_written_everywhere(w: &World) -> gnomon::EpisodeId {
     let acme = w
         .node("company", f, ValidTime::UNKNOWN, json!({ "name": "Acme" }))
         .await;
+    // An Alias of Acme, for Resolution (migration 0019).
+    w.write(
+        acme,
+        e,
+        ValidTime::UNKNOWN,
+        json!({ "aliases": [format!("{MARKER} Corp")] }),
+    )
+    .await;
     let owns = w
         .edge(acct, acme, e, ValidTime::UNKNOWN, json!({ "share": 7 }))
         .await;
@@ -204,6 +213,8 @@ async fn an_episode_written_everywhere(w: &World) -> gnomon::EpisodeId {
             .await
             .unwrap();
     }
+    // And of every current name and Alias.
+    support::vectors::embed_every_name(w, SCOPE, &mut rng).await;
     e
 }
 

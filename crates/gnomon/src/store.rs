@@ -38,12 +38,12 @@ use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Community,
     CommunityId, DerivedCitation, Direction, EdgeId, EdgeVersion, EndOfValidity, Episode,
-    EpisodeErasure, EpisodeId, EpisodeRetraction, Error, FullTextCandidate, GraphErasure, Kind,
-    KindOf, MergeRule, NewCommunity, NewEdge, NewEpisode, NewKind, NewNode, NewSummary, NodeId,
-    NodeVersion, Patch, Precision, Retraction, Scope, StageError, StageOutcome, StageRecord,
-    StageStatus, StageUsage, StageWrite, StatementKind, Step, Summary, SummaryId, TenantId,
-    Traversal, VacuumMode, VacuumReport, ValidTime, VectorCandidate, VersionId, Versioned,
-    WriteOutcome, WriteStatus,
+    EpisodeErasure, EpisodeId, EpisodeRetraction, Error, FullTextCandidate, FullTextNameMatch,
+    GraphErasure, Kind, KindOf, Mention, MergeRule, NewCommunity, NewEdge, NewEpisode, NewKind,
+    NewNode, NewSummary, NodeId, NodeVersion, Patch, Precision, ResolutionCandidate, Retraction,
+    Scope, StageError, StageOutcome, StageRecord, StageStatus, StageUsage, StageWrite,
+    StatementKind, Step, Summary, SummaryId, TenantId, Traversal, VacuumMode, VacuumReport,
+    ValidTime, VectorCandidate, VectorNameMatch, VersionId, Versioned, WriteOutcome, WriteStatus,
 };
 
 /// How many times a write is retried when Postgres fails it with a
@@ -1159,6 +1159,45 @@ impl Caller<'_> {
         Ok(())
     }
 
+    /// Stores the embedding of `name`, a current name or Alias of `node`,
+    /// for Resolution (migration 0019). The full vector is stored once per
+    /// text in the Node's Scope, the same row a Sentence or another name with
+    /// that text uses: when one is stored already it stays, and `embedding`
+    /// is not used. Every current name and Alias of the Scope with that text
+    /// is then matched by vector, and so is every one written later, so a
+    /// new Version that keeps its name needs no new embedding.
+    ///
+    /// An `embedding` that [`store_embedding`](Self::store_embedding) would
+    /// refuse fails with [`Error::Database`] and SQLSTATE 22023. A Node the
+    /// caller cannot see, or a text that is not one of its current names or
+    /// Aliases, fails with [`Error::InvalidWrite`].
+    pub async fn store_name_embedding(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        node: NodeId,
+        name: &str,
+        embedding: &[f32],
+    ) -> Result<(), Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        self.store
+            .statements
+            .query(
+                &tx,
+                "select gnomon.store_name_embedding($1, $2, $3, $4)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&node.0, Type::UUID),
+                    (&name, Type::TEXT),
+                    (&embedding, Type::FLOAT4_ARRAY),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        tx.commit().await.map_err(Error::from_store)?;
+        Ok(())
+    }
+
     /// The vector branch of Search (ADR-0010): the Versions whose stored
     /// embeddings are nearest `query` by cosine distance, As-of `as_of`,
     /// nearest first, at most `limit` of them. The search is exact over the
@@ -1208,6 +1247,84 @@ impl Caller<'_> {
                 scope: Scope::new(r.get::<_, String>(3)),
                 distance: r.get(4),
                 rank: r.get(5),
+            })
+            .collect())
+    }
+
+    /// Resolution (migration 0019): the Nodes whose current names and
+    /// Aliases match `mention`, best first, at most `limit` of them, each with
+    /// the name or Alias it matched. The full-text half scores each name and
+    /// Alias by BM25 from the word counts of the caller's allowed Scopes, and
+    /// finds a name as soon as the write that gave it commits. The vector
+    /// half runs when the mention carries an embedding. The halves are fused
+    /// by reciprocal rank fusion, and each candidate says what each half
+    /// found and at what rank.
+    ///
+    /// A name is current while its Version is the current belief, so a name
+    /// a Correction or a Retraction replaced is never matched, and one a Node
+    /// had over an earlier Valid time is, unless the mention names a
+    /// valid-at instant. Resolution merges nothing (ADR-0012).
+    ///
+    /// A `limit` below 1, or an embedding that
+    /// [`store_embedding`](Self::store_embedding) would refuse, fails with
+    /// [`Error::Database`] and SQLSTATE 22023.
+    pub async fn resolve(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        mention: &Mention<'_>,
+        limit: i32,
+    ) -> Result<Vec<ResolutionCandidate>, Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let embedding: Option<Vec<f32>> = mention.embedding.map(<[f32]>::to_vec);
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
+                "select node_id, scope, name, alias, score, rank,
+                        text_version_id, text_name, text_alias, text_score, text_rank,
+                        vector_version_id, vector_name, vector_alias, vector_distance,
+                        vector_rank
+                 from gnomon.resolve($1, $2, $3, $4, $5)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&mention.text, Type::TEXT),
+                    (&embedding, Type::FLOAT4_ARRAY),
+                    (&mention.valid_at, Type::TIMESTAMPTZ),
+                    (&limit, Type::INT4),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|r| ResolutionCandidate {
+                node: NodeId(r.get(0)),
+                scope: Scope::new(r.get::<_, String>(1)),
+                name: r.get(2),
+                alias: r.get(3),
+                score: r.get(4),
+                rank: r.get(5),
+                full_text: r
+                    .get::<_, Option<uuid::Uuid>>(6)
+                    .map(|version| FullTextNameMatch {
+                        version: VersionId(version),
+                        name: r.get(7),
+                        alias: r.get(8),
+                        score: r.get(9),
+                        rank: r.get(10),
+                    }),
+                vector: r
+                    .get::<_, Option<uuid::Uuid>>(11)
+                    .map(|version| VectorNameMatch {
+                        version: VersionId(version),
+                        name: r.get(12),
+                        alias: r.get(13),
+                        distance: r.get(14),
+                        rank: r.get(15),
+                    }),
             })
             .collect())
     }

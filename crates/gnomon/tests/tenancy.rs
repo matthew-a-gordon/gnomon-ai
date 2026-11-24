@@ -318,6 +318,12 @@ async fn switching_to_multi_tenant_mode_keeps_every_row_readable_under_the_forme
     let version = written.opened[0];
     let citations = single.list_citations(None, version).await.unwrap();
     assert_eq!(citations.len(), 2);
+    // The Node's name, embedded for Resolution (migration 0019).
+    let name_vector = support::vectors::Rng::new(7).unit();
+    single
+        .store_name_embedding(None, node, "Ada", &name_vector)
+        .await
+        .unwrap();
 
     db.switch_to_multi_tenant().await;
 
@@ -347,6 +353,17 @@ async fn switching_to_multi_tenant_mode_keeps_every_row_readable_under_the_forme
         multi.list_citations(first, version).await.unwrap(),
         citations
     );
+    let resolved = multi
+        .resolve(
+            first,
+            &gnomon::Mention::text("ada").with_embedding(&name_vector),
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].node, node);
+    assert!(resolved[0].full_text.is_some() && resolved[0].vector.is_some());
 
     // The Kind's rule still applies to the Tenant's Node.
     let earlier = {

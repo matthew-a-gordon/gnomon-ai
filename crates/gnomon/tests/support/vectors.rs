@@ -402,3 +402,312 @@ pub async fn embed_every_version(
     }
     vectors
 }
+
+/// One name or Alias of the synthetic name corpus, and which text it holds.
+#[derive(Debug, Clone)]
+pub struct SyntheticName {
+    pub node: Uuid,
+    pub scope: String,
+    pub text: usize,
+    /// Whether its Version is the current belief, or one a later Version
+    /// replaced.
+    pub current: bool,
+    pub valid_from: DateTime<Utc>,
+    pub valid_to: Option<DateTime<Utc>>,
+}
+
+/// The texts and names of the synthetic name corpus a test loaded.
+#[derive(Debug, Default)]
+pub struct NameCorpus {
+    pub texts: Vec<Vec<f32>>,
+    pub names: Vec<SyntheticName>,
+}
+
+impl NameCorpus {
+    /// The exact top `k` Nodes by the cosine distance of their nearest
+    /// current name or Alias at full precision, over `scopes`, valid at
+    /// `valid_at` when it is set, ties to the lower Node ID: the ground
+    /// truth Resolution's recall is measured against.
+    pub fn exact(
+        &self,
+        query: &[f32],
+        scopes: &[&str],
+        valid_at: Option<DateTime<Utc>>,
+        k: usize,
+    ) -> Vec<Uuid> {
+        let mut best: HashMap<Uuid, f64> = HashMap::new();
+        for n in self.names.iter().filter(|n| {
+            n.current
+                && scopes.contains(&n.scope.as_str())
+                && valid_at
+                    .is_none_or(|at| n.valid_from <= at && n.valid_to.is_none_or(|to| at < to))
+        }) {
+            let d = cosine_distance(query, &self.texts[n.text]);
+            let e = best.entry(n.node).or_insert(f64::INFINITY);
+            if d < *e {
+                *e = d;
+            }
+        }
+        let mut d: Vec<(f64, Uuid)> = best.into_iter().map(|(n, d)| (d, n)).collect();
+        d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        d.into_iter().take(k).map(|(_, n)| n).collect()
+    }
+
+    /// How many current names and Aliases of `scopes` there are.
+    pub fn current(&self, scopes: &[&str]) -> usize {
+        self.names
+            .iter()
+            .filter(|n| n.current && scopes.contains(&n.scope.as_str()))
+            .count()
+    }
+}
+
+/// Loads `nodes` Nodes of Kind `company` into `scope` of `tenant`, each
+/// with a current Version holding a name and up to two Aliases (60%, 30%,
+/// 10% hold one, two or three names). A third of the Nodes also have an
+/// earlier Version, replaced in Recorded time, with a name of its own. Each
+/// text is a vector near one of `centres`. Valid time starts unknown for a
+/// fifth of the Nodes, and ends for 30% of the rest.
+///
+/// The Nodes and Versions are inserted as the superuser with triggers off,
+/// because only that can give a Version a past Recorded time, and their name
+/// rows are then derived by `gnomon.index_node_names`, as the search index
+/// trigger derives them. The embeddings of current names are stored through
+/// `gnomon.store_name_embedding` as the Scope's worker, as the Pipeline
+/// stores one. Those of replaced names, which that call refuses, are stored
+/// as the superuser, so a search that read replaced names would find them.
+pub async fn load_names(
+    db: &super::TestDb,
+    corpus: &mut NameCorpus,
+    tenant: gnomon::TenantId,
+    scope: &str,
+    nodes: usize,
+    centres: &[Vec<f32>],
+    rng: &mut Rng,
+) {
+    let utc = |y, m, d| Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap();
+    let (mut node_ids, mut ids, mut node_of, mut props) = (vec![], vec![], vec![], vec![]);
+    let (mut vf, mut vt, mut rf, mut rt) = (vec![], vec![], vec![], vec![]);
+    let (mut current, mut replaced) = (vec![], vec![]);
+    let text = |corpus: &mut NameCorpus, rng: &mut Rng| {
+        let i = corpus.texts.len();
+        let centre = &centres[rng.below(centres.len())];
+        corpus.texts.push(rng.near(centre, 0.6));
+        i
+    };
+    for _ in 0..nodes {
+        let node = Uuid::new_v4();
+        node_ids.push(node);
+        let (valid_from, valid_to) = if rng.uniform() < 0.2 {
+            (None, None)
+        } else {
+            let from = day(rng, utc(2020, 1, 1), utc(2025, 6, 1));
+            let to =
+                (rng.uniform() >= 0.7).then(|| from + Duration::days(100 + rng.below(1400) as i64));
+            (Some(from), to)
+        };
+        let replaced_at = day(rng, utc(2024, 1, 1), utc(2026, 1, 1));
+        let mut versions = vec![];
+        if rng.uniform() < 1.0 / 3.0 {
+            versions.push((false, vec![text(corpus, rng)]));
+        }
+        let held = match rng.uniform() {
+            x if x < 0.6 => 1,
+            x if x < 0.9 => 2,
+            _ => 3,
+        };
+        versions.push((true, (0..held).map(|_| text(corpus, rng)).collect()));
+        let only = versions.len() == 1;
+        for (is_current, texts) in versions {
+            let label = |t: &usize| format!("{scope} name {t}");
+            for t in &texts {
+                corpus.names.push(SyntheticName {
+                    node,
+                    scope: scope.to_owned(),
+                    text: *t,
+                    current: is_current,
+                    valid_from: valid_from.unwrap_or(DateTime::<Utc>::MIN_UTC),
+                    valid_to,
+                });
+                if is_current {
+                    current.push((node, label(t), *t));
+                } else {
+                    replaced.push((label(t), *t));
+                }
+            }
+            ids.push(Uuid::new_v4());
+            node_of.push(node);
+            props.push(
+                serde_json::json!({
+                    "name": label(&texts[0]),
+                    "aliases": texts[1..].iter().map(label).collect::<Vec<_>>(),
+                })
+                .to_string(),
+            );
+            vf.push(valid_from);
+            vt.push(valid_to);
+            if is_current {
+                rf.push(if only { utc(2024, 1, 1) } else { replaced_at });
+                rt.push(None);
+            } else {
+                rf.push(utc(2023, 6, 1));
+                rt.push(Some(replaced_at));
+            }
+        }
+    }
+
+    let mut admin = db.admin().await;
+    let tx = admin.transaction().await.unwrap();
+    tx.batch_execute("set local session_replication_role = replica")
+        .await
+        .unwrap();
+    tx.execute_typed(
+        "insert into gnomon.node (tenant_id, scope, id, kind)
+         select $1, $2, x, 'company' from unnest($3::uuid[]) x",
+        &[
+            (&tenant.0, Type::UUID),
+            (&scope, Type::TEXT),
+            (&node_ids, Type::UUID_ARRAY),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.execute_typed(
+        "insert into gnomon.version (tenant_id, scope, id, node_id, props,
+                                     valid_from, valid_from_precision, valid_to, valid_to_precision,
+                                     recorded_from, recorded_to, merge_rule, closed_in)
+         select $1, $2, x.id, x.node, x.props::jsonb,
+                coalesce(x.vf, '-infinity'),
+                case when x.vf is null then 'unknown' else 'instant' end::gnomon.time_precision,
+                coalesce(x.vt, 'infinity'),
+                case when x.vt is null then 'unknown' else 'instant' end::gnomon.time_precision,
+                x.rf, coalesce(x.rt, 'infinity'), 'recency',
+                case when x.rt is null then null else '0'::xid8 end
+         from unnest($3::uuid[], $4::uuid[], $5::text[], $6::timestamptz[], $7::timestamptz[],
+                     $8::timestamptz[], $9::timestamptz[]) x(id, node, props, vf, vt, rf, rt)",
+        &[
+            (&tenant.0, Type::UUID),
+            (&scope, Type::TEXT),
+            (&ids, Type::UUID_ARRAY),
+            (&node_of, Type::UUID_ARRAY),
+            (&props, Type::TEXT_ARRAY),
+            (&vf, Type::TIMESTAMPTZ_ARRAY),
+            (&vt, Type::TIMESTAMPTZ_ARRAY),
+            (&rf, Type::TIMESTAMPTZ_ARRAY),
+            (&rt, Type::TIMESTAMPTZ_ARRAY),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.batch_execute("set local session_replication_role = origin")
+        .await
+        .unwrap();
+    tx.execute_typed(
+        "select gnomon.index_node_names($1, $2)",
+        &[(&tenant.0, Type::UUID), (&ids, Type::UUID_ARRAY)],
+    )
+    .await
+    .unwrap();
+    // The replaced names' embeddings, past the Store's function.
+    let flat: Vec<f32> = replaced
+        .iter()
+        .flat_map(|(_, t)| corpus.texts[*t].iter().copied())
+        .collect();
+    let labels: Vec<String> = replaced.iter().map(|(l, _)| l.clone()).collect();
+    tx.execute_typed(
+        "insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
+         select $1, $2, gnomon.sentence_text_hash(x.name),
+                gnomon.embedding_vector(($4::real[])[(x.i - 1) * $5 + 1 : x.i * $5])
+         from unnest($3::text[]) with ordinality x(name, i)",
+        &[
+            (&tenant.0, Type::UUID),
+            (&scope, Type::TEXT),
+            (&labels, Type::TEXT_ARRAY),
+            (&flat, Type::FLOAT4_ARRAY),
+            (&(DIM as i32), Type::INT4),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.execute_typed(
+        "update gnomon.node_name set q = null
+         where tenant_id = $1 and scope = $2 and name = any($3)",
+        &[
+            (&tenant.0, Type::UUID),
+            (&scope, Type::TEXT),
+            (&labels, Type::TEXT_ARRAY),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // The current names' embeddings, through the Store's function, as the
+    // worker.
+    let claims = serde_json::json!({
+        "role": "gnomon_worker",
+        "app_metadata": { "tenant_id": tenant.0.to_string(), "scopes": [scope] }
+    })
+    .to_string();
+    for chunk in current.chunks(500) {
+        let nodes: Vec<Uuid> = chunk.iter().map(|(n, _, _)| *n).collect();
+        let labels: Vec<String> = chunk.iter().map(|(_, l, _)| l.clone()).collect();
+        let flat: Vec<f32> = chunk
+            .iter()
+            .flat_map(|(_, _, t)| corpus.texts[*t].iter().copied())
+            .collect();
+        let tx = admin.transaction().await.unwrap();
+        tx.batch_execute("set local role gnomon_worker")
+            .await
+            .unwrap();
+        tx.query_typed(
+            "select set_config('request.jwt.claims', $1, true)",
+            &[(&claims, Type::TEXT)],
+        )
+        .await
+        .unwrap();
+        tx.query_typed(
+            "select gnomon.store_name_embedding($1, x.node, x.name,
+                                                ($4::real[])[(x.i - 1) * $5 + 1 : x.i * $5])
+             from unnest($2::uuid[], $3::text[]) with ordinality x(node, name, i)",
+            &[
+                (&tenant.0, Type::UUID),
+                (&nodes, Type::UUID_ARRAY),
+                (&labels, Type::TEXT_ARRAY),
+                (&flat, Type::FLOAT4_ARRAY),
+                (&(DIM as i32), Type::INT4),
+            ],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+}
+
+/// Stores an embedding of every current name and Alias of `scope`, as that
+/// Scope's worker, one vector per text. Returns the vector of each text.
+pub async fn embed_every_name(w: &World, scope: &str, rng: &mut Rng) -> HashMap<String, Vec<f32>> {
+    let rows =
+        w.db.admin()
+            .await
+            .query_typed(
+                "select distinct node_id, name from gnomon.node_name
+             where scope = $1 and recorded_to = 'infinity' order by 1, 2",
+                &[(&scope, Type::TEXT)],
+            )
+            .await
+            .unwrap();
+    let mut vectors = HashMap::new();
+    for r in rows {
+        let (node, name): (Uuid, String) = (r.get(0), r.get(1));
+        let v = vectors
+            .entry(name.clone())
+            .or_insert_with(|| rng.unit())
+            .clone();
+        w.worker_in(scope)
+            .store_name_embedding(w.tenant, gnomon::NodeId(node), &name, &v)
+            .await
+            .unwrap();
+    }
+    vectors
+}

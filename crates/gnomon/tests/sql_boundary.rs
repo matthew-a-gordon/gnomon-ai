@@ -6395,6 +6395,51 @@ async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_c
         .map(|r| r.get(0))
         .collect();
     assert_eq!(ids, vec![version.id.0]);
+
+    // Resolution too: the search index trigger quantizes a name's full
+    // vector as the definer role, and the caller's look-alike is not used.
+    caller
+        .store_name_embedding(t, node, "Ada", &embedding)
+        .await
+        .unwrap();
+    let names: Vec<String> = tx
+        .query_typed(
+            "select name from gnomon.resolve($1, 'ada', $2, null, 5)",
+            &[(&t.0, Type::UUID), (&embedding, Type::FLOAT4_ARRAY)],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(names, vec!["Ada".to_owned()]);
+    tx.commit().await.unwrap();
+    let twin = caller
+        .create_node(
+            &gnomon::NewNode {
+                tenant: Some(t),
+                scope: Scope::new("support"),
+                kind: gnomon::ROOT_NODE_KIND.into(),
+            },
+            &gnomon::Patch::new(
+                episode,
+                gnomon::ValidTime::UNKNOWN,
+                support::erasure::values(json!({ "name": "Ada" })),
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+    let found = caller
+        .resolve(t, &gnomon::Mention::embedding(&embedding), 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        found.len(),
+        2,
+        "the twin's name took its bits from the stored full vector"
+    );
+    assert!(found.iter().any(|c| c.node == twin));
 }
 
 // Summaries and Communities (ADR-0009, ADR-0014, ADR-0015, migration 0018).
@@ -6996,4 +7041,340 @@ async fn the_definers_summary_reach_covers_only_the_summaries_of_a_node_its_own_
         .unwrap();
     assert_eq!(deleted, 1, "the reach deleted beyond n1's Summary");
     tx.rollback().await.unwrap();
+}
+
+// Resolution (ADR-0009, ADR-0010, migration 0019). The search index trigger
+// writes the name rows, and callers update only a name row's bits in their
+// own Scopes, which a trigger derives from the stored full vector whatever
+// the caller supplies.
+
+/// The name table of Resolution, and the full vectors its rows use.
+const NAME_TABLES: &[&str] = &["node_name", "embedding"];
+
+/// `searchable_world()` with the embedding of every Node's name stored, as
+/// each Scope's worker, and a Node named "plain" in Tenant 1's `support`
+/// whose name has none.
+async fn named_world() -> World {
+    let w = searchable_world().await;
+    let store = Store::connect(&w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let mut rng = support::vectors::Rng::new(19);
+    let admin = w.db.admin().await;
+    for row in admin
+        .query_typed(
+            "select tenant_id, scope, node_id, name from gnomon.node_name",
+            &[],
+        )
+        .await
+        .unwrap()
+    {
+        let (tenant, scope, node, name): (Uuid, String, Uuid, String) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
+        store
+            .as_worker(TenantId(tenant), Scope::new(scope))
+            .store_name_embedding(TenantId(tenant), gnomon::NodeId(node), &name, &rng.unit())
+            .await
+            .unwrap();
+    }
+    store
+        .as_worker(TenantId(w.t1), Scope::new("support"))
+        .create_node(
+            &gnomon::NewNode {
+                tenant: Some(TenantId(w.t1)),
+                scope: Scope::new("support"),
+                kind: gnomon::ROOT_NODE_KIND.into(),
+            },
+            &gnomon::Patch::new(
+                EpisodeId(w.t1_support),
+                gnomon::ValidTime::UNKNOWN,
+                support::erasure::values(json!({ "name": "plain" })),
+            ),
+        )
+        .await
+        .unwrap();
+    w
+}
+
+async fn name_rows(db: &TestDb) -> Vec<String> {
+    let tables: Vec<String> = NAME_TABLES.iter().map(|t| t.to_string()).collect();
+    support::erasure::rows_of(&db.admin().await, &tables).await
+}
+
+#[tokio::test]
+async fn a_caller_reads_only_its_own_tenants_and_scopes_name_rows_and_resolves_only_them() {
+    let w = named_world().await;
+    let query = sql_vector();
+    for role in [USER, WORKER] {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        let seen: Vec<(Uuid, String)> = tx
+            .query_typed(
+                "select distinct tenant_id, scope from gnomon.node_name",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        assert_eq!(seen, vec![(w.t1, "support".to_owned())], "{role}");
+        // Both halves find only the caller's own Scope, and nothing when the
+        // call names the other Tenant.
+        for (tenant, expected) in [(w.t1, vec!["support".to_owned()]), (w.t2, vec![])] {
+            let scopes: Vec<String> = tx
+                .query_typed(
+                    &format!(
+                        "select distinct scope from gnomon.resolve($1, 'zebra billing support',
+                                                                   {query}, null, 400)"
+                    ),
+                    &[(&tenant, Type::UUID)],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            assert_eq!(scopes, expected, "{role} resolved in {tenant}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_caller_cannot_write_the_name_rows_directly_with_another_scopes_data_or_forge_them() {
+    let w = named_world().await;
+    let before = name_rows(&w.db).await;
+    let admin = w.db.admin().await;
+    let id_of = |scope: &'static str, tenant: Uuid| {
+        let admin = &admin;
+        async move {
+            let r = admin
+                .query_typed(
+                    "select version_id, node_id, text_hash from gnomon.node_name
+                     where tenant_id = $1 and scope = $2 and name like 'zebra%'",
+                    &[(&tenant, Type::UUID), (&scope, Type::TEXT)],
+                )
+                .await
+                .unwrap();
+            (
+                r[0].get::<_, Uuid>(0),
+                r[0].get::<_, Uuid>(1),
+                r[0].get::<_, String>(2),
+            )
+        }
+    };
+    let (t1, t2) = (w.t1, w.t2);
+    let (own_version, own_node, own_hash) = id_of("support", t1).await;
+    let (_, billing_node, billing_hash) = id_of("billing", t1).await;
+    let (_, other_tenant_node, _) = id_of("support", t2).await;
+    let v = sql_vector();
+    let row = |scope: &str, tenant: Uuid| {
+        format!(
+            "insert into gnomon.node_name (tenant_id, scope, version_id, node_id, text_hash, name,
+                                           alias, valid_from, valid_to, recorded_to)
+             values ('{tenant}', '{scope}', '{own_version}', '{own_node}', repeat('ab', 32),
+                     'forged', true, '-infinity', 'infinity', 'infinity')"
+        )
+    };
+    let attempts = [
+        // A forged Alias of the caller's own Version, in its own Scope,
+        // another Scope and another Tenant: callers hold no INSERT.
+        row("support", t1),
+        row("billing", t1),
+        row("support", t2),
+        // Billing's name in the caller's own Scope.
+        format!(
+            "insert into gnomon.node_name (tenant_id, scope, version_id, node_id, text_hash, name,
+                                           alias, valid_from, valid_to, recorded_to)
+             values ('{t1}', 'support', '{own_version}', '{billing_node}', '{billing_hash}',
+                     'zebra billing', false, '-infinity', 'infinity', 'infinity')"
+        ),
+        // What only the Store derives, and what only Erasure deletes.
+        "update gnomon.node_name set name = 'forged'".to_owned(),
+        "update gnomon.node_name set alias = not alias".to_owned(),
+        format!("update gnomon.node_name set text_hash = '{billing_hash}'"),
+        "update gnomon.node_name set scope = 'billing'".to_owned(),
+        format!("update gnomon.node_name set tenant_id = '{t2}'"),
+        format!("update gnomon.node_name set node_id = '{billing_node}'"),
+        "update gnomon.node_name set recorded_to = 'infinity'".to_owned(),
+        "update gnomon.node_name set valid_from = '2001-01-01'".to_owned(),
+        "delete from gnomon.node_name".to_owned(),
+        "truncate gnomon.node_name".to_owned(),
+        // Bits for a name whose text has no stored full vector.
+        "update gnomon.node_name set q = null where name = 'plain'".to_owned(),
+        // The Store's function, for a Node of another Scope or Tenant, and
+        // for a name the caller's own Node does not have.
+        format!("select gnomon.store_name_embedding('{t1}', '{billing_node}', 'zebra billing', {v})"),
+        format!("select gnomon.store_name_embedding('{t2}', '{other_tenant_node}', 'zebra support', {v})"),
+        format!("select gnomon.store_name_embedding('{t1}', '{own_node}', 'zebra billing', {v})"),
+        // The functions that derive the name rows, called directly.
+        format!("select gnomon.index_node_names('{t1}', array['{own_version}'::uuid])"),
+        format!("select * from gnomon.node_names('{t1}', array['{own_version}'::uuid])"),
+    ];
+    for role in [USER, WORKER] {
+        for sql in &attempts {
+            // As the caller's own statement, and from a trigger of the
+            // caller's own on a temporary table, which every role may create.
+            let through_a_trigger = format!(
+                "create temp table pulled (i int);
+                 create function pg_temp.pull() returns trigger language plpgsql as $f$
+                 begin
+                   execute $q${sql}$q$;
+                   return null;
+                 end $f$;
+                 create trigger pull after insert on pulled
+                   for each statement execute function pg_temp.pull();
+                 insert into pulled values (1);"
+            );
+            for attempt in [sql.clone(), through_a_trigger] {
+                let mut client = w.db.login().await;
+                let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+                assert_refused_write(
+                    tx.batch_execute(&attempt).await,
+                    &format!("{role}: {attempt}"),
+                );
+            }
+        }
+        // Another Scope's and Tenant's rows are not the caller's to update:
+        // RLS shows it none.
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        for (sql, what) in [
+            (
+                "update gnomon.node_name set q = null where scope = 'billing'",
+                "billing",
+            ),
+            (
+                "update gnomon.node_name set q = null where tenant_id <> gnomon.tenant_id()",
+                "Tenant 2",
+            ),
+        ] {
+            assert_eq!(
+                tx.execute_typed(sql, &[]).await.unwrap(),
+                0,
+                "{role} updated {what}"
+            );
+        }
+        // Forged bits on the caller's own row are replaced by the bits of
+        // the stored full vector.
+        let updated = tx
+            .execute_typed(
+                "update gnomon.node_name set q = ~q where text_hash = $1",
+                &[(&own_hash, Type::TEXT)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
+        tx.commit().await.unwrap();
+    }
+    assert_eq!(name_rows(&w.db).await, before);
+}
+
+#[tokio::test]
+async fn callers_hold_only_select_and_a_bits_update_on_the_name_table_and_the_definer_no_more_than_it_needs(
+) {
+    let w = world().await;
+    let admin = w.db.admin().await;
+    for role in [
+        USER,
+        WORKER,
+        support::LOGIN_ROLE,
+        "gnomon_definer",
+        "gnomon_maintainer",
+    ] {
+        let privileges: Vec<String> = admin
+            .query_typed(
+                "select p from unnest(array['SELECT', 'INSERT', 'UPDATE', 'DELETE',
+                                          'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']) p
+                 where has_table_privilege($1, 'gnomon.node_name'::regclass, p)
+                 union all
+                 select 'UPDATE (' || a.attname || ')'
+                 from pg_attribute a
+                 where a.attrelid = 'gnomon.node_name'::regclass and a.attnum > 0
+                   and not a.attisdropped
+                   and has_column_privilege($1, a.attrelid, a.attnum, 'UPDATE')",
+                &[(&role, Type::TEXT)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let expected: Vec<&str> = match role {
+            r if r == support::LOGIN_ROLE => vec![],
+            "gnomon_definer" => vec!["SELECT", "INSERT", "DELETE"],
+            "gnomon_maintainer" => vec!["MAINTAIN"],
+            _ => vec!["SELECT", "UPDATE (q)"],
+        };
+        assert_eq!(privileges, expected, "{role} on gnomon.node_name");
+    }
+    // Callers reach Resolution through its functions, and no caller runs
+    // the functions that derive the name rows or their bits.
+    for (function, callers_may) in [
+        (
+            "gnomon.resolve(uuid, text, real[], timestamptz, integer)",
+            true,
+        ),
+        (
+            "gnomon.resolve_full_text(uuid, text, timestamptz, integer)",
+            true,
+        ),
+        (
+            "gnomon.resolve_vector(uuid, real[], timestamptz, integer)",
+            true,
+        ),
+        (
+            "gnomon.store_name_embedding(uuid, uuid, text, real[])",
+            true,
+        ),
+        ("gnomon.node_names(uuid, uuid[])", false),
+        ("gnomon.index_node_names(uuid, uuid[])", false),
+        ("gnomon.node_name_derive()", false),
+    ] {
+        for role in [USER, WORKER] {
+            let may: bool = admin
+                .query_typed(
+                    "select has_function_privilege($1, $2, 'EXECUTE')",
+                    &[(&role, Type::TEXT), (&function, Type::TEXT)],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+            assert_eq!(may, callers_may, "{role} may execute {function}");
+        }
+    }
+    // The caller roles' only policy is their Tenant and Scopes. The
+    // definer's reach is a read of the names that share a text with an Edge
+    // the running Erasure listed.
+    let policies: Vec<(String, Vec<String>, String)> = admin
+        .query_typed(
+            "select policyname::text, array(select r::text from unnest(roles) r order by 1), cmd::text
+             from pg_policies
+             where schemaname = 'gnomon' and tablename = 'node_name' order by 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        policies,
+        vec![
+            (
+                "node_name_erasure_reach_read".to_owned(),
+                vec!["gnomon_definer".to_owned()],
+                "SELECT".to_owned()
+            ),
+            (
+                "node_name_tenant_scope".to_owned(),
+                vec![
+                    "authenticated".to_owned(),
+                    "gnomon_definer".to_owned(),
+                    "gnomon_worker".to_owned()
+                ],
+                "ALL".to_owned()
+            ),
+        ]
+    );
 }

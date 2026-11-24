@@ -683,6 +683,10 @@ pub async fn assert_no_residue(admin: &Client, residue: &Residue<'_>) {
             assert_tokens_derived_anew(admin, residue).await;
             continue;
         }
+        if table == NAME_ROWS {
+            assert_names_derived_anew(admin, residue).await;
+            continue;
+        }
         let n: i64 = admin
             .query_typed(
                 &format!("select count(*) from gnomon.{table} where version_id = any($1)"),
@@ -705,9 +709,10 @@ pub async fn assert_no_residue(admin: &Client, residue: &Residue<'_>) {
 pub const FULL_VECTORS: &str = "embedding";
 
 /// Checks, past RLS, that every full vector left is of a text some row of
-/// its Scope still uses: a quantized row of a Version, a Version's text, or a
-/// Sentence. A full vector of erased text has none of them, unless a
-/// surviving Version or Sentence holds the same text.
+/// its Scope still uses: a quantized row of a Version, a Version's text, a
+/// Sentence, or a name or Alias of a Node Version. A full vector of erased
+/// text has none of them, unless a surviving Version, Sentence or name holds
+/// the same text.
 pub async fn assert_no_unused_full_vector(admin: &Client) {
     let unused: Vec<String> = admin
         .query_typed(
@@ -721,6 +726,9 @@ pub async fn assert_no_unused_full_vector(admin: &Client) {
                and not exists (select from gnomon.sentence s
                                where s.tenant_id = e.tenant_id and s.scope = e.scope
                                  and gnomon.sentence_text_hash(s.sentence) = e.text_hash)
+               and not exists (select from gnomon.node_name n
+                               where n.tenant_id = e.tenant_id and n.scope = e.scope
+                                 and n.text_hash = e.text_hash)
              order by 1",
             &[],
         )
@@ -738,6 +746,52 @@ pub async fn assert_no_unused_full_vector(admin: &Client) {
 /// The token table of full-text Search (migration 0016), whose rows the
 /// Store derives from each Version's text.
 pub const SEARCH_TOKEN: &str = "search_token";
+
+/// The name table of Resolution (migration 0019), whose rows the Store
+/// derives from each Node Version's name and Aliases.
+pub const NAME_ROWS: &str = "node_name";
+
+/// The name rows an Erasure leaves: none of a Version it deleted, and for
+/// each recomputed Version that survives, exactly the rows its name and
+/// Aliases as they stand now give, so none holds a name or Alias only the
+/// erased text held. Their bits are not compared: a recomputed Version's
+/// name keeps bits only while the full vector of its text survives.
+async fn assert_names_derived_anew(admin: &Client, residue: &Residue<'_>) {
+    let n: i64 = admin
+        .query_typed(
+            "select count(*) from gnomon.node_name where version_id = any($1)",
+            &[(&residue.versions, Type::UUID_ARRAY)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(n, 0, "gnomon.node_name still holds rows of erased Versions");
+    let stale: Vec<String> = admin
+        .query_typed(
+            "with kept as (
+               select tenant_id, scope, version_id, node_id, text_hash, name, alias,
+                      valid_from, valid_to, recorded_to
+               from gnomon.node_name where version_id = any($1)),
+             anew as (
+               select t.* from gnomon.version v
+               cross join lateral gnomon.node_names(v.tenant_id, array[v.id]) t
+               where v.id = any($1))
+             select format('%s %s', version_id, name)
+             from ((table kept except table anew) union all (table anew except table kept)) d
+             order by 1",
+            &[(&residue.recomputed, Type::UUID_ARRAY)],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "gnomon.node_name holds rows of recomputed Versions not derived from their names \
+         and Aliases as they stand: {stale:?}"
+    );
+}
 
 /// The BM25 counts of each Scope, which an Erasure lowers rather than
 /// deletes while the Scope holds other Versions, and the table of each

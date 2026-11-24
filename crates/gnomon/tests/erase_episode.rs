@@ -162,6 +162,11 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
     // Edge, each moving that Version's embedding to its Sentence.
     let mut rng = support::vectors::Rng::new(3);
     support::vectors::embed_every_version(&w, SCOPE, &mut rng).await;
+    // And one of every current name and Alias, for Resolution (migration
+    // 0019), the Alias E alone gave among them. Its name rows and its full
+    // vector go.
+    let names = support::vectors::embed_every_name(&w, SCOPE, &mut rng).await;
+    assert!(names.contains_key(&format!("{MARKER}-alias")));
     for (version, sentence) in [
         (e_only_version, format!("{MARKER}: b owns 7% of Acme")),
         (shared_first, "a holds forty percent of Acme".to_owned()),
@@ -258,6 +263,30 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .unwrap()[0]
         .get(0);
     assert!(marked >= 2, "E's words are indexed: {marked}");
+    // E's Alias of a is in name rows with bits, which Resolution finds.
+    let alias = format!("{MARKER}-alias");
+    let resolved = |text: String| {
+        let w = &w;
+        async move {
+            w.caller()
+                .resolve(w.tenant, &gnomon::Mention::text(&text), 10)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(resolved(alias.clone()).await[0].node, a);
+    let embedded: i64 = admin
+        .query_typed(
+            "select count(*) from gnomon.node_name where name = $1 and q is not null",
+            &[(&alias, Type::TEXT)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert!(
+        embedded >= 1,
+        "E's Alias is embedded in each current Version of a"
+    );
 
     let erasure = w.erase(e).await;
     assert_eq!(erasure.erased_edges, vec![e_only]);
@@ -277,6 +306,11 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         },
     )
     .await;
+    assert!(
+        resolved(alias.clone()).await.is_empty(),
+        "Resolution finds a Node by E's Alias"
+    );
+    assert_eq!(resolved("Acme".into()).await[0].node, c);
     let referencing = tables_with_an_episode_reference(&admin).await;
     for expected in [
         "bound_statement",

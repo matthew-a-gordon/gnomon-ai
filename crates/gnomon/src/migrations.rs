@@ -115,6 +115,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0018_summaries_and_communities",
         template: include_str!("../migrations/0018_summaries_and_communities.sql"),
     },
+    Migration {
+        version: 19,
+        name: "0019_resolution",
+        template: include_str!("../migrations/0019_resolution.sql"),
+    },
 ];
 
 /// The schema version this build of the Store expects: the last migration's.
