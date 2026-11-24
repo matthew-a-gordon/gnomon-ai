@@ -469,52 +469,27 @@ async fn index_search_text(db: &TestDb, tenant: gnomon::TenantId) {
     }
 }
 
-/// Stores every Version's embedding through `gnomon.store_embedding` as the
-/// Scope's worker, on several connections at once. The vector of a text is
-/// computed from the pools in `perf` inside the call's own statement.
+/// Stores every Version's embedding on one connection, in batches of
+/// Versions. Each batch is two statements in one transaction: the full
+/// vectors, then the quantized rows. The vector of a text is computed from the
+/// pools in `perf` inside the statement.
 async fn embeddings(db: &TestDb, sql: &str, tenant: gnomon::TenantId) {
-    const WORKERS: i32 = 6;
-    const BATCH: i32 = 500;
-    let claims = json!({ "role": "gnomon_worker",
-        "app_metadata": { "tenant_id": tenant.0.to_string(), "scopes": [SCOPE] } })
-    .to_string();
-    let admin = db.admin().await;
-    // The section holds the statement to run per batch, after a marker line.
-    let (setup, per_batch) = sql.split_once("-- per batch\n").unwrap();
-    admin.batch_execute(setup).await.unwrap();
+    let mut admin = db.admin().await;
+    // The section holds the statements to run per batch, after a marker line.
+    let (_, per_batch) = sql.split_once("-- per batch\n").unwrap();
+    let (vectors, bits) = per_batch.split_once("-- then\n").unwrap();
     let batches: i32 = admin
         .query_typed("select max(batch) + 1 from perf.vers", &[])
         .await
         .unwrap()[0]
         .get(0);
-    let next = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
-    let mut tasks = vec![];
-    for _ in 0..WORKERS {
-        let (next, claims, per_batch) = (next.clone(), claims.clone(), per_batch.to_owned());
-        let mut client = db.admin().await;
-        tasks.push(tokio::spawn(async move {
-            loop {
-                let batch = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if batch >= batches {
-                    return;
-                }
-                let tx = client.transaction().await.unwrap();
-                tx.batch_execute("set local role gnomon_worker").await.unwrap();
-                tx.query_typed(
-                    "select set_config('request.jwt.claims', $1, true)",
-                    &[(&claims, Type::TEXT)],
-                )
+    for batch in 0..batches {
+        let tx = admin.transaction().await.unwrap();
+        for statement in [vectors, bits] {
+            tx.execute_typed(statement, &[(&tenant.0, Type::UUID), (&batch, Type::INT4)])
                 .await
-                .unwrap();
-                tx.execute_typed(&per_batch, &[(&tenant.0, Type::UUID), (&batch, Type::INT4)])
-                    .await
-                    .unwrap_or_else(|e| panic!("store embeddings of batch {batch}: {e:?}"));
-                tx.commit().await.unwrap();
-            }
-        }));
+                .unwrap_or_else(|e| panic!("store embeddings of batch {batch}: {e:?}"));
+        }
+        tx.commit().await.unwrap();
     }
-    for t in tasks {
-        t.await.unwrap();
-    }
-    let _ = BATCH;
 }

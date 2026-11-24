@@ -90,16 +90,29 @@ commit;
 -- @@index-search-text@@
 -- @@
 -- @@parallel-embeddings@@
-grant usage on schema perf to gnomon_worker;
-grant select on all tables in schema perf to gnomon_worker;
+-- One connection stores the embeddings, in batches of Versions, each as two
+-- statements in one transaction: the full vectors, then the quantized rows,
+-- whose trigger derives its bits from the full vector stored for the hash.
+-- Parallel callers of `gnomon.store_embedding` blocked each other on the
+-- shared full-vector rows and on their commits, so the loader does not use
+-- them. The triggers and checks of every table still run.
 -- per batch
-select gnomon.store_embedding($1, gv.id, gv.text_hash,
-         ({{ext}}.l2_normalize(c.centre operator({{ext}}.+) pa.v operator({{ext}}.+) pb.v))::real[])
+insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
+select distinct on (gv.text_hash) gv.tenant_id, gv.scope, gv.text_hash,
+       {{ext}}.l2_normalize(c.centre operator({{ext}}.+) pa.v operator({{ext}}.+) pb.v)
 from perf.vers v
   join perf.tx t on t.id = v.text_id
   join perf.centre c on c.id = t.c
   join perf.pool pa on pa.kind = 'a' and pa.i = t.a
   join perf.pool pb on pb.kind = 'b' and pb.i = t.b
+  join gnomon.version gv on gv.tenant_id = $1 and gv.id = v.id
+where v.batch = $2
+order by gv.text_hash
+on conflict (tenant_id, scope, text_hash) do nothing
+-- then
+insert into gnomon.embedding_bit (tenant_id, scope, version_id, text_hash)
+select gv.tenant_id, gv.scope, gv.id, gv.text_hash
+from perf.vers v
   join gnomon.version gv on gv.tenant_id = $1 and gv.id = v.id
 where v.batch = $2
 -- @@

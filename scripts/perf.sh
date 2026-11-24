@@ -3,7 +3,7 @@
 # then the 200,000-row Search case again in a container capped at 4 GiB, on
 # each image. See docs/testing.md.
 #
-#   scripts/perf.sh [search|patch|capped|all]      (default: all)
+#   scripts/perf.sh [search|search50k|search200k|patch|capped|all]      (default: all)
 #
 # Containers are named gnomon-t21-<image> and gnomon-t21-4g-<image>, publish on
 # loopback with a port Docker picks, keep their data on disk in an anonymous
@@ -28,14 +28,19 @@ teardown() { # <container name>: remove it and its anonymous volumes, nothing el
   fi
 }
 
-stage() { # <image> <prefix> <memory or ""> <postgres args> <cargo test filters...>
-  local image="$1" prefix="$2" memory="$3" args="$4"; shift 4
+# Every stage has a hard time limit, so a stuck stage fails loudly. A stage
+# builds its data set (20 minutes at most for 200,000 rows) and measures it.
+stage_limit_50k="${PERF_LIMIT_50K:-25m}"
+stage_limit_200k="${PERF_LIMIT_200K:-45m}"
+
+stage() { # <image> <prefix> <memory or ""> <postgres args> <time limit> <cargo test filters...>
+  local image="$1" prefix="$2" memory="$3" args="$4" limit="$5"; shift 5
   echo "== image=$image container=$prefix-$image memory=${memory:-none}"
   teardown "$prefix-$image"
   set +e
   GNOMON_TEST_IMAGE="$image" GNOMON_TEST_CONTAINER_PREFIX="$prefix" \
   GNOMON_TEST_DATA_DIR=disk GNOMON_TEST_MEMORY="$memory" GNOMON_TEST_POSTGRES_ARGS="$args" \
-    cargo test -p gnomon --features performance --test performance "$@" -- --nocapture --test-threads=1
+    timeout --signal=TERM --kill-after=60 "$limit" cargo test -p gnomon --features performance --test performance "$@" -- --nocapture --test-threads=1
   local status=$?
   set -e
   teardown "$prefix-$image"
@@ -45,13 +50,16 @@ stage() { # <image> <prefix> <memory or ""> <postgres args> <cargo test filters.
 status=0
 for image in $images; do
   case "$what" in
-    search|all) stage "$image" gnomon-t21 "" "$uncapped_args" ${PERF_FILTER:-fused_search} || status=1 ;;
+    search|search50k|all) stage "$image" gnomon-t21 "" "$uncapped_args" "$stage_limit_50k" 50000_visible || status=1 ;;
   esac
   case "$what" in
-    patch|all) stage "$image" gnomon-t21 "" "$uncapped_args" bounded_patch || status=1 ;;
+    search|search200k|all) stage "$image" gnomon-t21 "" "$uncapped_args" "$stage_limit_200k" 200000_visible || status=1 ;;
   esac
   case "$what" in
-    capped|all) stage "$image" gnomon-t21-4g 4g "$capped_args" 200000 || status=1 ;;
+    patch|all) stage "$image" gnomon-t21 "" "$uncapped_args" "$stage_limit_50k" bounded_patch || status=1 ;;
+  esac
+  case "$what" in
+    capped|all) stage "$image" gnomon-t21-4g 4g "$capped_args" "$stage_limit_200k" 200000_visible || status=1 ;;
   esac
 done
 docker ps -a --filter name=gnomon-t21 --format 'left over: {{.Names}} {{.Status}}'
