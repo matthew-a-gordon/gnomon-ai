@@ -899,3 +899,124 @@ async fn the_re_rank_reads_each_candidate_names_full_vector_by_one_primary_key_p
         tx.rollback().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn fusion_ranks_a_node_both_halves_find_second_above_one_a_single_half_finds_first() {
+    // Reciprocal rank fusion with k = 60: second in both halves is 2/62,
+    // first in one half alone is 1/61. Each half must hand fusion more than
+    // the call's limit, or a call for one candidate never sees the Node
+    // both halves found.
+    let w = World::new().await;
+    let e = w.episode(at(2024, 1, 1), None).await;
+    let mut rng = Rng::new(27);
+    let target = rng.unit();
+    // First by text alone: the mention's one word, in a name of one word.
+    let by_text = w
+        .node(
+            "company",
+            e,
+            ValidTime::UNKNOWN,
+            json!({ "name": "Lovelace" }),
+        )
+        .await;
+    // First by vector alone: a name with no word of the mention, nearest.
+    let by_vector = w
+        .node(
+            "company",
+            e,
+            ValidTime::UNKNOWN,
+            json!({ "name": "Countess" }),
+        )
+        .await;
+    // Second in both: the word in a longer name, embedded a little further.
+    let both = w
+        .node(
+            "company",
+            e,
+            ValidTime::UNKNOWN,
+            json!({ "name": "Ada Lovelace Institute" }),
+        )
+        .await;
+    w.caller()
+        .store_name_embedding(w.tenant, by_vector, "Countess", &rng.near(&target, 0.1))
+        .await
+        .unwrap();
+    w.caller()
+        .store_name_embedding(
+            w.tenant,
+            both,
+            "Ada Lovelace Institute",
+            &rng.near(&target, 0.6),
+        )
+        .await
+        .unwrap();
+    let mention = Mention::text("lovelace").with_embedding(&target);
+    let all = w.caller().resolve(w.tenant, &mention, 10).await.unwrap();
+    let ranks = |node| {
+        let c = all.iter().find(|c| c.node == node).unwrap();
+        (
+            c.full_text.as_ref().map(|m| m.rank),
+            c.vector.as_ref().map(|m| m.rank),
+        )
+    };
+    assert_eq!(ranks(by_text), (Some(1), None));
+    assert_eq!(ranks(by_vector), (None, Some(1)));
+    assert_eq!(ranks(both), (Some(2), Some(2)));
+    assert_eq!(all[0].node, both);
+
+    let one = w.caller().resolve(w.tenant, &mention, 1).await.unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].node, both, "{one:?}");
+    assert!((one[0].score - 2.0 / 62.0).abs() < 1e-12);
+}
+
+#[tokio::test]
+async fn full_text_scores_count_only_the_callers_allowed_scopes() {
+    // BM25 reads the word counts of the caller's allowed Scopes alone
+    // (ADR-0010), so another Scope's names never change a score or an
+    // order the caller sees.
+    let w = World::new().await;
+    let e = w.episode(at(2024, 1, 1), None).await;
+    w.node("company", e, ValidTime::UNKNOWN, json!({ "name": "Ada" }))
+        .await;
+    w.node("company", e, ValidTime::UNKNOWN, json!({ "name": "Grace" }))
+        .await;
+    let score = || async {
+        w.seeing(&[support::erasure::SCOPE])
+            .resolve(w.tenant, &Mention::text("ada"), 10)
+            .await
+            .unwrap()[0]
+            .full_text
+            .as_ref()
+            .unwrap()
+            .score
+    };
+    let before = score().await;
+    let billing = w.episode_in("billing", at(2024, 1, 1), "billing").await;
+    for i in 0..20 {
+        w.node_in(
+            "billing",
+            "company",
+            billing,
+            json!({ "name": format!("Ada {i}") }),
+        )
+        .await;
+    }
+    assert_eq!(
+        score().await,
+        before,
+        "billing's names changed support's score"
+    );
+    // A caller who sees both Scopes counts both, and the word is commoner.
+    let both = w
+        .seeing(&[support::erasure::SCOPE, "billing"])
+        .resolve(w.tenant, &Mention::text("ada"), 30)
+        .await
+        .unwrap();
+    assert_eq!(both.len(), 21);
+    let support_ada = both
+        .iter()
+        .find(|c| c.scope.as_str() == support::erasure::SCOPE)
+        .unwrap();
+    assert!(support_ada.full_text.as_ref().unwrap().score < before);
+}

@@ -519,7 +519,7 @@ pub async fn load_names(
         versions.push((true, (0..held).map(|_| text(corpus, rng)).collect()));
         let only = versions.len() == 1;
         for (is_current, texts) in versions {
-            let label = |t: &usize| format!("{scope} name {t}");
+            let name_of = |t: &usize| format!("{scope} name {t}");
             for t in &texts {
                 corpus.names.push(SyntheticName {
                     node,
@@ -530,17 +530,17 @@ pub async fn load_names(
                     valid_to,
                 });
                 if is_current {
-                    current.push((node, label(t), *t));
+                    current.push((node, name_of(t), *t));
                 } else {
-                    replaced.push((label(t), *t));
+                    replaced.push((name_of(t), *t));
                 }
             }
             ids.push(Uuid::new_v4());
             node_of.push(node);
             props.push(
                 serde_json::json!({
-                    "name": label(&texts[0]),
-                    "aliases": texts[1..].iter().map(label).collect::<Vec<_>>(),
+                    "name": name_of(&texts[0]),
+                    "aliases": texts[1..].iter().map(name_of).collect::<Vec<_>>(),
                 })
                 .to_string(),
             );
@@ -613,7 +613,7 @@ pub async fn load_names(
         .iter()
         .flat_map(|(_, t)| corpus.texts[*t].iter().copied())
         .collect();
-    let labels: Vec<String> = replaced.iter().map(|(l, _)| l.clone()).collect();
+    let names: Vec<String> = replaced.iter().map(|(n, _)| n.clone()).collect();
     tx.execute_typed(
         "insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
          select $1, $2, gnomon.sentence_text_hash(x.name),
@@ -622,7 +622,7 @@ pub async fn load_names(
         &[
             (&tenant.0, Type::UUID),
             (&scope, Type::TEXT),
-            (&labels, Type::TEXT_ARRAY),
+            (&names, Type::TEXT_ARRAY),
             (&flat, Type::FLOAT4_ARRAY),
             (&(DIM as i32), Type::INT4),
         ],
@@ -635,7 +635,7 @@ pub async fn load_names(
         &[
             (&tenant.0, Type::UUID),
             (&scope, Type::TEXT),
-            (&labels, Type::TEXT_ARRAY),
+            (&names, Type::TEXT_ARRAY),
         ],
     )
     .await
@@ -651,7 +651,7 @@ pub async fn load_names(
     .to_string();
     for chunk in current.chunks(500) {
         let nodes: Vec<Uuid> = chunk.iter().map(|(n, _, _)| *n).collect();
-        let labels: Vec<String> = chunk.iter().map(|(_, l, _)| l.clone()).collect();
+        let names: Vec<String> = chunk.iter().map(|(_, n, _)| n.clone()).collect();
         let flat: Vec<f32> = chunk
             .iter()
             .flat_map(|(_, _, t)| corpus.texts[*t].iter().copied())
@@ -673,7 +673,7 @@ pub async fn load_names(
             &[
                 (&tenant.0, Type::UUID),
                 (&nodes, Type::UUID_ARRAY),
-                (&labels, Type::TEXT_ARRAY),
+                (&names, Type::TEXT_ARRAY),
                 (&flat, Type::FLOAT4_ARRAY),
                 (&(DIM as i32), Type::INT4),
             ],

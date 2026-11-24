@@ -1260,10 +1260,11 @@ impl Caller<'_> {
     /// by reciprocal rank fusion, and each candidate says what each half
     /// found and at what rank.
     ///
-    /// A name is current while its Version is the current belief, so a name
-    /// a Correction or a Retraction replaced is never matched, and one a Node
-    /// had over an earlier Valid time is, unless the mention names a
-    /// valid-at instant. Resolution merges nothing (ADR-0012).
+    /// A name is current while its Version is the current belief. A name a
+    /// later write, a Correction or a Retraction replaced is never matched. A
+    /// name a Node had over an earlier Valid time is still matched, unless
+    /// the mention names a valid-at instant. Resolution merges nothing
+    /// (ADR-0012).
     ///
     /// A `limit` below 1, or an embedding that
     /// [`store_embedding`](Self::store_embedding) would refuse, fails with
@@ -1283,7 +1284,8 @@ impl Caller<'_> {
             .query(
                 &tx,
                 "select node_id, scope, name, alias, score, rank,
-                        text_version_id, text_name, text_alias, text_score, text_rank,
+                        full_text_version_id, full_text_name, full_text_alias,
+                        full_text_score, full_text_rank,
                         vector_version_id, vector_name, vector_alias, vector_distance,
                         vector_rank
                  from gnomon.resolve($1, $2, $3, $4, $5)",

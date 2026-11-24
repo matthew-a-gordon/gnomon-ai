@@ -37,10 +37,16 @@
 -- searchable (migration 0003), so the Versions whose token rows hold a word
 -- of the mention include every Node whose name or Alias does. Each such
 -- Version's current name rows are then read by key, and each name or Alias
--- is scored on its own: BM25 with k1 = 1.2 and b = 0.75, the word's
--- frequency from the counts of the caller's allowed Scopes and the
--- transaction's own changes to them, as `gnomon.search_full_text` reads
--- them, and the length of that name or Alias in words. A word that only
+-- is scored on its own, by BM25 with k1 = 1.2 and b = 0.75. A word's
+-- frequency, the number of texts and their mean length are the counts of
+-- the caller's allowed Scopes and the transaction's own changes to them, as
+-- `gnomon.search_full_text` reads them. Those counts are of whole Version
+-- texts, closed ones and Sentences among them, so the scores rank names
+-- against each other and are not BM25 over the names alone. The length is
+-- that of the name or Alias in words. The token lookup reaches closed
+-- Versions and Edge Versions too, and the probe of their name rows drops
+-- them, so its cost grows with a word's history in the Scope. That is the
+-- price of one token table, against a second one written on every write. A word that only
 -- another searchable property holds matches no name, so it finds nothing.
 -- A Node's best-scoring name is its match.
 --
@@ -57,9 +63,9 @@
 -- Full vectors. A name's text is hashed as a Sentence's is,
 -- `gnomon.sentence_text_hash`, and its full vector is the row of
 -- `gnomon.embedding` for that hash in the name's Scope (migration 0017).
--- There is no second full-vector table: a name whose text some Version,
--- Sentence or other name in the Scope already has an embedding of uses that
--- full vector, and the Pipeline stores none. The Pipeline calls
+-- There is no second full-vector table. A Version, a Sentence or another
+-- name of the Scope may already have an embedding of the same text. The name
+-- then uses that full vector, and the Pipeline stores none. The Pipeline calls
 -- `gnomon.store_name_embedding` with a Node, one of its current names or
 -- Aliases and the embedding of that text. The full vector is stored once
 -- per text in the Scope, and every current name row of the Scope with that
@@ -518,8 +524,9 @@ create or replace function gnomon.embedding_check_used() returns trigger
 -- Erasure deletes or recomputes goes: its name rows, its quantized row, the
 -- full vector of each of its texts that no other quantized row or name row
 -- with bits uses, its Sentence and its token rows. Everything else is as
--- migration 0017 wrote it. The embeddings go first, while the name rows and
--- the Sentences still give their hashes.
+-- migration 0017 wrote it. The texts' hashes are read first, while the name
+-- rows and the Sentences still give them. Then the name rows and quantized
+-- rows go, and then the full vectors that nothing uses any more.
 create or replace function gnomon.erase_version_text(p_tenant_id uuid, p_versions uuid[])
   returns void
   language plpgsql volatile security invoker set search_path = ''
@@ -580,6 +587,9 @@ create or replace function gnomon.erase_version_text(p_tenant_id uuid, p_version
 -- Resolution: the Nodes whose current names and Aliases match `p_mention`,
 -- fused from the full-text and vector halves by reciprocal rank fusion with
 -- k = 60, as prototype 5 fused Search, best first, at most `p_limit`. Each
+-- half hands fusion its best 100, or `p_limit` when that is more, as
+-- prototype 5 fused 100 from each branch, so a Node both halves rank just
+-- below the top still outranks one a single half ranks first. Each
 -- candidate reports what each half found: its matched name or Alias, its
 -- score or distance and its rank, or nulls where that half did not find it.
 -- Its own name and Alias are those of the half that ranked it higher, the
@@ -598,11 +608,11 @@ create function gnomon.resolve(
     alias boolean,
     score double precision,
     rank bigint,
-    text_version_id uuid,
-    text_name text,
-    text_alias boolean,
-    text_score double precision,
-    text_rank bigint,
+    full_text_version_id uuid,
+    full_text_name text,
+    full_text_alias boolean,
+    full_text_score double precision,
+    full_text_rank bigint,
     vector_version_id uuid,
     vector_name text,
     vector_alias boolean,
@@ -614,24 +624,28 @@ create function gnomon.resolve(
   begin
     if p_limit is null or p_limit < 1 then
       raise exception using errcode = 'invalid_parameter_value',
-        message = format('a Resolution returns at least one candidate, not %s', p_limit);
+        message = pg_catalog.format('a Resolution returns at least one candidate, not %s',
+                                    p_limit);
     end if;
     return query
       with t as materialized (
-        select * from gnomon.resolve_full_text(p_tenant_id, p_mention, p_valid_at, p_limit)
+        select * from gnomon.resolve_full_text(p_tenant_id, p_mention, p_valid_at,
+                                               greatest(100, p_limit))
       ),
-      v as materialized (
-        select * from gnomon.resolve_vector(p_tenant_id, p_embedding, p_valid_at, p_limit)
+      vec as materialized (
+        select * from gnomon.resolve_vector(p_tenant_id, p_embedding, p_valid_at,
+                                            greatest(100, p_limit))
       ),
       fused as (
-        select coalesce(t.node_id, v.node_id) as node_id, coalesce(t.scope, v.scope) as scope,
+        select coalesce(t.node_id, vec.node_id) as node_id,
+               coalesce(t.scope, vec.scope) as scope,
                t.version_id as t_version, t.name as t_name, t.alias as t_alias,
                t.score as t_score, t.rank as t_rank,
-               v.version_id as v_version, v.name as v_name, v.alias as v_alias,
-               v.distance as v_distance, v.rank as v_rank,
-               coalesce(1.0::float8 / (60 + t.rank), 0) + coalesce(1.0::float8 / (60 + v.rank), 0)
-                 as score
-        from t full join v on v.node_id = t.node_id
+               vec.version_id as v_version, vec.name as v_name, vec.alias as v_alias,
+               vec.distance as v_distance, vec.rank as v_rank,
+               coalesce(1.0::float8 / (60 + t.rank), 0)
+                 + coalesce(1.0::float8 / (60 + vec.rank), 0) as score
+        from t full join vec on vec.node_id = t.node_id
       )
       select f.node_id, f.scope,
              case when f.v_rank is null or f.t_rank <= f.v_rank then f.t_name else f.v_name end,
