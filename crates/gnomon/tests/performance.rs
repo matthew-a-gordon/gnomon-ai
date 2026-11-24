@@ -241,6 +241,9 @@ async fn a_bounded_patch_write_costs_1_to_11_ms_at_p50_and_grows_with_the_nodes_
         for n in 0..WARM_UP_NODES + NODES {
             nodes.push(w.node_with(contributions, n).await);
         }
+        // A running Store has autovacuum analyze what it wrote. The Nodes were
+        // just loaded, so the planner's statistics are brought up to date here.
+        w._db.admin().await.batch_execute("analyze").await.unwrap();
         let count: i64 = w
             ._db
             .admin()

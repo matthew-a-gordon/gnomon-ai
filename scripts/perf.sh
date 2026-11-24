@@ -19,6 +19,11 @@ images="${PERF_IMAGES:-pgvector supabase}"
 uncapped_args="-c shared_buffers=8GB -c work_mem=64MB -c maintenance_work_mem=512MB -c max_parallel_workers_per_gather=0 -c fsync=off -c autovacuum=off -c max_wal_size=16GB"
 capped_args="-c shared_buffers=1GB -c effective_cache_size=3GB -c work_mem=16MB -c maintenance_work_mem=512MB -c max_parallel_workers_per_gather=0 -c fsync=off -c autovacuum=off -c max_wal_size=8GB"
 
+# The patch case builds small databases and needs Postgres's own settings:
+# with autovacuum off its tables are never analyzed, the plans of a write
+# degrade as the Nodes grow, and a patch on 100 Contributions took 3 s.
+patch_args="${PERF_PATCH_ARGS-}"
+
 teardown() { # <container name>: remove it and its anonymous volumes, nothing else
   local name="$1" volumes
   if docker inspect "$name" >/dev/null 2>&1; then
@@ -56,7 +61,7 @@ for image in $images; do
     search|search200k|all) stage "$image" gnomon-t21 "" "$uncapped_args" "$stage_limit_200k" 200000_visible || status=1 ;;
   esac
   case "$what" in
-    patch|all) stage "$image" gnomon-t21 "" "$uncapped_args" "$stage_limit_50k" bounded_patch || status=1 ;;
+    patch|all) stage "$image" gnomon-t21 "" "$patch_args" "$stage_limit_50k" bounded_patch || status=1 ;;
   esac
   case "$what" in
     capped|all) stage "$image" gnomon-t21-4g 4g "$capped_args" "$stage_limit_200k" 200000_visible || status=1 ;;
