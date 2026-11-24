@@ -117,7 +117,12 @@ from perf.vers v
 where v.batch = $2
 -- @@
 -- One Edge from each Node to the next, current and valid always, each cited
--- by the data set's Episode, as search.rs's smoke check lays them out.
+-- by the data set's Episode, as search.rs's smoke check lays them out. The
+-- tables are analyzed first, so the joins below are planned on the rows just
+-- loaded and not on an empty table's defaults.
+analyze gnomon.node;
+analyze gnomon.version;
+analyze gnomon.episode;
 begin;
 set local session_replication_role = replica;
 with nodes as (
