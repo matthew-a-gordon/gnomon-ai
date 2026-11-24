@@ -104,20 +104,22 @@ pub fn user(
     }
 }
 
-/// Stores a Sentence of an Edge Version as the table's owner, as the
-/// function ticket #26 adds will, after the Version committed. The claims of
-/// the Version's Tenant and Scope are set for the insert, because the
-/// trigger that writes the Version's token rows reads it under them
-/// (migration 0016).
+/// Stores a Sentence of an Edge Version through `gnomon.store_sentence`,
+/// as an end user who sees the Version's Scope, after the Version
+/// committed (migration 0021).
 pub async fn store_sentence(
-    owner: &mut tokio_postgres::Client,
+    db: &TestDb,
     tenant: gnomon::TenantId,
     scope: &str,
     version: uuid::Uuid,
     sentence: &str,
 ) {
     let claims = serde_json::Value::Object(user(tenant, &[scope])).to_string();
-    let tx = owner.transaction().await.unwrap();
+    let mut client = db.login().await;
+    let tx = client.transaction().await.unwrap();
+    tx.batch_execute("set local role authenticated")
+        .await
+        .unwrap();
     tx.query_typed(
         "select set_config('request.jwt.claims', $1, true)",
         &[(&claims, tokio_postgres::types::Type::TEXT)],
@@ -125,11 +127,9 @@ pub async fn store_sentence(
     .await
     .unwrap();
     tx.execute_typed(
-        "insert into gnomon.sentence (tenant_id, scope, version_id, sentence)
-         values ($1, $2, $3, $4)",
+        "select gnomon.store_sentence($1, $2, $3)",
         &[
             (&tenant.0, tokio_postgres::types::Type::UUID),
-            (&scope, tokio_postgres::types::Type::TEXT),
             (&version, tokio_postgres::types::Type::UUID),
             (&sentence, tokio_postgres::types::Type::TEXT),
         ],

@@ -459,11 +459,13 @@ impl World {
         self.store_sentence_in(SCOPE, version.0, sentence).await;
     }
 
-    /// Stores a Sentence of an Edge Version of `scope`, as the Pipeline
-    /// would through a function a later ticket adds.
+    /// Stores a Sentence of an Edge Version of `scope` as that Scope's
+    /// worker, as the Pipeline does.
     pub async fn store_sentence_in(&self, scope: &str, version: Uuid, sentence: &str) {
-        let mut admin = self.db.admin().await;
-        super::store_sentence(&mut admin, self.tenant, scope, version, sentence).await;
+        self.worker_in(scope)
+            .store_sentence(self.tenant, gnomon::VersionId(version), sentence)
+            .await
+            .unwrap();
     }
 
     pub async fn sentence_of(&self, version: VersionId) -> Option<String> {

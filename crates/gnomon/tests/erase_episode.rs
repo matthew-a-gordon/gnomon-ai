@@ -177,6 +177,21 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
             .await
             .unwrap();
     }
+    // A Sentence the Pipeline embedded and then replaced, on the Edge E never
+    // touches, and the replacement's embedding. The replaced text's
+    // embedding goes when it is replaced (migration 0021), so no full vector
+    // is left that no row uses, which no Erasure could find.
+    for sentence in [
+        format!("{MARKER}: d held 1% of Acme"),
+        "d owns 1% of Acme".into(),
+    ] {
+        w.store_sentence(untouched_version, &sentence).await;
+        let hash = support::vectors::sentence_hash(&w, &sentence).await;
+        w.caller()
+            .store_embedding(w.tenant, untouched_version, &hash, &rng.unit())
+            .await
+            .unwrap();
+    }
     // Summaries and Communities the Pipeline would have written (ADR-0014,
     // ADR-0015). a's first Summary cites E and its regeneration F alone, so a
     // closed row cites E. A Community of a and c cites E and F, and one of c

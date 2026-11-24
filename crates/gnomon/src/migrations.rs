@@ -125,6 +125,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0020_neighbourhood_search_and_fusion",
         template: include_str!("../migrations/0020_neighbourhood_search_and_fusion.sql"),
     },
+    Migration {
+        version: 21,
+        name: "0021_sentences_and_gaps",
+        template: include_str!("../migrations/0021_sentences_and_gaps.sql"),
+    },
 ];
 
 /// The schema version this build of the Store expects: the last migration's.

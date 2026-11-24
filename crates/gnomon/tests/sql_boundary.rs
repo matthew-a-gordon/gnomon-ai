@@ -544,6 +544,8 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
         "gnomon.erase_node(",
         "gnomon.erase_edge(",
         "gnomon.erase_scope(",
+        "gnomon.store_sentence(",
+        "gnomon.list_gaps(",
     ] {
         assert!(
             names.iter().any(|n| n.starts_with(expected)),
@@ -2002,8 +2004,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         )
         .await
         .unwrap();
-    // An Edge from the Node to itself, and its Version's Sentence, which the
-    // table's owner stores until ticket #26 adds the function that does.
+    // An Edge from the Node to itself, and its Version's Sentence.
     let (_, edge) = single
         .create_edge(
             &gnomon::NewEdge {
@@ -2018,9 +2019,9 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         .await
         .unwrap();
 
-    let mut operator = db.operator().await;
+    let operator = db.operator().await;
     support::store_sentence(
-        &mut operator,
+        &db,
         TenantId(first),
         "support",
         edge.opened[0].0,
@@ -2882,7 +2883,8 @@ async fn a_caller_cannot_change_an_episodes_authority() {
 // own Tenant that the caller can see, of Kinds its Edge Kind allows. Edge
 // Versions are Versions: the guard triggers, the grants and RLS that keep a
 // Node's history keep an Edge's, and no caller gets a new right to change
-// them or to store a Sentence.
+// them. A caller stores a Sentence of an Edge Version it sees (migration
+// 0021), which the Sentences tests below cover.
 
 /// The Nodes of `nodes`, an Edge in each Tenant's `support` Scope from its
 /// Node to itself, written once, and a Node of Tenant one in `billing`.
@@ -3204,11 +3206,12 @@ async fn a_caller_cannot_read_or_traverse_another_tenants_or_scopes_edges() {
 }
 
 #[tokio::test]
-async fn a_caller_cannot_write_another_tenants_edge_or_change_an_edge_or_store_a_sentence() {
+async fn a_caller_cannot_write_another_tenants_edge_or_change_an_edge() {
     let e = edges().await;
     let t1 = e.n.w.t1;
     for role in [USER, WORKER] {
-        let attempts: [(&str, Vec<Uuid>, &str); 8] = [
+        // Sentences are covered with Sentences, below.
+        let attempts: [(&str, Vec<Uuid>, &str); 7] = [
             (
                 "select gnomon.write_edge($1, $2, $3, null, null, null, null, null, null)",
                 vec![e.n.w.t2, e.e2, e.n.w.t2_support],
@@ -3229,12 +3232,6 @@ async fn a_caller_cannot_write_another_tenants_edge_or_change_an_edge_or_store_a
                  values ($1, 'support', 'edge', $2, $3, '2000-01-01')",
                 vec![t1, e.n.n1, e.n.n1],
                 "choosing an Edge's creation time",
-            ),
-            (
-                "insert into gnomon.sentence (tenant_id, scope, version_id, sentence)
-                 select $1, 'support', $2, 'A forged Sentence.' where $3::uuid is not null",
-                vec![t1, e.e1_open, e.e1_open],
-                "storing a Sentence",
             ),
             (
                 "delete from gnomon.version where id = $2 and $1::uuid is not null and $3::uuid is not null",
@@ -7929,4 +7926,696 @@ async fn an_episode_edge_or_summary_of_a_scope_the_caller_cannot_see_changes_no_
     // rank and count included, while a caller of both Scopes sees another.
     assert_eq!(ranked(&["support"]).await, before);
     assert_ne!(ranked(&["support", "billing"]).await, both_before);
+}
+
+// Sentences and the gap listing (ADR-0009, ADR-0013, migration 0021).
+
+/// The Edges of `edges()`, each Edge Version's ID, and an Edge of Tenant
+/// one's `billing` Scope from its Node to itself. Tenant two's Edge and the
+/// billing Edge each have a Sentence, stored by their own Scope's worker.
+struct Sentenced {
+    e: Edges,
+    e2_open: Uuid,
+    billing_open: Uuid,
+}
+
+const STORE_SENTENCE: &str = "select gnomon.store_sentence($1, $2, $3)";
+
+async fn sentenced() -> Sentenced {
+    let e = edges().await;
+    let store = Store::connect(&e.n.w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let (_, written) = store
+        .as_worker(TenantId(e.n.w.t1), Scope::new("billing"))
+        .create_edge(
+            &gnomon::NewEdge {
+                tenant: Some(TenantId(e.n.w.t1)),
+                scope: Scope::new("billing"),
+                kind: gnomon::ROOT_EDGE_KIND.into(),
+                source: gnomon::NodeId(e.billing_node),
+                target: gnomon::NodeId(e.billing_node),
+            },
+            &gnomon::Patch::new(
+                EpisodeId(e.n.w.t1_billing),
+                gnomon::ValidTime::UNKNOWN,
+                Default::default(),
+            ),
+        )
+        .await
+        .unwrap();
+    let billing_open = written.opened[0];
+    let e2_open =
+        e.n.w
+            .db
+            .admin()
+            .await
+            .query_typed(
+                "select id from gnomon.version where edge_id = $1",
+                &[(&e.e2, Type::UUID)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+    for (t, scope, version) in [
+        (e.n.w.t2, "support", e2_open),
+        (e.n.w.t1, "billing", billing_open.0),
+    ] {
+        store
+            .as_worker(TenantId(t), Scope::new(scope))
+            .store_sentence(TenantId(t), gnomon::VersionId(version), "Its own Sentence.")
+            .await
+            .unwrap();
+    }
+    Sentenced {
+        e,
+        e2_open,
+        billing_open: billing_open.0,
+    }
+}
+
+/// Every Version and Sentence row, as text, read past RLS.
+async fn versions_and_sentences(db: &TestDb) -> Vec<String> {
+    db.admin()
+        .await
+        .query_typed(
+            "select format('%s %s %s %s', id, recorded_from, recorded_to, props)
+             from gnomon.version
+             union all
+             select format('%s %s %s %s', tenant_id, scope, version_id, sentence)
+             from gnomon.sentence
+             order by 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+/// Fails unless `result` is a refusal: those of [`assert_refused_write`], or
+/// a check constraint or a bad parameter.
+fn assert_refused_sentence(
+    result: Result<impl std::fmt::Debug, tokio_postgres::Error>,
+    what: &str,
+) {
+    match result {
+        Err(e)
+            if [SqlState::CHECK_VIOLATION, SqlState::INVALID_PARAMETER_VALUE]
+                .iter()
+                .any(|c| e.code() == Some(c)) => {}
+        other => assert_refused_write(other, what),
+    }
+}
+
+#[tokio::test]
+async fn a_caller_stores_a_sentence_only_of_an_edge_version_it_sees_by_the_function_or_directly() {
+    let s = sentenced().await;
+    let w = &s.e.n.w;
+    let (t1, t2) = (w.t1, w.t2);
+    let before = versions_and_sentences(&w.db).await;
+    let insert = "insert into gnomon.sentence (tenant_id, scope, version_id, sentence)
+                  values ($1, $2, $3, $4)";
+    for role in [USER, WORKER] {
+        let calls: [(Uuid, Uuid, &str, &str); 6] = [
+            (
+                t2,
+                s.e2_open,
+                "A forged Sentence.",
+                "another Tenant's Edge Version",
+            ),
+            (
+                t1,
+                s.e2_open,
+                "A forged Sentence.",
+                "another Tenant's Edge Version as its own",
+            ),
+            (
+                t1,
+                s.billing_open,
+                "A forged Sentence.",
+                "an Edge Version of a Scope it cannot see",
+            ),
+            (t1, s.e.n.open, "A forged Sentence.", "a Node Version"),
+            (t1, Uuid::new_v4(), "A forged Sentence.", "no Version"),
+            (t1, s.e.e1_open, " \t", "a Sentence with no word"),
+        ];
+        for (tenant, version, sentence, what) in calls {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            let r = tx
+                .execute_typed(
+                    STORE_SENTENCE,
+                    &[
+                        (&tenant, Type::UUID),
+                        (&version, Type::UUID),
+                        (&sentence, Type::TEXT),
+                    ],
+                )
+                .await;
+            assert_refused_sentence(r, &format!("{role} storing through the function {what}"));
+        }
+        let inserts: [(Uuid, &str, Uuid, &str, &str); 6] = [
+            (
+                t2,
+                "support",
+                s.e2_open,
+                "A forged Sentence.",
+                "in another Tenant",
+            ),
+            (
+                t1,
+                "billing",
+                s.billing_open,
+                "A forged Sentence.",
+                "in a Scope it cannot see",
+            ),
+            (
+                t1,
+                "support",
+                s.billing_open,
+                "A forged Sentence.",
+                "of another Scope's Version",
+            ),
+            (
+                t1,
+                "support",
+                s.e2_open,
+                "A forged Sentence.",
+                "of another Tenant's Version",
+            ),
+            (
+                t1,
+                "support",
+                s.e.n.open,
+                "A forged Sentence.",
+                "of a Node Version",
+            ),
+            (t1, "support", s.e.e1_open, "   ", "with no word"),
+        ];
+        for (tenant, scope, version, sentence, what) in inserts {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            let r = tx
+                .execute_typed(
+                    insert,
+                    &[
+                        (&tenant, Type::UUID),
+                        (&scope, Type::TEXT),
+                        (&version, Type::UUID),
+                        (&sentence, Type::TEXT),
+                    ],
+                )
+                .await;
+            assert_refused_sentence(r, &format!("{role} inserting a Sentence {what}"));
+        }
+
+        // Its own Sentence it may store and replace, and change nothing else
+        // about it: not its Tenant, Scope or Version, and not by a delete.
+        let own: [(&str, &str); 6] = [
+            ("update gnomon.sentence set tenant_id = $2 where version_id = $1", "its Tenant"),
+            ("update gnomon.sentence set scope = 'billing' where version_id = $1 and $2::uuid is not null", "its Scope"),
+            ("update gnomon.sentence set version_id = $2 where version_id = $1", "its Version"),
+            ("delete from gnomon.sentence where version_id = $1 and $2::uuid is not null", "a delete"),
+            ("truncate gnomon.sentence", "a truncate"),
+            ("update gnomon.sentence set sentence = '' where version_id = $1 and $2::uuid is not null", "an empty text"),
+        ];
+        for (sql, what) in own {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            tx.execute_typed(
+                STORE_SENTENCE,
+                &[
+                    (&t1, Type::UUID),
+                    (&s.e.e1_open, Type::UUID),
+                    (&"Its own Sentence.", Type::TEXT),
+                ],
+            )
+            .await
+            .unwrap();
+            let r = if sql.starts_with("truncate") {
+                tx.execute_typed(sql, &[]).await
+            } else {
+                let other = if what == "its Tenant" { t2 } else { s.e.n.open };
+                tx.execute_typed(sql, &[(&s.e.e1_open, Type::UUID), (&other, Type::UUID)])
+                    .await
+            };
+            assert_refused_sentence(r, &format!("{role} changing its own Sentence by {what}"));
+        }
+
+        // Another Tenant's and another Scope's Sentences are not there to
+        // change.
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        for version in [s.e2_open, s.billing_open] {
+            let changed = tx
+                .execute_typed(
+                    "update gnomon.sentence set sentence = 'A forged Sentence.'
+                     where version_id = $1",
+                    &[(&version, Type::UUID)],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                changed, 0,
+                "{role} changed another Scope's or Tenant's Sentence"
+            );
+        }
+        let seen: i64 = tx
+            .query_typed("select count(*) from gnomon.sentence", &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(seen, 0, "{role} saw another Scope's or Tenant's Sentences");
+        // A direct insert of its own, as the function's.
+        tx.execute_typed(
+            insert,
+            &[
+                (&t1, Type::UUID),
+                (&"support", Type::TEXT),
+                (&s.e.e1_open, Type::UUID),
+                (&"Its own Sentence.", Type::TEXT),
+            ],
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+    }
+    assert_eq!(
+        versions_and_sentences(&w.db).await,
+        before,
+        "no Version, Recorded time or Sentence changed"
+    );
+}
+
+#[tokio::test]
+async fn storing_a_sentence_writes_no_version_and_changes_no_recorded_time() {
+    let s = sentenced().await;
+    let w = &s.e.n.w;
+    let versions = || async {
+        w.db.admin()
+            .await
+            .query_typed(
+                "select format('%s %s %s %s %s', id, recorded_from, recorded_to, props, written_in)
+                 from gnomon.version order by 1",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<_>>()
+    };
+    let before = versions().await;
+    for (role, sentence) in [(USER, "First."), (WORKER, "Second."), (USER, "Second.")] {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        tx.execute_typed(
+            STORE_SENTENCE,
+            &[
+                (&w.t1, Type::UUID),
+                (&s.e.e1_open, Type::UUID),
+                (&sentence, Type::TEXT),
+            ],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    assert_eq!(versions().await, before);
+}
+
+/// The quantized rows and full vectors of a Tenant's Scope, read past RLS.
+async fn scope_embedding_rows(
+    db: &TestDb,
+    tenant: Uuid,
+    scope: &str,
+) -> (Vec<String>, Vec<String>) {
+    let admin = db.admin().await;
+    let read = |sql: &'static str| {
+        let admin = &admin;
+        let scope = scope.to_owned();
+        async move {
+            admin
+                .query_typed(sql, &[(&tenant, Type::UUID), (&scope, Type::TEXT)])
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<_, String>(0))
+                .collect::<Vec<_>>()
+        }
+    };
+    (
+        read(
+            "select version_id || ' ' || text_hash from gnomon.embedding_bit
+             where tenant_id = $1 and scope = $2 order by 1",
+        )
+        .await,
+        read(
+            "select text_hash from gnomon.embedding where tenant_id = $1 and scope = $2
+             order by 1",
+        )
+        .await,
+    )
+}
+
+#[tokio::test]
+async fn a_replaced_sentence_leaves_no_embedding_of_its_old_text_and_touches_no_other_scope() {
+    let s = sentenced().await;
+    let w = &s.e.n.w;
+    let store = Store::connect(&w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let mut rng = support::vectors::Rng::new(260);
+    let vector = rng.unit();
+    let text = "Its own Sentence.";
+    let hash: String =
+        w.db.admin()
+            .await
+            .query_typed(
+                "select gnomon.sentence_text_hash($1)",
+                &[(&text, Type::TEXT)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+    // The same text, embedded with the same vector, in Tenant one's support
+    // and billing and in Tenant two's support.
+    for (t, scope, version) in [
+        (w.t1, "support", s.e.e1_open),
+        (w.t1, "billing", s.billing_open),
+        (w.t2, "support", s.e2_open),
+    ] {
+        let caller = store.as_worker(TenantId(t), Scope::new(scope));
+        caller
+            .store_sentence(TenantId(t), gnomon::VersionId(version), text)
+            .await
+            .unwrap();
+        caller
+            .store_embedding(TenantId(t), gnomon::VersionId(version), &hash, &vector)
+            .await
+            .unwrap();
+    }
+    let billing = scope_embedding_rows(&w.db, w.t1, "billing").await;
+    let other_tenant = scope_embedding_rows(&w.db, w.t2, "support").await;
+    assert_eq!(billing.1, vec![hash.clone()]);
+
+    for role in [USER, WORKER] {
+        // A caller deletes no embedding row itself, its own Scope's included.
+        for table in ["embedding", "embedding_bit"] {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+            let r = tx
+                .execute_typed(&format!("delete from gnomon.{table}"), &[])
+                .await;
+            assert_refused(r, &format!("{role} deleting from gnomon.{table}"));
+        }
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        let r = tx.execute_typed("truncate gnomon.embedding_bit", &[]).await;
+        assert_refused(r, &format!("{role} truncating gnomon.embedding_bit"));
+
+        // Replacing its Sentence removes the old text's embedding, in the
+        // same transaction, and only its own.
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        tx.execute_typed(
+            STORE_SENTENCE,
+            &[
+                (&w.t1, Type::UUID),
+                (&s.e.e1_open, Type::UUID),
+                (&"A new Sentence.", Type::TEXT),
+            ],
+        )
+        .await
+        .unwrap();
+        let left: i64 = tx
+            .query_typed(
+                "select (select count(*) from gnomon.embedding_bit where version_id = $1)
+                      + (select count(*) from gnomon.embedding where text_hash = $2)",
+                &[(&s.e.e1_open, Type::UUID), (&hash, Type::TEXT)],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        assert_eq!(left, 0, "{role} still sees the old text's embedding");
+        let hits = tx
+            .query_typed(
+                "select version_id from gnomon.search_vector($1, $2, now(), null, 10)",
+                &[(&w.t1, Type::UUID), (&vector, Type::FLOAT4_ARRAY)],
+            )
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "{role} found the old text by vector");
+        tx.rollback().await.unwrap();
+    }
+
+    // Committed by the Store, as the Pipeline would.
+    store
+        .as_worker(TenantId(w.t1), Scope::new("support"))
+        .store_sentence(
+            TenantId(w.t1),
+            gnomon::VersionId(s.e.e1_open),
+            "A new Sentence.",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        scope_embedding_rows(&w.db, w.t1, "support").await,
+        (vec![], vec![])
+    );
+    assert_eq!(scope_embedding_rows(&w.db, w.t1, "billing").await, billing);
+    assert_eq!(
+        scope_embedding_rows(&w.db, w.t2, "support").await,
+        other_tenant
+    );
+    // No row of any table names the old text in that Scope.
+    let admin = w.db.admin().await;
+    let residue: Vec<String> = support::erasure::every_row(&admin)
+        .await
+        .into_iter()
+        .filter(|r| r.contains(&hash) && r.contains(&s.e.e1_open.to_string()))
+        .collect();
+    assert_eq!(residue, Vec::<String>::new());
+    support::erasure::assert_no_unused_full_vector(&admin).await;
+}
+
+const LIST_GAPS: &str = "select kind, id from gnomon.list_gaps($1, $2, null, null, null, 1000)";
+
+/// Every ID of a row of a Tenant's Scope that a gap can name: its Versions,
+/// Nodes, Summaries and Communities, read past RLS.
+async fn ids_in(db: &TestDb, tenant: Uuid, scope: &str) -> std::collections::HashSet<Uuid> {
+    db.admin()
+        .await
+        .query_typed(
+            "select id from gnomon.version where tenant_id = $1 and scope = $2
+             union all select id from gnomon.node where tenant_id = $1 and scope = $2
+             union all select id from gnomon.summary where tenant_id = $1 and scope = $2
+             union all select id from gnomon.community where tenant_id = $1 and scope = $2",
+            &[(&tenant, Type::UUID), (&scope, Type::TEXT)],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_gap_listing_names_only_the_callers_tenant_and_scope() {
+    let s = sentenced().await;
+    let w = &s.e.n.w;
+    let (t1, t2) = (w.t1, w.t2);
+    // Each other Scope has gaps of its own: an Edge Version of billing has
+    // no Sentence and the other's Sentence no embedding, and Tenant two's
+    // Node has no Summary.
+    let store = Store::connect(&w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let (_, unsentenced) = store
+        .as_worker(TenantId(t1), Scope::new("billing"))
+        .create_edge(
+            &gnomon::NewEdge {
+                tenant: Some(TenantId(t1)),
+                scope: Scope::new("billing"),
+                kind: gnomon::ROOT_EDGE_KIND.into(),
+                source: gnomon::NodeId(s.e.billing_node),
+                target: gnomon::NodeId(s.e.billing_node),
+            },
+            &gnomon::Patch::new(
+                EpisodeId(w.t1_billing),
+                gnomon::ValidTime::UNKNOWN,
+                Default::default(),
+            ),
+        )
+        .await
+        .unwrap();
+    let billing_gaps: Vec<String> = store
+        .as_worker(TenantId(t1), Scope::new("billing"))
+        .list_gaps(TenantId(t1), &Scope::new("billing"), None, 1000)
+        .await
+        .unwrap()
+        .gaps
+        .iter()
+        .map(|g| format!("{g:?}"))
+        .collect();
+    let unsentenced = unsentenced.opened[0].0.to_string();
+    assert!(
+        billing_gaps
+            .iter()
+            .any(|g| g.starts_with("Sentence ") && g.contains(&unsentenced)),
+        "{billing_gaps:?}"
+    );
+    assert!(!ids_in(&w.db, t2, "support").await.is_empty());
+    let support_ids = ids_in(&w.db, t1, "support").await;
+
+    for role in [USER, WORKER] {
+        let mut listings = Vec::new();
+        for scopes in [&["support"][..], &["support", "billing"][..]] {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, scopes)).await;
+            let rows = tx
+                .query_typed(LIST_GAPS, &[(&t1, Type::UUID), (&"support", Type::TEXT)])
+                .await
+                .unwrap();
+            let listed: Vec<(String, Uuid)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+            assert!(!listed.is_empty(), "{role} {scopes:?} listed nothing");
+            for (kind, id) in &listed {
+                assert!(
+                    support_ids.contains(id),
+                    "{role} {scopes:?} listed a {kind} gap {id} outside Tenant one's support"
+                );
+            }
+            listings.push(listed);
+        }
+        assert_eq!(
+            listings[0], listings[1],
+            "{role}: a second Scope changed the listing"
+        );
+
+        // A Scope it cannot see, another Tenant, claims of no Tenant, and a
+        // page token of no kind are refused.
+        for (tenant, scope, claims, what) in [
+            (
+                t1,
+                "billing",
+                claims(t1, &["support"]),
+                "a Scope it cannot see",
+            ),
+            (t2, "support", claims(t1, &["support"]), "another Tenant"),
+            (
+                t2,
+                "support",
+                claims(t2, &[]),
+                "another Tenant's claims with no Scope",
+            ),
+            (
+                t1,
+                "support",
+                json!({ "role": "authenticated" }).to_string(),
+                "claims of no Tenant",
+            ),
+        ] {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims).await;
+            let r = tx
+                .query_typed(LIST_GAPS, &[(&tenant, Type::UUID), (&scope, Type::TEXT)])
+                .await;
+            assert_refused_write(r, &format!("{role} listing the gaps of {what}"));
+        }
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        let r = tx
+            .query_typed(
+                "select id from gnomon.list_gaps($1, 'support', 'version', $2, null, 10)",
+                &[(&t1, Type::UUID), (&s.e.e1_open, Type::UUID)],
+            )
+            .await;
+        assert_eq!(
+            r.unwrap_err().code(),
+            Some(&SqlState::INVALID_PARAMETER_VALUE),
+            "{role}: a page token of no kind"
+        );
+    }
+}
+
+#[tokio::test]
+async fn callers_insert_a_sentence_and_change_only_its_text_and_both_functions_are_invokers() {
+    let w = world().await;
+    let admin = w.db.admin().await;
+    for role in [USER, WORKER] {
+        let table: Vec<String> = admin
+            .query_typed(
+                "select p from unnest(array['SELECT', 'INSERT', 'UPDATE', 'DELETE',
+                                          'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']) p
+                 where has_table_privilege($1, 'gnomon.sentence', p)",
+                &[(&role, Type::TEXT)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        assert_eq!(table, ["SELECT"], "{role} on gnomon.sentence");
+        let columns: Vec<String> = admin
+            .query_typed(
+                "select c || ' ' || p
+                 from unnest(array['tenant_id', 'scope', 'version_id', 'sentence']) c,
+                      unnest(array['INSERT', 'UPDATE']) p
+                 where has_column_privilege($1, 'gnomon.sentence', c, p)
+                 order by 1",
+                &[(&role, Type::TEXT)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                "scope INSERT",
+                "sentence INSERT",
+                "sentence UPDATE",
+                "tenant_id INSERT",
+                "version_id INSERT"
+            ],
+            "{role}'s column privileges on gnomon.sentence"
+        );
+        for table in ["embedding", "embedding_bit"] {
+            let deletes: bool = admin
+                .query_typed(
+                    "select has_table_privilege($1, ('gnomon.' || $2)::regclass, 'DELETE')
+                         or has_table_privilege($1, ('gnomon.' || $2)::regclass, 'TRUNCATE')",
+                    &[(&role, Type::TEXT), (&table, Type::TEXT)],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+            assert!(!deletes, "{role} may delete from gnomon.{table}");
+        }
+    }
+    let functions = admin
+        .query_typed(
+            "select p.oid::regprocedure::text, p.prosecdef, p.proconfig,
+                    array(select coalesce(nullif(a.grantee, 0)::regrole::text, 'public')
+                          from aclexplode(p.proacl) a where a.grantee <> p.proowner
+                          order by 1)
+             from pg_proc p
+             where p.oid in ('gnomon.store_sentence(uuid, uuid, text)'::regprocedure,
+                             'gnomon.list_gaps(uuid, text, text, uuid, text, integer)'::regprocedure)
+             order by 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(functions.len(), 2);
+    for f in functions {
+        let (name, definer, config, grantees): (String, bool, Vec<String>, Vec<String>) =
+            (f.get(0), f.get(1), f.get(2), f.get(3));
+        assert!(!definer, "{name} is a definer");
+        assert_eq!(config, ["search_path=\"\""], "{name}");
+        assert_eq!(grantees, ["authenticated", "gnomon_worker"], "{name}");
+    }
 }

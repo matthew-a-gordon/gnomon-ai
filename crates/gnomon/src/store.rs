@@ -46,6 +46,7 @@ use crate::{
     ValidTime, VectorCandidate, VectorNameMatch, VersionId, Versioned, WriteOutcome, WriteStatus,
 };
 use crate::{BranchRank, SearchHit, SearchRequest, SearchResult, SignalRank};
+use crate::{Gap, GapCursor, GapPage};
 
 /// How many times a write is retried when Postgres fails it with a
 /// serialization failure or a deadlock, which a write to a Node that a
@@ -2780,5 +2781,138 @@ fn search_result(r: &Row) -> SearchResult {
             count: r.get(15),
             rank: r.get(16),
         },
+    }
+}
+
+/// Sentences and the gaps `maintain` repairs (ADR-0013, migration 0021).
+impl Caller<'_> {
+    /// Stores the Sentence of an Edge Version, after the write that made the
+    /// Version committed, replacing any stored before (ADR-0013). It writes
+    /// no Version and changes no Recorded time. The Version may be closed: a
+    /// Search at an earlier known-at instant finds it by its Sentence.
+    ///
+    /// The Sentence's words and BM25 counts are written in the same
+    /// transaction, so full-text Search finds the Version by them once this
+    /// call returns, before any embedding exists. The Pipeline then embeds
+    /// it with [`store_embedding`](Self::store_embedding) and the hash
+    /// `gnomon.sentence_text_hash` gives. A replaced Sentence's embedding is
+    /// deleted with it, and its full vector unless another row uses it, so
+    /// the replaced text is found by no Search.
+    ///
+    /// The call commits the stage records this Caller is
+    /// [`recording`](Self::recording), since a Sentence is a stage's output.
+    /// A Version that is not an Edge Version the caller can see fails with
+    /// [`Error::InvalidWrite`], and a Sentence with no word with
+    /// [`Error::Database`] and SQLSTATE 22023.
+    pub async fn store_sentence(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        version: VersionId,
+        sentence: &str,
+    ) -> Result<(), Error> {
+        let stages = self.take_stages();
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        self.store
+            .statements
+            .query(
+                &tx,
+                "select gnomon.store_sentence($1, $2, $3)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&version.0, Type::UUID),
+                    (&sentence, Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        self.commit_with(tx, tenant, &stages).await
+    }
+
+    /// One page of the gaps of `scope`, the Scope's rows the caller sees
+    /// that `maintain` repairs: at most `limit`, after `after`, or from the
+    /// first when it is `None`. See [`Gap`] for each kind. The order is the
+    /// same on every call: by kind, in the order of [`Gap`]'s variants, then
+    /// by ID and text hash. A gap that is listed on every call is listed once
+    /// as the pages are read, however the gaps change between them.
+    ///
+    /// A Scope the caller cannot see fails with [`Error::InvalidWrite`], and
+    /// a `limit` below 1 with [`Error::Database`] and SQLSTATE 22023.
+    pub async fn list_gaps(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        scope: &Scope,
+        after: Option<&GapCursor>,
+        limit: i32,
+    ) -> Result<GapPage, Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
+                "select kind, id, text_hash, node_id, edge_id, search_text
+                 from gnomon.list_gaps($1, $2, $3, $4, $5, $6)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&scope.as_str(), Type::TEXT),
+                    (&after.map(|a| a.kind), Type::TEXT),
+                    (&after.map(|a| a.id), Type::UUID),
+                    (&after.and_then(|a| a.hash.as_deref()), Type::TEXT),
+                    (&limit, Type::INT4),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        tx.commit().await?;
+        let gaps: Vec<Gap> = rows.iter().map(gap).collect();
+        let next = match gaps.last() {
+            Some(last) if gaps.len() == limit as usize => Some(last.cursor()),
+            _ => None,
+        };
+        Ok(GapPage { gaps, next })
+    }
+}
+
+fn gap(r: &Row) -> Gap {
+    let id: uuid::Uuid = r.get(1);
+    let hash = || r.get::<_, String>(2);
+    let node = || NodeId(r.get(3));
+    let edge = || EdgeId(r.get(4));
+    let text = || r.get::<_, String>(5);
+    match r.get::<_, &str>(0) {
+        "sentence" => Gap::Sentence {
+            version: VersionId(id),
+            edge: edge(),
+        },
+        "sentence_embedding" => Gap::SentenceEmbedding {
+            version: VersionId(id),
+            edge: edge(),
+            text_hash: hash(),
+            sentence: text(),
+        },
+        "node_embedding" => Gap::NodeEmbedding {
+            version: VersionId(id),
+            node: node(),
+            text_hash: hash(),
+        },
+        "name_embedding" => Gap::NameEmbedding {
+            node: NodeId(id),
+            text_hash: hash(),
+            name: text(),
+        },
+        "summary_embedding" => Gap::SummaryEmbedding {
+            summary: SummaryId(id),
+            node: node(),
+        },
+        "community_embedding" => Gap::CommunityEmbedding {
+            community: CommunityId(id),
+        },
+        "summary" => Gap::Summary { node: NodeId(id) },
+        "community" => Gap::Community {
+            community: CommunityId(id),
+        },
+        other => unreachable!("gnomon.list_gaps returns no {other} gaps"),
     }
 }

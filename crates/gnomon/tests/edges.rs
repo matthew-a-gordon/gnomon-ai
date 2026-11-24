@@ -643,17 +643,11 @@ async fn reads_and_traversal_return_each_edge_versions_sentence_or_none_until_on
         .unwrap();
     assert_eq!(steps[0].edge.sentence, None);
 
-    // Ticket #26 adds the function that stores a Sentence. Until then the
-    // table's owner stores one, as that function will, after the Version
-    // committed.
-    support::store_sentence(
-        &mut w.db.operator().await,
-        w.tenant,
-        SCOPE,
-        v.id.0,
-        "Ada works at Acme.",
-    )
-    .await;
+    // The Pipeline stores it after the Version committed.
+    w.caller()
+        .store_sentence(w.tenant, v.id, "Ada works at Acme.")
+        .await
+        .unwrap();
 
     let read = w.read_edge(edge, now).await.unwrap();
     assert_eq!(read.sentence.as_deref(), Some("Ada works at Acme."));

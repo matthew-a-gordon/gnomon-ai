@@ -7,6 +7,7 @@
 
 mod connect;
 mod edge;
+mod gap;
 mod kind;
 pub mod migrations;
 mod node;
@@ -27,6 +28,7 @@ pub use connect::{ConnectOptions, Tls};
 pub use edge::{
     Direction, EdgeId, EdgeVersion, EpisodeErasure, GraphErasure, NewEdge, Step, Traversal,
 };
+pub use gap::{Gap, GapCursor, GapPage};
 pub use kind::{
     Kind, KindOf, MergeRule, NewKind, DIFFERENT_FROM_KIND, ROOT_EDGE_KIND, ROOT_NODE_KIND,
     SAME_AS_KIND,
