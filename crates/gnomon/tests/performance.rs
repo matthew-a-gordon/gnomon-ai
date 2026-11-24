@@ -37,6 +37,16 @@ const SEARCH_BUDGET_200K: f64 = 250.0;
 /// Node with 10 Contributions, 3 ms with 100, and 10 to 11 ms with 500.
 const PATCH_P50_CEILING_MS: f64 = 11.0;
 
+/// Prototype 4's bounded-patch p50 (ms) on a Node of this many Contributions,
+/// recorded next to the measured number.
+fn prototype_4_p50(contributions: usize) -> f64 {
+    match contributions {
+        10 => 1.3,
+        100 => 3.4,
+        _ => 10.4,
+    }
+}
+
 /// Searches discarded before the timed ones, and timed.
 const SEARCH_WARM_UP: usize = 10;
 const SEARCH_SAMPLES: usize = 100;
@@ -83,10 +93,16 @@ async fn fused_search_case(case: &str, visible_target: usize, budget_ms: f64) {
             // The two branches alone, for the record.
             if i % 4 == 0 {
                 let t = Instant::now();
-                caller.search_vector(data.tenant(), &q, current.clone(), 10).await.unwrap();
+                caller
+                    .search_vector(data.tenant(), &q, current.clone(), 10)
+                    .await
+                    .unwrap();
                 vector_times.push(t.elapsed());
                 let t = Instant::now();
-                caller.search_full_text(data.tenant(), &text, current.clone(), 10).await.unwrap();
+                caller
+                    .search_full_text(data.tenant(), &text, current.clone(), 10)
+                    .await
+                    .unwrap();
                 text_times.push(t.elapsed());
             }
         }
@@ -116,7 +132,11 @@ async fn fused_search_case(case: &str, visible_target: usize, budget_ms: f64) {
         "fused Search p95 {:.1} ms is over the {budget_ms} ms budget at {} visible rows{}",
         stats.p95,
         data.visible,
-        if loaded { " (the machine was loaded: rerun when it is quieter)" } else { "" }
+        if loaded {
+            " (the machine was loaded: rerun when it is quieter)"
+        } else {
+            ""
+        }
     );
 }
 
@@ -144,21 +164,21 @@ fn values(v: Value) -> Map<String, Value> {
 }
 
 struct Writes {
-    _db: TestDb,
+    db: TestDb,
     store: Store,
     tenant: TenantId,
 }
 
 impl Writes {
     fn caller(&self) -> gnomon::Caller<'_> {
-        self.store.as_worker(self.tenant, Scope::new("perf"))
+        self.store.as_worker(self.tenant, Scope::new(perf::SCOPE))
     }
 
     async fn episode(&self, reference_time: DateTime<Utc>) -> gnomon::EpisodeId {
         self.caller()
             .record_episode(&NewEpisode {
                 tenant: Some(self.tenant),
-                scope: Scope::new("perf"),
+                scope: Scope::new(perf::SCOPE),
                 content: format!("an Episode from {reference_time}"),
                 reference_time,
                 authority: None,
@@ -188,7 +208,7 @@ impl Writes {
             .create_node(
                 &NewNode {
                     tenant: Some(self.tenant),
-                    scope: Scope::new("perf"),
+                    scope: Scope::new(perf::SCOPE),
                     kind: ROOT_NODE_KIND.to_owned(),
                 },
                 &first,
@@ -198,7 +218,10 @@ impl Writes {
         for i in 1..(contributions as i64 / 2) {
             let from = (i * 37 + n * 11) % 330;
             let patch = self.patch(i, from, 10 + (i * 13) % 50).await;
-            self.caller().write_node(self.tenant, node, &patch).await.unwrap();
+            self.caller()
+                .write_node(self.tenant, node, &patch)
+                .await
+                .unwrap();
         }
         node
     }
@@ -208,7 +231,10 @@ impl Writes {
         let from = (round * 61 + n * 29) % 330;
         let patch = self.patch(round + 1000, from, 14).await;
         let started = Instant::now();
-        self.caller().write_node(self.tenant, node, &patch).await.unwrap();
+        self.caller()
+            .write_node(self.tenant, node, &patch)
+            .await
+            .unwrap();
         started.elapsed()
     }
 }
@@ -230,9 +256,9 @@ async fn a_bounded_patch_write_costs_1_to_11_ms_at_p50_and_grows_with_the_nodes_
     let w = Writes {
         tenant: support::tenant(),
         store,
-        _db: db,
+        db: db,
     };
-    let record = Record::start("bounded_patch_write", &w._db.name).await;
+    let record = Record::start("bounded_patch_write", &w.db.name).await;
     let mut cells = vec![];
     let mut p50s = vec![];
     for contributions in SIZES {
@@ -243,18 +269,17 @@ async fn a_bounded_patch_write_costs_1_to_11_ms_at_p50_and_grows_with_the_nodes_
         }
         // A running Store has autovacuum analyze what it wrote. The Nodes were
         // just loaded, so the planner's statistics are brought up to date here.
-        w._db.admin().await.batch_execute("analyze").await.unwrap();
-        let count: i64 = w
-            ._db
-            .admin()
-            .await
-            .query_typed(
-                "select count(*) from gnomon.contribution where node_id = $1",
-                &[(&nodes[0].0, tokio_postgres::types::Type::UUID)],
-            )
-            .await
-            .unwrap()[0]
-            .get(0);
+        w.db.admin().await.batch_execute("analyze").await.unwrap();
+        let count: i64 =
+            w.db.admin()
+                .await
+                .query_typed(
+                    "select count(*) from gnomon.contribution where node_id = $1",
+                    &[(&nodes[0].0, tokio_postgres::types::Type::UUID)],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
         // Warm-up Nodes first, their writes discarded.
         for (n, node) in nodes.iter().take(WARM_UP_NODES as usize).enumerate() {
             w.timed_patch(*node, 0, n as i64).await;
@@ -275,9 +300,11 @@ async fn a_bounded_patch_write_costs_1_to_11_ms_at_p50_and_grows_with_the_nodes_
             stats.n
         );
         p50s.push(stats.p50);
-        cells.push(json!({ "contributions": contributions, "contributions_on_first_node": count,
+        cells.push(
+            json!({ "contributions": contributions, "contributions_on_first_node": count,
                            "bounded_patch": stats.to_json(),
-                           "prototype_4_bounded_p50_ms": match contributions { 10 => 1.3, 100 => 3.4, _ => 10.4 } }));
+                           "prototype_4_bounded_p50_ms": prototype_4_p50(contributions) }),
+        );
     }
     let loaded = record.finish(json!({
         "cells": cells,
@@ -289,7 +316,11 @@ async fn a_bounded_patch_write_costs_1_to_11_ms_at_p50_and_grows_with_the_nodes_
             *p50 <= PATCH_P50_CEILING_MS,
             "a bounded patch on {contributions} Contributions took {p50:.2} ms at p50, over \
              {PATCH_P50_CEILING_MS} ms{}",
-            if loaded { " (the machine was loaded: rerun when it is quieter)" } else { "" }
+            if loaded {
+                " (the machine was loaded: rerun when it is quieter)"
+            } else {
+                ""
+            }
         );
     }
     assert!(

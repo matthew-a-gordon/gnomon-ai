@@ -184,6 +184,7 @@ About 54% of the texts are visible at the current belief, so 92,000 texts give a
 ```sh
 scripts/perf.sh                 # both images, then the 4 GiB case on each; about an hour on a quiet machine
 scripts/perf.sh search          # fused Search at 50,000 and 200,000 visible rows, on both images
+                                # (search50k and search200k run one size)
 scripts/perf.sh patch           # bounded patch writes, on both images
 scripts/perf.sh capped          # 200,000 visible rows in a container capped at 4 GiB, on both images
 PERF_IMAGES=pgvector scripts/perf.sh search
@@ -202,12 +203,14 @@ How a case measures:
 
 - Search takes 10 discarded warm-up calls, then 100 timed ones, each a fresh text word and a fresh query vector near one of 200 subtopic centres. A patch write takes three Nodes' worth of discarded warm-up writes, then 60 timed writes: three bounded patches (two properties, a 14-day Valid time) to each of 20 Nodes. Each time includes the commit.
 - The data set is built with set-based SQL (`support/perf_data.sql`, `generate_series`) into a database named `gnomon_perf_<texts>_<hash of the migrations and the SQL>`. It stays on the server, so a rerun against a container that is still up skips the build. About 54% of the texts are visible at the current belief, so 92,600 texts give about 50,000 visible rows and 370,400 give about 200,000. A case refuses to run if its data set is not within 5% of the size it names.
-- The server runs with prototype 5's settings. `scripts/perf.sh` sets them through `GNOMON_TEST_POSTGRES_ARGS`: `shared_buffers` 8 GB, `work_mem` 64 MB, no parallel workers, `fsync` off and autovacuum off, with the tables vacuumed and frozen after the load. The capped container uses prototype 5's capped settings: `shared_buffers` 1 GB, `effective_cache_size` 3 GB, `work_mem` 16 MB. Durable commit cost is not in the patch numbers, as in prototype 4.
+- The Search cases run with prototype 5's settings. `scripts/perf.sh` sets them through `GNOMON_TEST_POSTGRES_ARGS`: `shared_buffers` 8 GB, `work_mem` 64 MB, no parallel workers, `fsync` off and autovacuum off, with the tables analyzed before the Edges are written and vacuumed and frozen after the load. The capped container uses prototype 5's capped settings: `shared_buffers` 1 GB, `effective_cache_size` 3 GB, `work_mem` 16 MB. The data is loaded on one connection, because parallel callers of `gnomon.store_embedding` blocked each other on the shared full vectors and on their commits.
+- The patch case runs on Postgres's own settings, so autovacuum analyzes what the loads write, and the harness runs `analyze` after each load as well. Set `PERF_PATCH_ARGS="-c fsync=off"` to take durable commit cost out of the numbers, as prototype 4 did. The Search cases and the patch case have their own time limits (`PERF_LIMIT_50K` 25 minutes, `PERF_LIMIT_200K` 45 minutes, `PERF_LIMIT_PATCH` 25 minutes), so a stuck stage fails instead of running for hours.
+- The query word is a number that one text holds. The generated texts have no word-frequency structure, so the full-text branch costs less here than a real vocabulary would make it cost.
 
 Three variables for the harness exist for this suite:
 
 - `GNOMON_TEST_MEMORY`, such as `4g`, caps the container's memory, with no swap beyond the cap. It sets `--memory` and `--memory-swap` through the container request.
-- `GNOMON_TEST_DATA_DIR=disk` keeps the data in the image's anonymous volume instead of a tmpfs, which would count against the cap. `scripts/perf.sh` removes the volume with the container.
+- `GNOMON_TEST_DATA_DIR=disk` keeps the data in the image's anonymous volume instead of the tmpfs the correctness suite uses, because a tmpfs would count against the cap. `scripts/perf.sh` removes the volume with the container.
 - `GNOMON_TEST_POSTGRES_ARGS` appends arguments to the server's command line.
 
 Each case writes a JSON record to `target/tmp/performance/` and prints a summary. The record holds the date, the image, the Postgres and pgvector versions, the CPU count, the host's memory, the container's memory cap (and `docker inspect`'s view of it), the server settings, the one-minute load average and the I/O pressure from `/proc/pressure/io` before and after, and the numbers. When the load average was at or above half the CPU count, or tasks waited on I/O a tenth of the time or more, the output says `THIS RUN WAS LOADED`. A budget that fails on a loaded machine is rerun when the machine is quieter. The budgets stay as they are.

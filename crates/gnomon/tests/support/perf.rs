@@ -153,11 +153,17 @@ impl Record {
         let mem_total_kib: u64 = std::fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|m| {
-                m.lines()
-                    .find_map(|l| l.strip_prefix("MemTotal:")?.split_whitespace().next()?.parse().ok())
+                m.lines().find_map(|l| {
+                    l.strip_prefix("MemTotal:")?
+                        .split_whitespace()
+                        .next()?
+                        .parse()
+                        .ok()
+                })
             })
             .unwrap_or(0);
-        let container = std::env::var("GNOMON_TEST_CONTAINER_PREFIX").unwrap_or_else(|_| "gnomon-test".into())
+        let container = std::env::var("GNOMON_TEST_CONTAINER_PREFIX")
+            .unwrap_or_else(|_| "gnomon-test".into())
             + "-"
             + &std::env::var("GNOMON_TEST_IMAGE").unwrap_or_else(|_| "pgvector".into());
         let inspected = std::process::Command::new("docker")
@@ -212,20 +218,34 @@ impl Record {
         std::fs::create_dir_all(&dir).unwrap();
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
         let cap = self.environment["container_memory_cap"].as_str().unwrap();
-        let image = self.environment["image"].as_str().unwrap().replace(['/', ':'], "_");
+        let image = self.environment["image"]
+            .as_str()
+            .unwrap()
+            .replace(['/', ':'], "_");
         let path = dir.join(format!("{stamp}-{}-{image}-cap-{cap}.json", self.case));
         std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
         println!("--- performance record: {}", self.case);
-        println!("environment: {}", serde_json::to_string(&self.environment).unwrap());
+        println!(
+            "environment: {}",
+            serde_json::to_string(&self.environment).unwrap()
+        );
         println!(
             "machine load before: {} | io pressure: {}",
             self.before.loadavg,
-            self.before.io_pressure.as_deref().unwrap_or("n/a").replace('\n', " / ")
+            self.before
+                .io_pressure
+                .as_deref()
+                .unwrap_or("n/a")
+                .replace('\n', " / ")
         );
         println!(
             "machine load after:  {} | io pressure: {}",
             after.loadavg,
-            after.io_pressure.as_deref().unwrap_or("n/a").replace('\n', " / ")
+            after
+                .io_pressure
+                .as_deref()
+                .unwrap_or("n/a")
+                .replace('\n', " / ")
         );
         if was_loaded {
             println!(
@@ -245,7 +265,8 @@ impl Record {
 pub struct Dataset {
     pub db: String,
     pub texts: usize,
-    /// Versions the Scope's worker sees at `valid_at` at the current belief.
+    /// Node Versions held at `valid_at` at the current belief: the rows a
+    /// Search over the Scope can reach.
     pub visible: i64,
     pub versions: i64,
 }
@@ -264,7 +285,9 @@ pub fn texts_for_visible(visible: usize) -> usize {
 /// The one Tenant every data set is built for, so a data set found in the
 /// server by a later run belongs to the Tenant that run names.
 fn data_tenant() -> gnomon::TenantId {
-    gnomon::TenantId(uuid::Uuid::from_u128(0x2100_0000_0000_4000_8000_0000_0000_0021))
+    gnomon::TenantId(uuid::Uuid::from_u128(
+        0x2100_0000_0000_4000_8000_0000_0000_0021,
+    ))
 }
 
 fn dataset_name(texts: usize) -> String {
@@ -314,19 +337,16 @@ impl Dataset {
 
     /// The Store's worker connection to the data set.
     pub async fn store(&self) -> gnomon::Store {
-        gnomon::Store::connect(&super::login_url_to(&self.db).await, &super::connect_options())
-            .await
-            .unwrap()
+        gnomon::Store::connect(
+            &super::login_url_to(&self.db).await,
+            &super::connect_options(),
+        )
+        .await
+        .unwrap()
     }
 
     pub fn tenant(&self) -> gnomon::TenantId {
         data_tenant()
-    }
-
-    pub fn claims(&self) -> String {
-        json!({ "role": "gnomon_worker",
-                "app_metadata": { "tenant_id": self.tenant().0.to_string(), "scopes": [SCOPE] } })
-        .to_string()
     }
 
     /// The subtopic centres of the data set, to draw query vectors near.
@@ -344,11 +364,11 @@ impl Dataset {
     pub fn query_for(&self, rng: &mut Rng, centres: &[Vec<f32>]) -> (String, Vec<f32>) {
         let c = rng.below(centres.len());
         let q = rng.near(&centres[c], 0.6);
-        // A word one text holds, as `search.rs`'s smoke check does: a word
-        // every text holds would make the full-text branch score the whole
-        // Scope (migration 0016), as prototype 5 avoided by querying
-        // mid-frequency words.
-        (format!("{}", rng.below(self.texts)), q)
+        // The word is a number that one text holds, as `search.rs`'s smoke
+        // check does. The generated texts have no word-frequency structure,
+        // so this suite cannot query the mid-frequency words prototype 5 did,
+        // and its full-text branch is cheaper than a real vocabulary's.
+        (rng.below(self.texts).to_string(), q)
     }
 }
 
@@ -412,7 +432,7 @@ async fn build(texts: usize, name: &str) {
             .replace("{{dim}}", &DEFAULT_DIMENSION.to_string());
         step += 1;
         let t = std::time::Instant::now();
-        if sql.contains("@@parallel-embeddings@@") {
+        if sql.contains("@@embeddings@@") {
             embeddings(&db, &sql, tenant).await;
         } else if sql.contains("@@index-search-text@@") {
             index_search_text(&db, tenant).await;

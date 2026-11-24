@@ -89,7 +89,7 @@ commit;
 -- @@
 -- @@index-search-text@@
 -- @@
--- @@parallel-embeddings@@
+-- @@embeddings@@
 -- One connection stores the embeddings, in batches of Versions, each as two
 -- statements in one transaction: the full vectors, then the quantized rows,
 -- whose trigger derives its bits from the full vector stored for the hash.
