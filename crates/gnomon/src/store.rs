@@ -2859,7 +2859,7 @@ impl Caller<'_> {
                     (&scope.as_str(), Type::TEXT),
                     (&after.map(|a| a.kind), Type::TEXT),
                     (&after.map(|a| a.id), Type::UUID),
-                    (&after.and_then(|a| a.hash.as_deref()), Type::TEXT),
+                    (&after.and_then(|a| a.text_hash.as_deref()), Type::TEXT),
                     (&limit, Type::INT4),
                 ],
             )

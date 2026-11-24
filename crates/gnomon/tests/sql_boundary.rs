@@ -8537,6 +8537,28 @@ async fn the_gap_listing_names_only_the_callers_tenant_and_scope() {
             Some(&SqlState::INVALID_PARAMETER_VALUE),
             "{role}: a page token of no kind"
         );
+        // A token of an embedding's kind names its text's hash, and one of
+        // another kind names none.
+        for (kind, hash) in [("node_embedding", None), ("sentence", Some("ab"))] {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            let r = tx
+                .query_typed(
+                    "select id from gnomon.list_gaps($1, 'support', $2, $3, $4, 10)",
+                    &[
+                        (&t1, Type::UUID),
+                        (&kind, Type::TEXT),
+                        (&s.e.e1_open, Type::UUID),
+                        (&hash, Type::TEXT),
+                    ],
+                )
+                .await;
+            assert_eq!(
+                r.unwrap_err().code(),
+                Some(&SqlState::INVALID_PARAMETER_VALUE),
+                "{role}: a {kind} token with hash {hash:?}"
+            );
+        }
     }
 }
 

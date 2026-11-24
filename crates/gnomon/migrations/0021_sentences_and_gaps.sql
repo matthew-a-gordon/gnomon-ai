@@ -36,9 +36,13 @@
 -- row of the Scope still uses it. It touches only rows of the stored
 -- Sentence's own Tenant and Scope. No definer and no grant are added.
 --
--- A Sentence is not carried to a new Version. A Refinement, a Correction or
--- an Erasure that recomputes an Edge Version leaves that Version with no
--- Sentence (ADR-0013, migration 0011), and the gap listing below names it.
+-- A Sentence row is not carried to a new Version: migration 0008 keys it by
+-- the Edge Version, and an Erasure deletes the Sentence of every Edge Version
+-- it recomputes (migration 0011). So a Refinement, a Correction, or an
+-- Erasure that reopens or replays an Edge Version leaves that Version with
+-- no Sentence, and the gap listing below names it. A Refinement changes no
+-- Valid time a Sentence states, so the Pipeline stores the same text again,
+-- and its full vector is reused (ADR-0013, migration 0017).
 --
 -- The gaps (`gnomon.list_gaps`). `maintain` finds what is missing in one
 -- Scope and repairs it. The listing is an invoker under RLS, so it reads only
@@ -68,21 +72,25 @@
 --                        open Recorded time (ADR-0015). A Node with no
 --                        current Version, bare or retracted, has nothing to
 --                        summarise.
---   community            A closed Community of the Scope whose group has no
---                        current Summary: no Community of the Scope that
---                        opened at the instant it closed, and no current
---                        Community of the Scope, holds any of its Nodes.
+--   community            A closed Community of the Scope that lost its
+--                        replacement: no Community of the Scope opened at the
+--                        instant it closed, and no current Community of the
+--                        Scope holds any of its Nodes.
 --
 -- Why a Community that lost its replacement is a gap. A Community's text is
--- the Summary of its group. Regenerating it closes the old row and adds the
--- new one at the same instant (migration 0018), so a closed Community always
--- has a successor that opened when it closed, unless an Erasure deleted that
--- successor for citing an erased Episode (ADR-0003). The closed row then
--- stands for a group the graph still holds with no current Summary, which
--- the Pipeline regenerates from the Episodes that remain. A row whose
--- successor stands, closed or open, is ordinary history and is not listed,
--- and nor is one whose Nodes a current Community holds again. An Erasure
--- that removed every row of a Community leaves nothing to list.
+-- its Summary. `gnomon.write_community` closes the Communities it replaces
+-- and adds the new one in one transaction, at one instant (migration 0018),
+-- so a closed Community always has a Community that opened when it closed,
+-- unless an Erasure deleted every Community that transaction wrote for
+-- citing an erased Episode (ADR-0003). The closed row's Nodes then have no
+-- current Community, and the Pipeline regenerates one from the Episodes that
+-- remain. A row whose replacement stands, closed or open, is ordinary
+-- history, whatever Nodes the replacement holds, so a write that regroups
+-- Nodes leaves no gap. Nor is a row listed whose Nodes a current Community
+-- holds again. Two limits follow. An Erasure that removed every row of a
+-- Community leaves nothing to list. And where one transaction replaced
+-- several Communities and an Erasure deleted only some of the new ones, the
+-- old rows still have a replacement that stands and are not listed.
 --
 -- Paging. The order is fixed: by kind as above, then by ID, then by hash in
 -- byte order. A page holds at most the limit, and the next page starts after
@@ -171,7 +179,10 @@ create function gnomon.list_gaps(
     end if;
     if p_after_kind is not null or p_after_id is not null or p_after_hash is not null then
       v_after := pg_catalog.array_position(v_kinds, p_after_kind);
-      if v_after is null or p_after_id is null then
+      -- The kinds of an embedding of a text carry its hash, and the others
+      -- none, so a token names one gap.
+      if v_after is null or p_after_id is null
+         or (p_after_hash is null) = (v_after in (2, 3, 4)) then
         raise exception using errcode = 'invalid_parameter_value',
           message = pg_catalog.format('%s %s %s is not a page token of the gap listing',
                                       p_after_kind, p_after_id, p_after_hash);
@@ -273,13 +284,17 @@ create function gnomon.list_gaps(
          where c.tenant_id = p_tenant_id and c.scope = p_scope
            and c.recorded_to <> 'infinity'
            and not exists (
+             select from gnomon.community r
+             where r.tenant_id = c.tenant_id and r.scope = c.scope
+               and r.recorded_from = c.recorded_to)
+           and not exists (
              select from gnomon.community_member cm
              join gnomon.community_member rm
                on rm.tenant_id = cm.tenant_id and rm.scope = cm.scope and rm.node_id = cm.node_id
              join gnomon.community r
                on r.tenant_id = rm.tenant_id and r.scope = rm.scope and r.id = rm.community_id
              where cm.tenant_id = c.tenant_id and cm.scope = c.scope and cm.community_id = c.id
-               and (r.recorded_from = c.recorded_to or r.recorded_to = 'infinity'))
+               and r.recorded_to = 'infinity')
            and (v_after < 8 or v_after = 8 and c.id > v_id)
          order by c.id
          limit p_limit)

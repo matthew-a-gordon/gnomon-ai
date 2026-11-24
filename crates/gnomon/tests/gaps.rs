@@ -408,7 +408,7 @@ fn communities(gaps: Vec<Gap>) -> Vec<Gap> {
 }
 
 #[tokio::test]
-async fn a_community_whose_replacement_an_erasure_removed_is_listed_until_its_group_is_regenerated()
+async fn a_community_whose_replacement_an_erasure_removed_is_listed_until_its_nodes_have_one_again()
 {
     let w = World::new().await;
     let f = w.episode(at(2024, 1, 1), None).await;
@@ -440,8 +440,28 @@ async fn a_community_whose_replacement_an_erasure_removed_is_listed_until_its_gr
         vec![Gap::Community { community: c2 }]
     );
 
-    // Regenerated, the group has a current Community again.
+    // Written again, its Nodes have a current Community.
     community(&w, vec![], vec![acme, bob], f).await;
+    assert_eq!(communities(gaps(&w).await), vec![]);
+
+    // A write that regroups Nodes leaves no gap, though the Nodes it drops
+    // are in no current Community: the Community it closed has a
+    // replacement.
+    let regrouped = community(&w, vec![], vec![ada], f).await;
+    let current = w
+        .caller()
+        .read_communities(w.tenant, acme, AsOf::current(at(2024, 6, 1)))
+        .await
+        .unwrap();
+    let mut replaces: Vec<CommunityId> = current.iter().map(|c| c.id).collect();
+    replaces.push(regrouped);
+    community(&w, replaces, vec![bob], f).await;
+    assert!(w
+        .caller()
+        .read_communities(w.tenant, ada, AsOf::current(at(2024, 6, 1)))
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(communities(gaps(&w).await), vec![]);
 }
 

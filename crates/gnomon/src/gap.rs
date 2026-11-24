@@ -4,14 +4,16 @@
 //! Edge Versions without a Sentence, the search texts without an embedding
 //! (Node Versions' texts, current names and Aliases, Sentences, Summaries and
 //! Communities), and the Nodes and Communities without a current Summary. A
-//! Refinement or an Erasure that recomputes an Edge Version leaves that
-//! Version with no Sentence (ADR-0013), so it is listed again.
+//! Sentence is held per Edge Version, so a Refinement or an Erasure that
+//! recomputes an Edge Version leaves that Version with no Sentence, and it
+//! is listed again.
 //!
 //! The listing is paged by key. Its order is fixed: by kind, in the order of
-//! the variants of [`Gap`], then by ID and text hash. A [`GapCursor`] is the
-//! key of the last gap of a page, and the next page starts after it. A gap's
-//! key never changes while it is listed, so a gap that is there on every
-//! call is listed exactly once however the set changes between pages.
+//! the variants of [`Gap`], then by ID and text hash. A [`GapCursor`], the
+//! page token, is the key of the last gap of a page, and the next page
+//! starts after it. A gap's key never changes while it is listed, so a gap
+//! that is there on every call is listed exactly once however the set
+//! changes between pages.
 
 use uuid::Uuid;
 
@@ -50,9 +52,10 @@ pub enum Gap {
     /// A Node of the Scope with a current Version and no current Summary
     /// in the Scope.
     Summary { node: NodeId },
-    /// A closed Community whose group has no current Summary: an Erasure
-    /// removed the Community that replaced it, and no current Community
-    /// holds any of its Nodes. The Pipeline regenerates the group.
+    /// A closed Community that lost its replacement: an Erasure removed
+    /// every Community written when it closed, and no current Community
+    /// holds any of its Nodes. The Pipeline writes a Community of them
+    /// again.
     Community { community: CommunityId },
 }
 
@@ -78,18 +81,18 @@ impl Gap {
         GapCursor {
             kind,
             id,
-            hash: hash.cloned(),
+            text_hash: hash.cloned(),
         }
     }
 }
 
-/// The key of a gap, after which the next page starts. It is the gap's
-/// kind, ID and text hash.
+/// The page token of the gap listing: the key of a gap, after which the
+/// next page starts. It is the gap's kind, ID and text hash.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GapCursor {
     pub(crate) kind: &'static str,
     pub(crate) id: Uuid,
-    pub(crate) hash: Option<String>,
+    pub(crate) text_hash: Option<String>,
 }
 
 /// One page of the gap listing.
