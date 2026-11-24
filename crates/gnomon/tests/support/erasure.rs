@@ -845,8 +845,9 @@ async fn assert_tokens_derived_anew(admin: &Client, residue: &Residue<'_>) {
 }
 
 /// Checks that the BM25 counts, read past RLS, are those the token rows give
-/// when counted again: each Scope's Versions per word, and its Versions and
-/// words. No committed transaction leaves a change to them behind.
+/// when counted again: each Scope's texts per word, and its texts and words.
+/// The texts are Versions' and, since migration 0020, Summaries' and
+/// Communities'. No committed transaction leaves a change to them behind.
 pub async fn assert_search_counts_match_the_token_rows(admin: &Client) {
     let left: i64 = admin
         .query_typed("select count(*) from gnomon.search_count_delta", &[])
@@ -857,13 +858,20 @@ pub async fn assert_search_counts_match_the_token_rows(admin: &Client) {
     for (stored, recounted, what) in [
         (
             "select scope, token, versions from gnomon.search_token_frequency",
-            "select scope, token, count(*) from gnomon.search_token group by 1, 2",
+            "select scope, token, count(*)
+             from (select scope, token from gnomon.search_token
+                   union all
+                   select scope, token from gnomon.derived_search_token) t
+             group by 1, 2",
             "the document frequencies",
         ),
         (
             "select scope, versions::text, words from gnomon.search_scope_length",
             "select scope, count(*)::text, sum(dl)::bigint
-             from (select distinct scope, version_id, dl from gnomon.search_token) d group by 1",
+             from (select distinct scope, version_id, dl from gnomon.search_token
+                   union all
+                   select distinct scope, derived_id, dl from gnomon.derived_search_token) d
+             group by 1",
             "the Scope totals",
         ),
     ] {

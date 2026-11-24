@@ -45,6 +45,7 @@ use crate::{
     StatementKind, Step, Summary, SummaryId, TenantId, Traversal, VacuumMode, VacuumReport,
     ValidTime, VectorCandidate, VectorNameMatch, VersionId, Versioned, WriteOutcome, WriteStatus,
 };
+use crate::{BranchRank, SearchHit, SearchRequest, SearchResult, SignalRank};
 
 /// How many times a write is retried when Postgres fails it with a
 /// serialization failure or a deadlock, which a write to a Node that a
@@ -2599,4 +2600,185 @@ fn derived_citations(row: &Row, at: usize) -> Vec<DerivedCitation> {
             place,
         })
         .collect()
+}
+
+/// Search (ADR-0010, migration 0020).
+impl Caller<'_> {
+    /// Search: one fused, ranked list of the Versions, Summaries and
+    /// Communities that match `request` As-of its instants, best first, at most
+    /// `limit` of them.
+    ///
+    /// Three branches find candidates: the vector branch, when the query
+    /// carries an embedding, the full-text branch, and the neighbourhood
+    /// branch, which follows the Edges of the request's seed Nodes, or of the
+    /// ten Nodes the other two branches rank best when it names none, to
+    /// depth 1 or 2, at most 50 Edges per Node, the most-mentioned first.
+    /// Reciprocal rank fusion with k = 60 combines each branch's best 100, or
+    /// `limit` when that is more. Two graph signals then reorder the fused
+    /// candidates: mentions, the Episodes citing a candidate, and
+    /// connectedness, the Edges joining the Nodes it is about. Both are
+    /// counted at search time over the rows the caller can see at the As-of
+    /// instants, and neither adds a candidate. A Summary or Community is
+    /// found only when its Recorded time contains the known-at instant and
+    /// the valid-at instant is on or after the one it was written for
+    /// (ADR-0015).
+    ///
+    /// Each result reports where each branch and signal ranked it.
+    ///
+    /// A `limit` below 1, a depth other than 1 or 2, a weight below 0 or not
+    /// finite, or an embedding that [`store_embedding`](Self::store_embedding)
+    /// would refuse fails with [`Error::Database`] and SQLSTATE 22023.
+    pub async fn search(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        request: &SearchRequest<'_>,
+        limit: i32,
+    ) -> Result<Vec<SearchResult>, Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant.into()).await?;
+        let embedding: Option<Vec<f32>> = request.embedding.map(<[f32]>::to_vec);
+        let seeds: Vec<uuid::Uuid> = request.seeds.iter().map(|n| n.0).collect();
+        let w = &request.weights;
+        let rows = self
+            .store
+            .statements
+            .query(
+                &tx,
+                "select kind, id, node_id, edge_id, scope, score, rank,
+                        vector_distance, vector_rank, full_text_score, full_text_rank,
+                        neighbourhood_depth, neighbourhood_rank, mentions, mentions_rank,
+                        connectedness, connectedness_rank
+                 from gnomon.search($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&request.text, Type::TEXT),
+                    (&embedding, Type::FLOAT4_ARRAY),
+                    (&request.as_of.valid_at, Type::TIMESTAMPTZ),
+                    (&request.as_of.known_at, Type::TIMESTAMPTZ),
+                    (&seeds, Type::UUID_ARRAY),
+                    (&request.depth, Type::INT4),
+                    (&w.vector, Type::FLOAT8),
+                    (&w.full_text, Type::FLOAT8),
+                    (&w.neighbourhood, Type::FLOAT8),
+                    (&w.mentions, Type::FLOAT8),
+                    (&w.connectedness, Type::FLOAT8),
+                    (&limit, Type::INT4),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        tx.commit().await?;
+        Ok(rows.iter().map(search_result).collect())
+    }
+
+    /// Stores the embedding of a Summary's text, after the write that made
+    /// it committed, for the vector branch of [`search`](Self::search). A
+    /// Summary's text never changes, so its first embedding stays and a
+    /// second call does not use `embedding`. A Summary the caller cannot see
+    /// fails with [`Error::InvalidWrite`], and an `embedding` that
+    /// [`store_embedding`](Self::store_embedding) would refuse with
+    /// [`Error::Database`] and SQLSTATE 22023.
+    pub async fn store_summary_embedding(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        summary: SummaryId,
+        embedding: &[f32],
+    ) -> Result<(), Error> {
+        self.store_derived_embedding(
+            tenant.into(),
+            "select gnomon.store_summary_embedding($1, $2, $3)",
+            summary.0,
+            embedding,
+        )
+            .await
+    }
+
+    /// Stores the embedding of a Community's text, as
+    /// [`store_summary_embedding`](Self::store_summary_embedding) stores a
+    /// Summary's.
+    pub async fn store_community_embedding(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        community: CommunityId,
+        embedding: &[f32],
+    ) -> Result<(), Error> {
+        self.store_derived_embedding(
+            tenant.into(),
+            "select gnomon.store_community_embedding($1, $2, $3)",
+            community.0,
+            embedding,
+        )
+        .await
+    }
+
+    async fn store_derived_embedding(
+        &self,
+        tenant: Option<TenantId>,
+        sql: &'static str,
+        id: uuid::Uuid,
+        embedding: &[f32],
+    ) -> Result<(), Error> {
+        let mut client = self.store.client.lock().await;
+        let (tx, tenant) = self.begin(&mut client, tenant).await?;
+        self.store
+            .statements
+            .query(
+                &tx,
+                sql,
+                &[
+                    (&tenant.0, Type::UUID),
+                    (&id, Type::UUID),
+                    (&embedding, Type::FLOAT4_ARRAY),
+                ],
+            )
+            .await
+            .map_err(Error::from_store)?;
+        tx.commit().await.map_err(Error::from_store)?;
+        Ok(())
+    }
+}
+
+fn search_result(r: &Row) -> SearchResult {
+    let id: uuid::Uuid = r.get(1);
+    let node: Option<uuid::Uuid> = r.get(2);
+    let hit = match r.get::<_, &str>(0) {
+        "summary" => SearchHit::Summary {
+            summary: SummaryId(id),
+            node: NodeId(node.expect("a Summary describes a Node")),
+        },
+        "community" => SearchHit::Community(CommunityId(id)),
+        "version" => SearchHit::Version {
+            version: VersionId(id),
+            of: match node {
+                Some(node) => Versioned::Node(NodeId(node)),
+                None => Versioned::Edge(EdgeId(r.get(3))),
+            },
+        },
+        other => unreachable!("gnomon.search returns no {other} results"),
+    };
+    let branch = |value: usize, rank: usize| {
+        r.get::<_, Option<i64>>(rank).map(|rank| BranchRank {
+            value: r.get::<_, f64>(value),
+            rank,
+        })
+    };
+    SearchResult {
+        hit,
+        scope: Scope::new(r.get::<_, String>(4)),
+        score: r.get(5),
+        rank: r.get(6),
+        vector: branch(7, 8),
+        full_text: branch(9, 10),
+        neighbourhood: r
+            .get::<_, Option<i64>>(12)
+            .map(|rank| BranchRank { value: r.get(11), rank }),
+        mentions: SignalRank {
+            count: r.get(13),
+            rank: r.get(14),
+        },
+        connectedness: SignalRank {
+            count: r.get(15),
+            rank: r.get(16),
+        },
+    }
 }

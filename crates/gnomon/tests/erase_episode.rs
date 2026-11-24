@@ -223,6 +223,22 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .write_community(w.tenant, &community(vec![c], "Acme".into(), vec![f]))
         .await
         .unwrap();
+    // Each is embedded for Search (migration 0020), and each has token rows
+    // of its text, E's marker among them for the two that cite E.
+    for (i, id) in [e_summary, f_summary].into_iter().enumerate() {
+        let v = support::vectors::Rng::new(40 + i as u64).unit();
+        w.caller()
+            .store_summary_embedding(w.tenant, id, &v)
+            .await
+            .unwrap();
+    }
+    for (i, id) in [e_community, f_community].into_iter().enumerate() {
+        let v = support::vectors::Rng::new(50 + i as u64).unit();
+        w.caller()
+            .store_community_embedding(w.tenant, id, &v)
+            .await
+            .unwrap();
+    }
     // Last, E is retracted, which marks it and retracts what only it cites.
     w.caller().retract_episode(w.tenant, e).await.unwrap();
 
@@ -263,6 +279,15 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .unwrap()[0]
         .get(0);
     assert!(marked >= 2, "E's words are indexed: {marked}");
+    let marked: i64 = admin
+        .query_typed(
+            "select count(*) from gnomon.derived_search_token where strpos(token, $1) > 0",
+            &[(&MARKER, Type::TEXT)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert!(marked >= 2, "the words of E's Summary and Community are indexed: {marked}");
     // E's Alias of a is in name rows with bits, which Resolution finds.
     let alias = format!("{MARKER}-alias");
     let resolved = |text: String| {
@@ -354,6 +379,31 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .unwrap()[0]
         .get(0);
     assert_eq!(members, 0, "the erased Community's members stand");
+    // Their Search rows go with them, and those of the rows that cite F
+    // alone stand.
+    for (column, gone, kept) in [
+        ("summary_id", e_summary.0, f_summary.0),
+        ("community_id", e_community.0, f_community.0),
+    ] {
+        for table in ["derived_search_token", "derived_embedding"] {
+            let count = |id: Uuid| {
+                let admin = &admin;
+                async move {
+                    admin
+                        .query_typed(
+                            &format!("select count(*) from gnomon.{table} where {column} = $1"),
+                            &[(&id, Type::UUID)],
+                        )
+                        .await
+                        .unwrap()[0]
+                        .get::<_, i64>(0)
+                }
+            };
+            assert_eq!(count(gone).await, 0, "{table} keeps rows of {gone}");
+            assert!(count(kept).await > 0, "{table} lost the rows of {kept}");
+        }
+    }
+    support::erasure::assert_search_counts_match_the_token_rows(&admin).await;
     assert!(w.stage_records_of(SCOPE, e).await.is_empty());
     assert_eq!(w.stage_records_of(SCOPE, f).await, f_stages);
 

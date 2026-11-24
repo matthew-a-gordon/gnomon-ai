@@ -2061,7 +2061,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         )
         .await
         .unwrap();
-    single
+    let community = single
         .write_community(
             None,
             &gnomon::NewCommunity {
@@ -2073,6 +2073,12 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
                 citations: vec![gnomon::DerivedCitation::of(episode)],
             },
         )
+        .await
+        .unwrap();
+    // Its embedding, for Search (migration 0020). Its token rows and the
+    // Summary's are written with them.
+    single
+        .store_community_embedding(None, community, &support::vectors::Rng::new(8).unit())
         .await
         .unwrap();
     let tables = tenant_tables(&operator).await;
@@ -2099,6 +2105,8 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         "community",
         "community_member",
         "community_citation",
+        "derived_search_token",
+        "derived_embedding",
     ] {
         assert!(
             tables.iter().any(|t| t == expected),
@@ -7377,4 +7385,548 @@ async fn callers_hold_only_select_and_a_bits_update_on_the_name_table_and_the_de
             ),
         ]
     );
+}
+
+// Search (ADR-0010, migration 0020). The fused call, its token rows and
+// embeddings of Summaries and Communities, and its graph signals run as the
+// caller under RLS. No caller writes a token row, and an embedding row a
+// caller inserts is derived from the stored row whatever it supplied.
+
+/// The token rows and embeddings of Summaries and Communities.
+const DERIVED_SEARCH_TABLES: &[&str] = &["derived_search_token", "derived_embedding"];
+
+/// `searchable_world()` with a Summary and a Community of each Scope's Node,
+/// "zebra summary <scope>" and "zebra community <scope>", each citing the
+/// Scope's Episode and embedded by the Scope's worker, and a Summary of
+/// Tenant 1's `support` Node with no embedding.
+struct DerivedWorld {
+    w: World,
+    /// Tenant 1's rows: its `support` Summary, its `billing` Summary and
+    /// Community, and Tenant 2's `support` Summary.
+    support_summary: Uuid,
+    unembedded_summary: Uuid,
+    billing_summary: Uuid,
+    billing_community: Uuid,
+    other_tenant_summary: Uuid,
+    support_node: Uuid,
+}
+
+async fn derived_world() -> DerivedWorld {
+    let w = searchable_world().await;
+    let store = Store::connect(&w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let admin = w.db.admin().await;
+    let mut rng = support::vectors::Rng::new(23);
+    let mut summaries = std::collections::HashMap::new();
+    let mut communities = std::collections::HashMap::new();
+    let mut nodes = std::collections::HashMap::new();
+    for row in admin
+        .query_typed(
+            "select n.tenant_id, n.scope, n.id, e.id from gnomon.node n
+             join gnomon.episode e on e.tenant_id = n.tenant_id and e.scope = n.scope",
+            &[],
+        )
+        .await
+        .unwrap()
+    {
+        let (tenant, scope, node, episode): (Uuid, String, Uuid, Uuid) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
+        let caller = store.as_worker(TenantId(tenant), Scope::new(scope.clone()));
+        let at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let summary = caller
+            .write_summary(
+                TenantId(tenant),
+                &gnomon::NewSummary {
+                    scope: Scope::new(scope.clone()),
+                    node: gnomon::NodeId(node),
+                    content: format!("zebra summary {scope}"),
+                    as_of_valid: at,
+                    citations: vec![gnomon::DerivedCitation::of(EpisodeId(episode))],
+                },
+            )
+            .await
+            .unwrap();
+        let community = caller
+            .write_community(
+                TenantId(tenant),
+                &gnomon::NewCommunity {
+                    scope: Scope::new(scope.clone()),
+                    replaces: vec![],
+                    members: vec![gnomon::NodeId(node)],
+                    content: format!("zebra community {scope}"),
+                    as_of_valid: at,
+                    citations: vec![gnomon::DerivedCitation::of(EpisodeId(episode))],
+                },
+            )
+            .await
+            .unwrap();
+        caller
+            .store_summary_embedding(TenantId(tenant), summary, &rng.unit())
+            .await
+            .unwrap();
+        caller
+            .store_community_embedding(TenantId(tenant), community, &rng.unit())
+            .await
+            .unwrap();
+        summaries.insert((tenant, scope.clone()), summary.0);
+        communities.insert((tenant, scope.clone()), community.0);
+        nodes.insert((tenant, scope), node);
+    }
+    let support_node = nodes[&(w.t1, "support".to_owned())];
+    // A second Node in Tenant 1's `support`, with a Summary and no embedding.
+    let (other, _) = store
+        .as_worker(TenantId(w.t1), Scope::new("support"))
+        .create_node(
+            &gnomon::NewNode {
+                tenant: Some(TenantId(w.t1)),
+                scope: Scope::new("support"),
+                kind: gnomon::ROOT_NODE_KIND.into(),
+            },
+            &gnomon::Patch::new(
+                EpisodeId(w.t1_support),
+                gnomon::ValidTime::UNKNOWN,
+                support::erasure::values(json!({ "name": "plain" })),
+            ),
+        )
+        .await
+        .unwrap();
+    let unembedded = store
+        .as_worker(TenantId(w.t1), Scope::new("support"))
+        .write_summary(
+            TenantId(w.t1),
+            &gnomon::NewSummary {
+                scope: Scope::new("support"),
+                node: other,
+                content: "plain prose".into(),
+                as_of_valid: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                citations: vec![gnomon::DerivedCitation::of(EpisodeId(w.t1_support))],
+            },
+        )
+        .await
+        .unwrap();
+    DerivedWorld {
+        support_summary: summaries[&(w.t1, "support".to_owned())],
+        unembedded_summary: unembedded.0,
+        billing_summary: summaries[&(w.t1, "billing".to_owned())],
+        billing_community: communities[&(w.t1, "billing".to_owned())],
+        other_tenant_summary: summaries[&(w.t2, "support".to_owned())],
+        support_node,
+        w,
+    }
+}
+
+async fn derived_search_rows(db: &TestDb) -> Vec<String> {
+    let tables: Vec<String> = DERIVED_SEARCH_TABLES.iter().map(|t| t.to_string()).collect();
+    support::erasure::rows_of(&db.admin().await, &tables).await
+}
+
+/// `gnomon.search` as SQL, at valid-at 2025-01-01, reading the current
+/// belief, with the default seeds, depth and weights.
+fn search_sql(query_vector: &str) -> String {
+    format!(
+        "select kind, id, scope, score, rank, vector_rank, full_text_rank, neighbourhood_rank,
+                mentions, mentions_rank, connectedness, connectedness_rank
+         from gnomon.search($1, 'zebra', {query_vector}, '2025-01-01', null, null, null,
+                            null, null, null, null, null, 50)"
+    )
+}
+
+#[tokio::test]
+async fn a_caller_reads_only_its_own_tenants_and_scopes_summary_search_rows_and_searches_only_them(
+) {
+    let dw = derived_world().await;
+    let w = &dw.w;
+    let search = search_sql(&sql_vector());
+    for role in [USER, WORKER] {
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
+        for table in DERIVED_SEARCH_TABLES {
+            let seen: Vec<(Uuid, String)> = tx
+                .query_typed(
+                    &format!("select distinct tenant_id, scope from gnomon.{table}"),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| (r.get(0), r.get(1)))
+                .collect();
+            assert_eq!(
+                seen,
+                vec![(w.t1, "support".to_owned())],
+                "{role} read gnomon.{table}"
+            );
+        }
+        // Search finds Versions, Summaries and Communities of the caller's
+        // own Scope only, and nothing when it names the other Tenant.
+        for (tenant, expected) in [(w.t1, vec!["support".to_owned()]), (w.t2, vec![])] {
+            let rows = tx.query_typed(&search, &[(&tenant, Type::UUID)]).await.unwrap();
+            let mut scopes: Vec<String> = rows.iter().map(|r| r.get(2)).collect();
+            scopes.dedup();
+            assert_eq!(scopes, expected, "{role} searched in {tenant}");
+            if tenant == w.t1 {
+                let mut kinds: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+                kinds.sort();
+                kinds.dedup();
+                assert_eq!(kinds, ["community", "summary", "version"], "{role}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_caller_cannot_write_the_summary_search_rows_or_forge_an_embedding_of_one() {
+    let dw = derived_world().await;
+    let w = &dw.w;
+    let before = derived_search_rows(&w.db).await;
+    let (t1, t2) = (w.t1, w.t2);
+    let (own, billing, billing_community, other_tenant) = (
+        dw.support_summary,
+        dw.billing_summary,
+        dw.billing_community,
+        dw.other_tenant_summary,
+    );
+    let v = sql_vector();
+    let dim = support::vectors::DIM;
+    let embedding_row = |tenant: Uuid, scope: &str, summary: Uuid| {
+        format!(
+            "insert into gnomon.derived_embedding (tenant_id, scope, summary_id, embedding, q,
+                                                   as_of_valid, recorded_from, recorded_to)
+             values ('{tenant}', '{scope}', '{summary}', gnomon.embedding_vector({v}),
+                     repeat('1', {dim})::bit({dim}), '-infinity', '-infinity', 'infinity')"
+        )
+    };
+    let attempts = [
+        // Token rows, in the caller's own Scope, another Scope and another
+        // Tenant: callers hold no INSERT.
+        format!(
+            "insert into gnomon.derived_search_token (tenant_id, scope, token, summary_id, tf, dl)
+             values ('{t1}', 'support', 'forged', '{own}', 1, 1)"
+        ),
+        format!(
+            "insert into gnomon.derived_search_token (tenant_id, scope, token, summary_id, tf, dl)
+             values ('{t1}', 'billing', 'forged', '{billing}', 1, 1)"
+        ),
+        format!(
+            "insert into gnomon.derived_search_token (tenant_id, scope, token, summary_id, tf, dl)
+             values ('{t2}', 'support', 'forged', '{other_tenant}', 1, 1)"
+        ),
+        "update gnomon.derived_search_token set tf = tf + 1".to_owned(),
+        "delete from gnomon.derived_search_token".to_owned(),
+        "truncate gnomon.derived_search_token".to_owned(),
+        // An embedding row of another Scope's or Tenant's Summary, and of the
+        // caller's own Summary in another Scope.
+        embedding_row(t1, "billing", billing),
+        embedding_row(t2, "support", other_tenant),
+        embedding_row(t1, "support", billing),
+        // What only the Store derives, and what only Erasure deletes.
+        "update gnomon.derived_embedding set recorded_to = '2001-01-01'".to_owned(),
+        "update gnomon.derived_embedding set q = ~q".to_owned(),
+        "update gnomon.derived_embedding set embedding = embedding".to_owned(),
+        "delete from gnomon.derived_embedding".to_owned(),
+        "truncate gnomon.derived_embedding".to_owned(),
+        // The Store's functions, for another Scope's or Tenant's rows.
+        format!("select gnomon.store_summary_embedding('{t1}', '{billing}', {v})"),
+        format!("select gnomon.store_community_embedding('{t1}', '{billing_community}', {v})"),
+        format!("select gnomon.store_summary_embedding('{t2}', '{other_tenant}', {v})"),
+        format!("select gnomon.store_summary_embedding('{t1}', '{other_tenant}', {v})"),
+        // The function that derives the token rows, called directly, and the
+        // search index trigger attached to a table of the caller's own.
+        format!("select * from gnomon.derived_text_tokens('{t1}', 'summary', array['{own}'::uuid])"),
+        "create temp table mine (id uuid, tenant_id uuid);
+         create trigger mine after insert on mine referencing new table as changed
+           for each statement execute function gnomon.maintain_search_index()"
+            .to_owned(),
+    ];
+    for role in [USER, WORKER] {
+        for sql in &attempts {
+            let through_a_trigger = format!(
+                "create temp table pulled (i int);
+                 create function pg_temp.pull() returns trigger language plpgsql as $f$
+                 begin
+                   execute $q${sql}$q$;
+                   return null;
+                 end $f$;
+                 create trigger pull after insert on pulled
+                   for each statement execute function pg_temp.pull();
+                 insert into pulled values (1);"
+            );
+            for attempt in [sql.clone(), through_a_trigger] {
+                let mut client = w.db.login().await;
+                let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+                assert_refused_write(
+                    tx.batch_execute(&attempt).await,
+                    &format!("{role}: {attempt}"),
+                );
+            }
+        }
+    }
+    assert_eq!(derived_search_rows(&w.db).await, before);
+
+    // An embedding row a caller inserts for its own Summary holds the bits
+    // of its own vector and the Summary's time columns, whatever it supplied.
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    tx.batch_execute(&embedding_row(t1, "support", dw.unembedded_summary))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let admin = w.db.admin().await;
+    let ext: String = admin
+        .query_typed(
+            "select n.nspname::text from pg_extension e
+             join pg_namespace n on n.oid = e.extnamespace where e.extname = 'vector'",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let dim = support::vectors::DIM;
+    let row = admin
+        .query_typed(
+            &format!(
+                "select d.q = {}.binary_quantize(d.embedding)::bit({dim}),
+                        d.as_of_valid = s.as_of_valid, d.recorded_from = s.recorded_from,
+                        d.recorded_to = s.recorded_to
+                 from gnomon.derived_embedding d
+                 join gnomon.summary s on s.id = d.summary_id
+                 where d.summary_id = $1",
+                support::quote_ident(&ext)
+            ),
+            &[(&dw.unembedded_summary, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    let (bits, valid, from, to): (bool, bool, bool, bool) =
+        (row[0].get(0), row[0].get(1), row[0].get(2), row[0].get(3));
+    assert!(bits, "the bits are those of the caller's own vector");
+    assert!(valid && from && to, "the time columns are the Summary's");
+}
+
+#[tokio::test]
+async fn callers_hold_only_select_on_the_summary_token_rows_and_select_and_insert_on_their_embeddings(
+) {
+    let w = world().await;
+    let admin = w.db.admin().await;
+    for (table, caller, definer) in [
+        ("gnomon.derived_search_token", vec!["SELECT"], vec!["SELECT", "INSERT", "DELETE"]),
+        ("gnomon.derived_embedding", vec!["SELECT", "INSERT"], vec!["SELECT", "DELETE"]),
+    ] {
+        for role in [
+            USER,
+            WORKER,
+            support::LOGIN_ROLE,
+            "gnomon_definer",
+            "gnomon_maintainer",
+        ] {
+            let privileges: Vec<String> = admin
+                .query_typed(
+                    "select p from unnest(array['SELECT', 'INSERT', 'UPDATE', 'DELETE',
+                                              'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']) p
+                     where has_table_privilege($1, $2::regclass, p)
+                     union all
+                     select 'UPDATE (' || a.attname || ')'
+                     from pg_attribute a
+                     where a.attrelid = $2::regclass and a.attnum > 0 and not a.attisdropped
+                       and has_column_privilege($1, a.attrelid, a.attnum, 'UPDATE')",
+                    &[(&role, Type::TEXT), (&table, Type::TEXT)],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            let expected = match role {
+                r if r == support::LOGIN_ROLE => vec![],
+                "gnomon_definer" => definer.clone(),
+                "gnomon_maintainer" => vec!["MAINTAIN"],
+                _ => caller.clone(),
+            };
+            assert_eq!(privileges, expected, "{role} on {table}");
+        }
+    }
+    // Callers reach Search through its functions, and no caller runs the
+    // functions that derive the token rows or an embedding row's bits.
+    for (function, callers_may) in [
+        ("gnomon.search(uuid, text, real[], timestamptz, timestamptz, uuid[], integer, \
+          double precision, double precision, double precision, double precision, \
+          double precision, integer)", true),
+        ("gnomon.store_summary_embedding(uuid, uuid, real[])", true),
+        ("gnomon.store_community_embedding(uuid, uuid, real[])", true),
+        ("gnomon.search_neighbourhood(uuid, uuid[], integer, timestamptz, timestamptz, integer)", true),
+        ("gnomon.derived_text_tokens(uuid, text, uuid[])", false),
+        ("gnomon.derived_embedding_derive()", false),
+        ("gnomon.maintain_search_index()", false),
+    ] {
+        for role in [USER, WORKER] {
+            let may: bool = admin
+                .query_typed(
+                    "select has_function_privilege($1, $2, 'EXECUTE')",
+                    &[(&role, Type::TEXT), (&function, Type::TEXT)],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+            assert_eq!(may, callers_may, "{role} may execute {function}");
+        }
+    }
+    // The search index trigger is still the one definer that writes the
+    // search tables, owned by the definer role.
+    let owner: String = admin
+        .query_typed(
+            "select p.proowner::regrole::text from pg_proc p
+             where p.oid = 'gnomon.maintain_search_index()'::regprocedure and p.prosecdef",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(owner, "gnomon_definer");
+    // The callers' only policy is their Tenant and Scopes. The definer's
+    // reach reads and deletes the rows of a Summary the running Erasure
+    // reaches.
+    for table in DERIVED_SEARCH_TABLES {
+        let policies: Vec<(String, Vec<String>, String)> = admin
+            .query_typed(
+                "select policyname::text, array(select r::text from unnest(roles) r order by 1),
+                        cmd::text
+                 from pg_policies
+                 where schemaname = 'gnomon' and tablename = $1 order by 1",
+                &[(table, Type::TEXT)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect();
+        let definer = vec!["gnomon_definer".to_owned()];
+        assert_eq!(
+            policies,
+            vec![
+                (format!("{table}_erasure_reach_delete"), definer.clone(), "DELETE".to_owned()),
+                (format!("{table}_erasure_reach_read"), definer, "SELECT".to_owned()),
+                (
+                    format!("{table}_tenant_scope"),
+                    vec![
+                        "authenticated".to_owned(),
+                        "gnomon_definer".to_owned(),
+                        "gnomon_worker".to_owned()
+                    ],
+                    "ALL".to_owned()
+                ),
+            ],
+            "gnomon.{table}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_episode_edge_or_summary_of_a_scope_the_caller_cannot_see_changes_no_ranking_of_search(
+) {
+    let dw = derived_world().await;
+    let w = &dw.w;
+    let search = search_sql(&sql_vector());
+    let ranked = |scopes: &'static [&'static str]| {
+        let w = w;
+        let search = &search;
+        async move {
+            let mut client = w.db.login().await;
+            let tx = as_caller(&mut client, USER, &claims(w.t1, scopes)).await;
+            let rows = tx.query_typed(search, &[(&w.t1, Type::UUID)]).await.unwrap();
+            rows.iter()
+                .map(|r| {
+                    format!(
+                        "{} {} {} {:?} {} {:?} {:?} {:?} {} {:?} {} {:?}",
+                        r.get::<_, String>(0),
+                        r.get::<_, Uuid>(1),
+                        r.get::<_, String>(2),
+                        r.get::<_, f64>(3).to_bits(),
+                        r.get::<_, i64>(4),
+                        r.get::<_, Option<i64>>(5),
+                        r.get::<_, Option<i64>>(6),
+                        r.get::<_, Option<i64>>(7),
+                        r.get::<_, i64>(8),
+                        r.get::<_, Option<i64>>(9),
+                        r.get::<_, i64>(10),
+                        r.get::<_, Option<i64>>(11),
+                    )
+                })
+                .collect::<Vec<String>>()
+        }
+    };
+    let before = ranked(&["support"]).await;
+    let both_before = ranked(&["support", "billing"]).await;
+    assert!(!before.is_empty());
+
+    // In `billing`, which the caller cannot see: three Episodes, each the
+    // source of an Edge from the caller's `support` Node to a `billing` Node,
+    // and of another Summary of the `support` Node, written by a user who
+    // sees both Scopes.
+    let store = Store::connect(&w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let t1 = TenantId(w.t1);
+    let both = store.as_user(support::erasure::values(json!({
+        "role": "authenticated",
+        "app_metadata": { "tenant_id": w.t1.to_string(), "scopes": ["support", "billing"] }
+    })));
+    let mut episodes = vec![];
+    for i in 0..3 {
+        let e = both
+            .record_episode(&NewEpisode {
+                tenant: Some(t1),
+                scope: Scope::new("billing"),
+                content: format!("hidden {i}"),
+                reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                authority: None,
+            })
+            .await
+            .unwrap();
+        episodes.push(e);
+        let (far, _) = both
+            .create_node(
+                &gnomon::NewNode {
+                    tenant: Some(t1),
+                    scope: Scope::new("billing"),
+                    kind: gnomon::ROOT_NODE_KIND.into(),
+                },
+                &gnomon::Patch::new(
+                    e,
+                    gnomon::ValidTime::UNKNOWN,
+                    support::erasure::values(json!({ "name": format!("far {i}") })),
+                ),
+            )
+            .await
+            .unwrap();
+        both.create_edge(
+            &gnomon::NewEdge {
+                tenant: Some(t1),
+                scope: Scope::new("billing"),
+                kind: gnomon::ROOT_EDGE_KIND.into(),
+                source: gnomon::NodeId(dw.support_node),
+                target: far,
+            },
+            &gnomon::Patch::new(e, gnomon::ValidTime::UNKNOWN, serde_json::Map::new()),
+        )
+        .await
+        .unwrap();
+    }
+    both.write_summary(
+        t1,
+        &gnomon::NewSummary {
+            scope: Scope::new("billing"),
+            node: gnomon::NodeId(dw.support_node),
+            content: "zebra zebra, as billing tells it".into(),
+            as_of_valid: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            citations: episodes.iter().map(|e| gnomon::DerivedCitation::of(*e)).collect(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // The caller of `support` alone sees the same ranking, every score,
+    // rank and count included, while a caller of both Scopes sees another.
+    assert_eq!(ranked(&["support"]).await, before);
+    assert_ne!(ranked(&["support", "billing"]).await, both_before);
 }

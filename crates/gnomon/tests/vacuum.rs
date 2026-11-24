@@ -27,7 +27,8 @@ const MARKER: &str = "vacuumed-7f3e";
 /// The tables an Erasure deletes from or rewrites today: those migration
 /// 0013's header lists, the token table and BM25 counts of migration 0016,
 /// the full and quantized embeddings of migration 0017, the Summaries and
-/// Communities of migration 0018, and the name rows of migration 0019.
+/// Communities of migration 0018, the name rows of migration 0019, and the
+/// token rows and embeddings of Summaries and Communities of migration 0020.
 const ERASED_TABLES: &[&str] = &[
     "gnomon.bound_statement",
     "gnomon.citation",
@@ -35,6 +36,8 @@ const ERASED_TABLES: &[&str] = &[
     "gnomon.community_citation",
     "gnomon.community_member",
     "gnomon.contribution",
+    "gnomon.derived_embedding",
+    "gnomon.derived_search_token",
     "gnomon.edge",
     "gnomon.embedding",
     "gnomon.embedding_bit",
@@ -163,8 +166,9 @@ async fn an_episode_written_everywhere(w: &World) -> gnomon::EpisodeId {
     w.write_stage_records(SCOPE, e, &format!("{MARKER}-model"))
         .await;
     // A Summary of the account and a Community of it and Acme, each citing E
-    // (migration 0018).
-    w.caller()
+    // (migration 0018), each embedded for Search (migration 0020).
+    let summary = w
+        .caller()
         .write_summary(
             w.tenant,
             &gnomon::NewSummary {
@@ -177,7 +181,8 @@ async fn an_episode_written_everywhere(w: &World) -> gnomon::EpisodeId {
         )
         .await
         .unwrap();
-    w.caller()
+    let community = w
+        .caller()
         .write_community(
             w.tenant,
             &gnomon::NewCommunity {
@@ -189,6 +194,15 @@ async fn an_episode_written_everywhere(w: &World) -> gnomon::EpisodeId {
                 citations: vec![gnomon::DerivedCitation::of(e)],
             },
         )
+        .await
+        .unwrap();
+    let mut embeddings = support::vectors::Rng::new(17);
+    w.caller()
+        .store_summary_embedding(w.tenant, summary, &embeddings.unit())
+        .await
+        .unwrap();
+    w.caller()
+        .store_community_embedding(w.tenant, community, &embeddings.unit())
         .await
         .unwrap();
     // The embedding of every Version's values (ADR-0010).
