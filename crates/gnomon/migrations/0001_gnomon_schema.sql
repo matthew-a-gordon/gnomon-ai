@@ -51,8 +51,6 @@ $$;
 
 -- Every gnomon object lives here. PostgREST does not expose this schema.
 create schema gnomon;
-revoke all on schema gnomon from public;
-grant usage on schema gnomon to authenticated, gnomon_worker;
 
 -- The ledger the Rust core reads to refuse a schema it does not expect.
 -- It is the one table with no Tenant: it describes the schema, not a graph.
@@ -65,7 +63,6 @@ create table gnomon.schema_version (
 alter table gnomon.schema_version enable row level security;
 create policy schema_version_read on gnomon.schema_version
   for select to authenticated, gnomon_worker using (true);
-grant select on gnomon.schema_version to authenticated, gnomon_worker;
 
 -- The embedding dimension this chain was exported with. Vector columns in
 -- later migrations are typed with the same value.
@@ -135,7 +132,37 @@ create function gnomon.allowed_scopes() returns text[]
     )
   $$;
 
+-- Grants. First every grant a default privilege made on the schema and on
+-- this migration's objects is revoked, so each holds only the grants below.
+-- Every object in the schema is this migration's.
+do $$
+declare
+  g record;
+begin
+  for g in
+    select format('schema %s', n.oid::regnamespace) as object, a.grantee
+    from pg_namespace n, aclexplode(n.nspacl) a
+    where n.oid = 'gnomon'::regnamespace and a.grantee <> n.nspowner
+    union
+    select format('function %s', p.oid::regprocedure), a.grantee
+    from pg_proc p, aclexplode(p.proacl) a
+    where p.pronamespace = 'gnomon'::regnamespace and a.grantee <> p.proowner
+    union
+    select format('table %s', c.oid::regclass), a.grantee
+    from pg_class c, aclexplode(c.relacl) a
+    where c.relnamespace = 'gnomon'::regnamespace and a.grantee <> c.relowner
+  loop
+    execute format(
+      'revoke all on %s from %s', g.object,
+      case when g.grantee = 0 then 'public' else g.grantee::regrole::text end);
+  end loop;
+end
+$$;
+revoke all on schema gnomon from public;
 revoke all on all functions in schema gnomon from public;
+
+grant usage on schema gnomon to authenticated, gnomon_worker;
+grant select on gnomon.schema_version to authenticated, gnomon_worker;
 grant execute on all functions in schema gnomon to authenticated, gnomon_worker;
 
 insert into gnomon.schema_version (version, name) values (1, '0001_gnomon_schema');

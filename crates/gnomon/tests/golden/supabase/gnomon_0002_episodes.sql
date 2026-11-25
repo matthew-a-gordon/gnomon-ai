@@ -27,8 +27,6 @@ create policy episode_tenant_scope on gnomon.episode
   using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
   with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
 
-grant select, insert on gnomon.episode to authenticated, gnomon_worker;
-
 -- Store functions run as the invoker with an empty search path, so RLS
 -- applies to every call and nothing can be resolved through a caller's
 -- search path (ADR-0009).
@@ -64,8 +62,35 @@ create function gnomon.read_episode(p_tenant_id uuid, p_episode_id uuid)
     where e.tenant_id = p_tenant_id and e.id = p_episode_id
   $$;
 
+-- Grants. First every grant a default privilege made on this migration's
+-- objects is revoked, so each holds only the grants below. The policy covers
+-- every command, so the grants alone keep callers from updating or deleting
+-- an Episode.
+do $$
+declare
+  g record;
+begin
+  for g in
+    select format('function %s', p.oid::regprocedure) as object, a.grantee
+    from pg_proc p, aclexplode(p.proacl) a
+    where p.oid in (
+      'gnomon.record_episode(uuid, text, text, timestamptz, integer)'::regprocedure,
+      'gnomon.read_episode(uuid, uuid)'::regprocedure
+    ) and a.grantee <> p.proowner
+    union
+    select format('table %s', c.oid::regclass), a.grantee
+    from pg_class c, aclexplode(c.relacl) a
+    where c.oid = 'gnomon.episode'::regclass and a.grantee <> c.relowner
+  loop
+    execute format(
+      'revoke all on %s from %s', g.object,
+      case when g.grantee = 0 then 'public' else g.grantee::regrole::text end);
+  end loop;
+end
+$$;
 revoke all on function gnomon.record_episode(uuid, text, text, timestamptz, integer) from public;
 revoke all on function gnomon.read_episode(uuid, uuid) from public;
+grant select, insert on gnomon.episode to authenticated, gnomon_worker;
 grant execute on function gnomon.record_episode(uuid, text, text, timestamptz, integer)
   to authenticated, gnomon_worker;
 grant execute on function gnomon.read_episode(uuid, uuid) to authenticated, gnomon_worker;

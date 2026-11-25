@@ -3108,6 +3108,117 @@ async fn a_caller_cannot_change_an_episodes_authority() {
     assert_eq!(after, before);
 }
 
+/// Every grant on the gnomon schema and on each relation and function in
+/// it, to any role but the object's owner. An object with no ACL holds its
+/// built-in default.
+async fn gnomon_grants(client: &Client) -> Vec<String> {
+    client
+        .query_typed(
+            "with objects as (
+               select 'schema' as kind, n.nspname::text as name,
+                      coalesce(n.nspacl, acldefault('n'::\"char\", n.nspowner)) as acl, n.nspowner as owner
+               from pg_namespace n where n.nspname = 'gnomon'
+               union all
+               select 'relation', c.oid::regclass::text,
+                      coalesce(c.relacl, acldefault(case when c.relkind = 'S' then 's' else 'r' end::\"char\",
+                                                    c.relowner)),
+                      c.relowner
+               from pg_class c
+               where c.relnamespace = 'gnomon'::regnamespace
+                 and c.relkind in ('r', 'p', 'v', 'm', 'S', 'f')
+               union all
+               select 'function', p.oid::regprocedure::text,
+                      coalesce(p.proacl, acldefault('f'::\"char\", p.proowner)), p.proowner
+               from pg_proc p where p.pronamespace = 'gnomon'::regnamespace
+             )
+             select format('%s %s: %s %s', o.kind, o.name,
+                           case when a.grantee = 0 then 'public' else a.grantee::regrole::text end,
+                           a.privilege_type)
+             from objects o, aclexplode(o.acl) a
+             where a.grantee <> o.owner
+             order by 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+#[tokio::test]
+async fn global_default_privileges_give_callers_no_right_the_migrations_do_not() {
+    // The role that applies the migrations grants callers everything on
+    // every table, function and schema it creates, in any schema,
+    // before the first migration runs. Each migration revokes what that
+    // grants on its own objects, so the chain ends with the grants a chain
+    // without default privileges has, and an Episode stays immutable.
+    let db = TestDb::empty_with_login().await;
+    let operator = db.operator().await;
+    for objects in ["tables", "functions", "schemas"] {
+        operator
+            .batch_execute(&format!(
+                "alter default privileges grant all on {objects} to authenticated, gnomon_worker"
+            ))
+            .await
+            .unwrap();
+    }
+    for (file, sql) in support::exported(support::DEFAULT_DIMENSION) {
+        operator
+            .batch_execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("apply {file}: {e:?}"));
+    }
+
+    let plain = TestDb::migrated().await;
+    let expected = gnomon_grants(&plain.admin().await).await;
+    let granted = gnomon_grants(&db.admin().await).await;
+    let extra: Vec<_> = granted.iter().filter(|g| !expected.contains(g)).collect();
+    let missing: Vec<_> = expected.iter().filter(|g| !granted.contains(g)).collect();
+    assert!(
+        extra.is_empty() && missing.is_empty(),
+        "grants beyond the migrations': {extra:#?}\ngrants the migrations give that are missing: {missing:#?}"
+    );
+
+    let store = Store::connect(&db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let t = Uuid::new_v4();
+    let EpisodeId(episode) = store
+        .as_worker(TenantId(t), Scope::new("support"))
+        .record_episode(&NewEpisode {
+            tenant: Some(TenantId(t)),
+            scope: Scope::new("support"),
+            content: "an Episode".into(),
+            reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            authority: Some(1),
+        })
+        .await
+        .unwrap();
+    for role in [USER, WORKER] {
+        for sql in [
+            "update gnomon.episode set authority = 99, content = 'rewritten'",
+            "delete from gnomon.episode",
+        ] {
+            let mut client = db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t, &["support"])).await;
+            assert_refused(tx.batch_execute(sql).await, &format!("{role}: {sql}"));
+        }
+    }
+    let row = db
+        .admin()
+        .await
+        .query_typed(
+            "select content, authority from gnomon.episode where id = $1",
+            &[(&episode, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.len(), 1);
+    assert_eq!(row[0].get::<_, String>(0), "an Episode");
+    assert_eq!(row[0].get::<_, Option<i32>>(1), Some(1));
+}
+
 // Edges (ADR-0005, ADR-0008, ADR-0009). An Edge's endpoints are Nodes of its
 // own Tenant that the caller can see, of Kinds its Edge Kind allows. Edge
 // Versions are Versions: the guard triggers, the grants and RLS that keep a
