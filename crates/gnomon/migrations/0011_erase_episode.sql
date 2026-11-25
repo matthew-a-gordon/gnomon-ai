@@ -899,6 +899,7 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
     v_plan jsonb := '[]';
     it record;
     v_text uuid[];
+    v_open uuid[] := '{}';
     v_edges uuid[] := '{}';
     v_nodes uuid[] := '{}';
     v_lock uuid[];
@@ -1053,6 +1054,10 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
       select coalesce(array_agg(v.id), '{}') into v_text
         from gnomon.version v
         where v.tenant_id = p_tenant_id and v.versioned_id = it.id and v.recorded_to >= it.t0;
+      v_open := v_open || array(
+        select v.id from gnomon.version v
+        where v.tenant_id = p_tenant_id and v.versioned_id = it.id
+          and v.recorded_to = 'infinity' and v.recorded_from < it.t0);
       perform gnomon.erase_version_text(p_tenant_id, v_text);
       delete from gnomon.citation c
         using gnomon.version v
@@ -1074,6 +1079,16 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
       perform gnomon.replay_versions(
         p_tenant_id, v_scope, it.id, it.is_edge, it.kind, it.t0, it.rules);
     end loop;
+
+    -- A Version current at T0 that was never closed lost its text-derived
+    -- rows above, and the replay neither inserts nor reopens it, so nothing
+    -- indexes it again. An update that changes nothing sends it through the
+    -- search index trigger (migration 0016), which writes its token and name
+    -- rows from its text as it stands, as for a Version the reset reopened.
+    -- One the replay closed was indexed then, and the trigger writes nothing
+    -- for it twice.
+    update gnomon.version v set recorded_to = v.recorded_to
+      where v.tenant_id = p_tenant_id and v.id = any(v_open);
 
     -- What is left of nothing: each Edge the Episode touched that no row
     -- names any more, then each such Node, and each endpoint of an erased

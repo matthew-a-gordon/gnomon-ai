@@ -78,7 +78,8 @@
 -- replays, so they are indexed from their recomputed text. A Version it
 -- reopens is the one that stood just before the Episode first touched its
 -- Node or Edge, so its text owes nothing to the erased Episode. It is indexed
--- again from its text as it stands, with no Sentence. The definer may read
+-- again from its text as it stands, with no Sentence, and so is a Version
+-- that was current then and that the Episode never closed. The definer may read
 -- and delete the token rows of an Edge the running Erasure reaches in a
 -- Scope the caller cannot see (migration 0012). It may change the counts
 -- only of a Scope whose changes its own transaction recorded.

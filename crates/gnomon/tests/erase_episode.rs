@@ -1273,3 +1273,72 @@ async fn another_episodes_retraction_of_a_version_only_the_erased_episode_suppli
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn full_text_search_and_resolution_find_a_node_by_its_name_after_erasing_an_unrelated_episode(
+) {
+    // Acme's current Version comes from F. G, of the same Scope, writes
+    // nothing of Acme. H states a value of Acme only before its Version's
+    // Valid time starts, so its write leaves that Version open and
+    // unchanged. Erasing G, then H, leaves Acme found by its name both ways.
+    let w = World::new().await;
+    let f = w.episode(at(2024, 1, 1), None).await;
+    let g = w.episode(at(2024, 1, 2), None).await;
+    let h = w.episode(at(2024, 1, 3), None).await;
+    let acme = w
+        .node(
+            "company",
+            f,
+            ValidTime::between(at(2024, 3, 1), at(2030, 1, 1)),
+            json!({ "name": "Acme" }),
+        )
+        .await;
+    w.node(
+        "company",
+        g,
+        ValidTime::UNKNOWN,
+        json!({ "name": "Globex" }),
+    )
+    .await;
+    w.write(
+        acme,
+        h,
+        ValidTime::between(at(2023, 1, 1), at(2023, 6, 1)),
+        json!({ "aliases": ["Acme Ltd"] }),
+    )
+    .await;
+    let version = w.read(acme, at(2024, 6, 1)).await.unwrap().id;
+    let as_of = AsOf::current(at(2024, 6, 1));
+    let found = |when: &'static str| {
+        let w = &w;
+        async move {
+            let text = w
+                .caller()
+                .search_full_text(w.tenant, "acme", as_of, 10)
+                .await
+                .unwrap();
+            assert_eq!(
+                text.iter().map(|c| c.version).collect::<Vec<_>>(),
+                vec![version],
+                "full-text Search {when}"
+            );
+            let resolved = w
+                .caller()
+                .resolve(w.tenant, &gnomon::Mention::text("Acme"), 10)
+                .await
+                .unwrap();
+            assert_eq!(
+                resolved.iter().map(|c| c.node).collect::<Vec<_>>(),
+                vec![acme],
+                "Resolution {when}"
+            );
+        }
+    };
+    found("before the Erasures").await;
+    w.erase(g).await;
+    found("after erasing an Episode that wrote nothing of Acme").await;
+    let erasure = w.erase(h).await;
+    assert_eq!(erasure.recomputed_nodes, vec![acme]);
+    assert_eq!(w.read(acme, at(2024, 6, 1)).await.unwrap().id, version);
+    found("after erasing an Episode that left Acme's Version open").await;
+}
