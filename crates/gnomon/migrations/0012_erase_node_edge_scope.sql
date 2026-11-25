@@ -88,9 +88,11 @@
 -- Later tables extend these Erasures in three places, and only there:
 --
 --   `gnomon.erase_versioned_rows`  every row of a Node or an Edge: name and
---                                  Alias rows, adjacency rows (#17),
---                                  Summaries and Communities that drew on a
---                                  Node (#16).
+--                                  Alias rows (#17), Summaries and
+--                                  Communities that drew on a Node (#16).
+--                                  There is no adjacency table: Search's
+--                                  neighbourhood reads the Edges and their
+--                                  Versions (ADR-0010).
 --   `gnomon.erase_version_text`    every row derived from a Version's text
 --                                  (migration 0011).
 --   `gnomon.erase_episode_rows`    every row that names an Episode, which a
@@ -176,8 +178,8 @@ $$;
 -- themselves: their bound statements, Contributions, statements (whose
 -- Contributions would cascade), Citations and Versions. Their text-derived
 -- rows go first, through `gnomon.erase_version_text`. Ticket #16 adds the
--- Summaries and Communities that drew on a Node here, and ticket #17 the name,
--- Alias and adjacency rows.
+-- Summaries and Communities that drew on a Node here, and ticket #17 the name
+-- and Alias rows.
 create function gnomon.erase_versioned_rows(p_tenant_id uuid, p_ids uuid[])
   returns void
   language plpgsql volatile security invoker set search_path = ''

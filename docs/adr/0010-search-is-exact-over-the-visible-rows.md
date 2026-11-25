@@ -33,6 +33,7 @@ We chose this because, under RLS, only a leakproof condition can be an index con
 - Resolution searches a current-only partial index of Node names and Aliases.
 - Edge Versions are searched through their Sentence. Summaries and Communities are searched. Episodes are not searched; they are reached through Citations.
 - The embedding dimension is fixed when the migrations are exported. Changing the model means a migration adds a column, the Pipeline back-fills it, and a later migration drops the old column.
+- There is no adjacency table. The neighbourhood branch reads `gnomon.edge` and `gnomon.version` under RLS, through the `edge_source` and `edge_target` indexes on `(tenant_id, source_id, scope)` and `(tenant_id, target_id, scope)`, and the fused Search meets the budgets above with it. An adjacency table with one row per Edge Version and direction was planned and not built. Issue #72 tracks the measurement of the branch on hub Nodes.
 - Neighbourhood expansion defaults to depth 1, with a maximum of 2. It keeps at most 50 Edges per Node, choosing the most-mentioned at the As-of instants, with Edge ID as the tie-break.
 - Mentions and connectedness are two more fused lists. Mentions counts the Episodes citing a candidate. Connectedness counts its Edges.
   - Both are computed at search time over the visible rows. Stored counters would leak across Scopes and be wrong for past reads.

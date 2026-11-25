@@ -17,10 +17,9 @@ An Episode is an immutable record of its own, not a Node. A Version, Summary, Co
 - Erasure deletes Search's derived rows in the same transaction (ADR-0010):
   - the full and quantized embeddings of every Version it deletes or recomputes;
   - the token rows and the BM25 counts they feed;
-  - the adjacency rows;
   - the name and Alias rows.
 
-  The Pipeline re-embeds recomputed text afterwards.
+  The Pipeline re-embeds recomputed text afterwards. There is no adjacency table to delete from: the neighbourhood branch of Search reads `gnomon.edge` and `gnomon.version` under RLS, through the `edge_source` and `edge_target` indexes, and meets the Search budgets that way (ADR-0010).
 - An Erasure is complete at commit, when nothing derived from the Episode is readable. Copies of the erased bytes stay in dead tuples and index pages until the affected tables are vacuumed.
   - `VACUUM` cannot run in a transaction, so a separate call, which the deployment runs, vacuums them. That call uses the `MAINTAIN` privilege granted to the gnomon role.
   - Only `VacuumMode::Full` purges the pages. It rewrites each table and its indexes and drops the old files, so the bytes are gone from the tables when that call has finished.
