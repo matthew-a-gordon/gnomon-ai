@@ -12,9 +12,12 @@
 //! Episode that wrote it, both its endpoints and their Scopes do. After each
 //! Erasure the oracle is compared with As-of reads of every Node at every
 //! known-at instant the sequence produced and at points across the
-//! Valid-time axis, and with which Edges exist. The expected number of
-//! disagreements is zero, and proptest shrinks a failing sequence to a short
-//! one.
+//! Valid-time axis, and with which Edges exist. The no-residue check of
+//! `support/erasure.rs` then reads every table past RLS: no row names an
+//! Episode, Node, Edge or Version the Erasure removed, and the token and name
+//! rows of each Version it recomputed are those its text as it stands gives.
+//! The expected number of disagreements is zero, and proptest shrinks a
+//! failing sequence to a short one.
 
 mod support;
 
@@ -26,6 +29,7 @@ use gnomon::{
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 use serde_json::{json, Map, Value};
+use support::erasure::{assert_no_residue, Residue};
 use support::TestDb;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
@@ -297,35 +301,39 @@ fn oracle(
     (!out.is_empty()).then_some(out)
 }
 
+/// A database with the ranked Kind registered, and a Store whose worker may
+/// register Kinds and erase.
+async fn setup() -> (TestDb, Store, TenantId) {
+    let db = TestDb::migrated().await;
+    db.grant_kind_registration("gnomon_worker").await;
+    db.grant_erasure("gnomon_worker").await;
+    let store = Store::connect(&db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let tenant = support::tenant();
+    let caller = store.as_worker(tenant, Scope::new(SCOPES[0]));
+    caller
+        .register_kind(&NewKind {
+            tenant: Some(tenant),
+            name: RANKED_KIND.into(),
+            of: KindOf::Node,
+            parent: None,
+            properties: json!({ "type": "object", "properties": {} }),
+            search: vec![],
+        })
+        .await
+        .unwrap();
+    caller
+        .set_merge_rule(tenant, RANKED_KIND, MergeRule::Ranked)
+        .await
+        .unwrap();
+    (db, store, tenant)
+}
+
 #[test]
 fn as_of_reads_after_every_erasure_agree_with_an_oracle_over_the_remaining_contributions() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (db, store, tenant) = rt.block_on(async {
-        let db = TestDb::migrated().await;
-        db.grant_kind_registration("gnomon_worker").await;
-        db.grant_erasure("gnomon_worker").await;
-        let store = Store::connect(&db.login_url(), &support::connect_options())
-            .await
-            .unwrap();
-        let tenant = support::tenant();
-        let caller = store.as_worker(tenant, Scope::new(SCOPES[0]));
-        caller
-            .register_kind(&NewKind {
-                tenant: Some(tenant),
-                name: RANKED_KIND.into(),
-                of: KindOf::Node,
-                parent: None,
-                properties: json!({ "type": "object", "properties": {} }),
-                search: vec![],
-            })
-            .await
-            .unwrap();
-        caller
-            .set_merge_rule(tenant, RANKED_KIND, MergeRule::Ranked)
-            .await
-            .unwrap();
-        (db, store, tenant)
-    });
+    let (db, store, tenant) = rt.block_on(setup());
     let mut runner = TestRunner::new(Config {
         cases: 32,
         failure_persistence: None,
@@ -355,6 +363,57 @@ fn as_of_reads_after_every_erasure_agree_with_an_oracle_over_the_remaining_contr
     );
 }
 
+/// The case the random sequences shrank to with `PROPTEST_RNG_SEED=1`. Node
+/// 2's Version of "a" from day 10 on is current when Episode 3 states a null
+/// Alias before day 2, and that write leaves it open. Erasing Episode 3 once
+/// deleted the Version's token and name rows and indexed it again nowhere, so
+/// neither full-text Search nor Resolution found the Node.
+#[tokio::test]
+async fn erasing_an_episode_keeps_the_search_text_of_a_current_version_it_never_closed() {
+    let (db, store, tenant) = setup().await;
+    let traits = |scope, reference_day, authority| EpisodeTraits {
+        scope,
+        reference_day,
+        authority,
+    };
+    let case = Case {
+        ranked: false,
+        episodes: vec![
+            traits(0, 1, 2),
+            traits(0, 1, 2),
+            traits(1, 3, 0),
+            traits(1, 3, 1),
+        ],
+        sequence: vec![
+            vec![Write {
+                node: 2,
+                episode: 2,
+                from: Some(10),
+                to: None,
+                name: Some(Some("a")),
+                aliases: None,
+            }],
+            vec![Write {
+                node: 2,
+                episode: 3,
+                from: None,
+                to: Some(2),
+                name: None,
+                aliases: Some(None),
+            }],
+        ],
+        erasures: vec![
+            Erasure::Episode(3),
+            Erasure::Episode(2),
+            Erasure::Episode(1),
+            Erasure::Episode(0),
+        ],
+    };
+    let (wrong, _, ran) = check(&db, &store, tenant, &case).await;
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(ran, [4, 0, 0, 0]);
+}
+
 /// A user of both Scopes, who writes and reads every Node and Edge.
 fn user_of_both_scopes(store: &Store, tenant: TenantId) -> gnomon::Caller<'_> {
     let claims = json!({
@@ -379,6 +438,72 @@ async fn exists(db: &TestDb, table: &str, id: Uuid) -> bool {
         .unwrap()
         .len()
         == 1
+}
+
+/// The IDs of every Episode, Node, Edge and Version of the Tenant, read past
+/// RLS, in that order.
+async fn ids(db: &TestDb, tenant: TenantId) -> [Vec<Uuid>; 4] {
+    let admin = db.admin().await;
+    let mut out: [Vec<Uuid>; 4] = Default::default();
+    for (i, table) in ["episode", "node", "edge", "version"].iter().enumerate() {
+        out[i] = admin
+            .query_typed(
+                &format!("select id from gnomon.{table} where tenant_id = $1"),
+                &[(&tenant.0, Type::UUID)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+    }
+    out
+}
+
+/// Checks that an Erasure left no residue. What it removed comes from the
+/// rows before and after it, because the Erasure of a Node names no Edge of
+/// a Scope its caller cannot see. The Versions it recomputed are those that
+/// survive of the Nodes and Edges it reports recomputing.
+async fn assert_erasure_left_no_residue(
+    db: &TestDb,
+    tenant: TenantId,
+    before: &[Vec<Uuid>; 4],
+    recomputed_of: &[Uuid],
+) {
+    let after = ids(db, tenant).await;
+    let gone: Vec<Vec<Uuid>> = before
+        .iter()
+        .zip(&after)
+        .map(|(b, a)| b.iter().filter(|id| !a.contains(id)).copied().collect())
+        .collect();
+    let admin = db.admin().await;
+    let recomputed: Vec<Uuid> = admin
+        .query_typed(
+            "select id from gnomon.version
+             where tenant_id = $1 and versioned_id = any($2) and id = any($3)",
+            &[
+                (&tenant.0, Type::UUID),
+                (&recomputed_of, Type::UUID_ARRAY),
+                (&before[3], Type::UUID_ARRAY),
+            ],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_no_residue(
+        &admin,
+        &Residue {
+            episodes: &gone[0],
+            nodes: &gone[1],
+            edges: &gone[2],
+            versions: &gone[3],
+            recomputed: &recomputed,
+            markers: &[],
+        },
+    )
+    .await;
 }
 
 /// Writes the case, runs its Erasures in turn and compares the reads after
@@ -504,17 +629,21 @@ async fn check(
     for &erasure in &case.erasures {
         // An Erasure of something already gone is skipped, as a caller that
         // found it gone would skip it.
+        let before = ids(db, tenant).await;
+        let mut recomputed_of = Vec::new();
         match erasure {
             Erasure::Episode(e) => {
                 if erased.is_episode_erased(case, e) {
                     continue;
                 }
                 let scope = Scope::new(SCOPES[case.episodes[e].scope]);
-                store
+                let done = store
                     .as_worker(tenant, scope)
                     .erase_episode(tenant, episodes[e])
                     .await
                     .unwrap();
+                recomputed_of.extend(done.recomputed_nodes.iter().map(|n| n.0));
+                recomputed_of.extend(done.recomputed_edges.iter().map(|k| k.0));
                 erased.episodes.push(e);
                 ran[0] += 1;
             }
@@ -556,6 +685,7 @@ async fn check(
                 ran[3] += 1;
             }
         }
+        assert_erasure_left_no_residue(db, tenant, &before, &recomputed_of).await;
         for (k, edge) in edges.iter().enumerate() {
             let expected = !erased.is_edge_erased(case, k);
             if exists(db, "edge", edge.0).await != expected {
