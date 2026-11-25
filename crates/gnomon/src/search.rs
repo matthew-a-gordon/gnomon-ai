@@ -64,9 +64,15 @@ pub struct VectorCandidate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SearchHit {
     /// A Version of a Node or an Edge.
-    Version { version: VersionId, of: Versioned },
+    Version {
+        version: VersionId,
+        of: Versioned,
+    },
     /// A Summary, and the Node it describes.
-    Summary { summary: SummaryId, node: NodeId },
+    Summary {
+        summary: SummaryId,
+        node: NodeId,
+    },
     Community(CommunityId),
 }
 

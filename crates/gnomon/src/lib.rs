@@ -40,8 +40,8 @@ pub use node::{
 };
 pub use resolution::{FullTextNameMatch, Mention, ResolutionCandidate, VectorNameMatch};
 pub use search::{
-    BranchRank, FullTextCandidate, SearchHit, SearchRequest, SearchResult, SearchWeights, SignalRank,
-    VectorCandidate, Versioned,
+    BranchRank, FullTextCandidate, SearchHit, SearchRequest, SearchResult, SearchWeights,
+    SignalRank, VectorCandidate, Versioned,
 };
 pub use stage::{StageError, StageOutcome, StageRecord, StageStatus, StageUsage, StageWrite};
 pub use store::{Caller, Store};

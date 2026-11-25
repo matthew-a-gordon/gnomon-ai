@@ -7514,7 +7514,10 @@ async fn derived_world() -> DerivedWorld {
 }
 
 async fn derived_search_rows(db: &TestDb) -> Vec<String> {
-    let tables: Vec<String> = DERIVED_SEARCH_TABLES.iter().map(|t| t.to_string()).collect();
+    let tables: Vec<String> = DERIVED_SEARCH_TABLES
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
     support::erasure::rows_of(&db.admin().await, &tables).await
 }
 
@@ -7530,8 +7533,8 @@ fn search_sql(query_vector: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_caller_reads_only_its_own_tenants_and_scopes_summary_search_rows_and_searches_only_them(
-) {
+async fn a_caller_reads_only_its_own_tenants_and_scopes_summary_search_rows_and_searches_only_them()
+{
     let dw = derived_world().await;
     let w = &dw.w;
     let search = search_sql(&sql_vector());
@@ -7558,7 +7561,10 @@ async fn a_caller_reads_only_its_own_tenants_and_scopes_summary_search_rows_and_
         // Search finds Versions, Summaries and Communities of the caller's
         // own Scope only, and nothing when it names the other Tenant.
         for (tenant, expected) in [(w.t1, vec!["support".to_owned()]), (w.t2, vec![])] {
-            let rows = tx.query_typed(&search, &[(&tenant, Type::UUID)]).await.unwrap();
+            let rows = tx
+                .query_typed(&search, &[(&tenant, Type::UUID)])
+                .await
+                .unwrap();
             let mut scopes: Vec<String> = rows.iter().map(|r| r.get(2)).collect();
             scopes.dedup();
             assert_eq!(scopes, expected, "{role} searched in {tenant}");
@@ -7630,7 +7636,9 @@ async fn a_caller_cannot_write_the_summary_search_rows_or_forge_an_embedding_of_
         format!("select gnomon.store_summary_embedding('{t1}', '{other_tenant}', {v})"),
         // The function that derives the token rows, called directly, and the
         // search index trigger attached to a table of the caller's own.
-        format!("select * from gnomon.derived_text_tokens('{t1}', 'summary', array['{own}'::uuid])"),
+        format!(
+            "select * from gnomon.derived_text_tokens('{t1}', 'summary', array['{own}'::uuid])"
+        ),
         "create temp table mine (id uuid, tenant_id uuid);
          create trigger mine after insert on mine referencing new table as changed
            for each statement execute function gnomon.maintain_search_index()"
@@ -7707,8 +7715,16 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_select_and_inser
     let w = world().await;
     let admin = w.db.admin().await;
     for (table, caller, definer) in [
-        ("gnomon.derived_search_token", vec!["SELECT"], vec!["SELECT", "INSERT", "DELETE"]),
-        ("gnomon.derived_embedding", vec!["SELECT", "INSERT"], vec!["SELECT", "DELETE"]),
+        (
+            "gnomon.derived_search_token",
+            vec!["SELECT"],
+            vec!["SELECT", "INSERT", "DELETE"],
+        ),
+        (
+            "gnomon.derived_embedding",
+            vec!["SELECT", "INSERT"],
+            vec!["SELECT", "DELETE"],
+        ),
     ] {
         for role in [
             USER,
@@ -7746,12 +7762,18 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_select_and_inser
     // Callers reach Search through its functions, and no caller runs the
     // functions that derive the token rows or an embedding row's bits.
     for (function, callers_may) in [
-        ("gnomon.search(uuid, text, real[], timestamptz, timestamptz, uuid[], integer, \
+        (
+            "gnomon.search(uuid, text, real[], timestamptz, timestamptz, uuid[], integer, \
           double precision, double precision, double precision, double precision, \
-          double precision, integer)", true),
+          double precision, integer)",
+            true,
+        ),
         ("gnomon.store_summary_embedding(uuid, uuid, real[])", true),
         ("gnomon.store_community_embedding(uuid, uuid, real[])", true),
-        ("gnomon.search_neighbourhood(uuid, uuid[], integer, timestamptz, timestamptz, integer)", true),
+        (
+            "gnomon.search_neighbourhood(uuid, uuid[], integer, timestamptz, timestamptz, integer)",
+            true,
+        ),
         ("gnomon.derived_text_tokens(uuid, text, uuid[])", false),
         ("gnomon.derived_embedding_derive()", false),
         ("gnomon.maintain_search_index()", false),
@@ -7801,8 +7823,16 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_select_and_inser
         assert_eq!(
             policies,
             vec![
-                (format!("{table}_erasure_reach_delete"), definer.clone(), "DELETE".to_owned()),
-                (format!("{table}_erasure_reach_read"), definer, "SELECT".to_owned()),
+                (
+                    format!("{table}_erasure_reach_delete"),
+                    definer.clone(),
+                    "DELETE".to_owned()
+                ),
+                (
+                    format!("{table}_erasure_reach_read"),
+                    definer,
+                    "SELECT".to_owned()
+                ),
                 (
                     format!("{table}_tenant_scope"),
                     vec![
@@ -7819,8 +7849,8 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_select_and_inser
 }
 
 #[tokio::test]
-async fn an_episode_edge_or_summary_of_a_scope_the_caller_cannot_see_changes_no_ranking_of_search(
-) {
+async fn an_episode_edge_or_summary_of_a_scope_the_caller_cannot_see_changes_no_ranking_of_search()
+{
     let dw = derived_world().await;
     let w = &dw.w;
     let search = search_sql(&sql_vector());
@@ -7830,7 +7860,10 @@ async fn an_episode_edge_or_summary_of_a_scope_the_caller_cannot_see_changes_no_
         async move {
             let mut client = w.db.login().await;
             let tx = as_caller(&mut client, USER, &claims(w.t1, scopes)).await;
-            let rows = tx.query_typed(search, &[(&w.t1, Type::UUID)]).await.unwrap();
+            let rows = tx
+                .query_typed(search, &[(&w.t1, Type::UUID)])
+                .await
+                .unwrap();
             rows.iter()
                 .map(|r| {
                     format!(
@@ -7916,7 +7949,10 @@ async fn an_episode_edge_or_summary_of_a_scope_the_caller_cannot_see_changes_no_
             node: gnomon::NodeId(dw.support_node),
             content: "zebra zebra, as billing tells it".into(),
             as_of_valid: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-            citations: episodes.iter().map(|e| gnomon::DerivedCitation::of(*e)).collect(),
+            citations: episodes
+                .iter()
+                .map(|e| gnomon::DerivedCitation::of(*e))
+                .collect(),
         },
     )
     .await

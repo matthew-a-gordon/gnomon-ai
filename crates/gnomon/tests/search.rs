@@ -10,8 +10,8 @@ mod support;
 
 use chrono::{DateTime, Utc};
 use gnomon::{
-    AsOf, CommunityId, DerivedCitation, EdgeId, EpisodeId, NewCommunity, NewSummary, NodeId,
-    Scope, SearchHit, SearchRequest, SearchResult, SearchWeights, SummaryId, ValidTime, VersionId,
+    AsOf, CommunityId, DerivedCitation, EdgeId, EpisodeId, NewCommunity, NewSummary, NodeId, Scope,
+    SearchHit, SearchRequest, SearchResult, SearchWeights, SummaryId, ValidTime, VersionId,
     Versioned,
 };
 use serde_json::json;
@@ -178,7 +178,9 @@ async fn a_summary_or_community_is_found_only_when_its_recorded_time_holds_known
     let (acme, e) = named(&w, "Acme").await;
     let old = summary(&w, acme, "Acme sells gadgets.", &[e]).await;
     let c = community(&w, &[acme], "The gadgets circle.", &[e]).await;
-    let between = w.write(acme, e, ValidTime::UNKNOWN, json!({ "plan": "basic" })).await;
+    let between = w
+        .write(acme, e, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
     // Regenerating the Summary closes the old row (ADR-0015).
     let new = summary(&w, acme, "Acme sells gadgets and gizmos.", &[e]).await;
 
@@ -195,10 +197,17 @@ async fn a_summary_or_community_is_found_only_when_its_recorded_time_holds_known
         let w = &w;
         async move { derived(&search(w, &SearchRequest::text("gadgets", as_of), 10).await) }
     };
-    let s = |summary| SearchHit::Summary { summary, node: acme };
+    let s = |summary| SearchHit::Summary {
+        summary,
+        node: acme,
+    };
     let mut expected_now = vec![s(new), SearchHit::Community(c)];
     expected_now.sort_by_key(|h| format!("{h:?}"));
-    assert_eq!(at_instants(current()).await, expected_now, "the latest, now");
+    assert_eq!(
+        at_instants(current()).await,
+        expected_now,
+        "the latest, now"
+    );
     let mut expected_between = vec![s(old), SearchHit::Community(c)];
     expected_between.sort_by_key(|h| format!("{h:?}"));
     // `between` is the Recorded time of a write after the old Summary and
@@ -211,7 +220,10 @@ async fn a_summary_or_community_is_found_only_when_its_recorded_time_holds_known
     // At valid-at instants before the one they were written for, Search finds
     // neither, and at that instant both.
     assert_eq!(at_instants(AsOf::current(at(2024, 5, 31))).await, vec![]);
-    assert_eq!(at_instants(AsOf::current(at(2024, 6, 1))).await, expected_now);
+    assert_eq!(
+        at_instants(AsOf::current(at(2024, 6, 1))).await,
+        expected_now
+    );
     // Before either was recorded, neither.
     assert_eq!(at_instants(AsOf::at(now(), at(2020, 1, 1))).await, vec![]);
 
@@ -274,7 +286,9 @@ fn edges_of(results: &[SearchResult]) -> Vec<EdgeId> {
 
 fn sqlstate<T: std::fmt::Debug>(r: Result<T, gnomon::Error>) -> String {
     match r {
-        Err(gnomon::Error::Database(e)) => e.code().map(|c| c.code().to_owned()).unwrap_or_default(),
+        Err(gnomon::Error::Database(e)) => {
+            e.code().map(|c| c.code().to_owned()).unwrap_or_default()
+        }
         other => panic!("expected a database error, got {other:?}"),
     }
 }
@@ -307,7 +321,11 @@ async fn the_neighbourhood_keeps_the_fifty_most_mentioned_edges_per_node_to_its_
     let mut expected: Vec<EdgeId> = boosted.clone();
     expected.extend(edges[..45].iter().copied());
     expected.sort_by_key(|e| e.0);
-    assert_eq!(edges_of(&first), expected, "the five most mentioned and the 45 lowest IDs");
+    assert_eq!(
+        edges_of(&first),
+        expected,
+        "the five most mentioned and the 45 lowest IDs"
+    );
     // Every result came from the neighbourhood, at depth 1: the 50 Edges and
     // the 50 Companies at their other ends.
     assert_eq!(first.len(), 100);
@@ -329,7 +347,9 @@ async fn the_neighbourhood_keeps_the_fifty_most_mentioned_edges_per_node_to_its_
     assert!(edges_of(&deeper).contains(&far_edge));
     let far_hit = deeper
         .iter()
-        .find(|r| matches!(r.hit, SearchHit::Version { of: Versioned::Edge(e), .. } if e == far_edge))
+        .find(
+            |r| matches!(r.hit, SearchHit::Version { of: Versioned::Edge(e), .. } if e == far_edge),
+        )
         .unwrap();
     assert_eq!(far_hit.neighbourhood.unwrap().value, 2);
     let far_node = deeper
@@ -352,7 +372,9 @@ async fn the_neighbourhood_keeps_the_fifty_most_mentioned_edges_per_node_to_its_
     let company_seed = [companies[59]];
     let from_company = search(
         &w,
-        &SearchRequest::text("", current()).seeds(&company_seed).depth(2),
+        &SearchRequest::text("", current())
+            .seeds(&company_seed)
+            .depth(2),
         300,
     )
     .await;
@@ -360,9 +382,9 @@ async fn the_neighbourhood_keeps_the_fifty_most_mentioned_edges_per_node_to_its_
     expected_from_company.push(far_edge);
     expected_from_company.sort_by_key(|e| e.0);
     assert_eq!(edges_of(&from_company), expected_from_company);
-    assert!(!from_company
-        .iter()
-        .any(|r| matches!(r.hit, SearchHit::Version { of: Versioned::Node(n), .. } if n == companies[59])));
+    assert!(!from_company.iter().any(
+        |r| matches!(r.hit, SearchHit::Version { of: Versioned::Node(n), .. } if n == companies[59])
+    ));
     let back = from_company
         .iter()
         .find(|r| matches!(r.hit, SearchHit::Version { of: Versioned::Edge(e), .. } if e == edges[59]))
@@ -375,7 +397,10 @@ async fn the_neighbourhood_keeps_the_fifty_most_mentioned_edges_per_node_to_its_
 
     // No other depth.
     for depth in [0, 3] {
-        let r = w.caller().search(w.tenant, &query.clone().depth(depth), 10).await;
+        let r = w
+            .caller()
+            .search(w.tenant, &query.clone().depth(depth), 10)
+            .await;
         assert_eq!(sqlstate(r), "22023", "depth {depth}");
     }
 }
@@ -431,8 +456,13 @@ async fn graph_signals_never_add_a_candidate_the_branches_did_not_find() {
         let edge = owns(&w, popular, c).await;
         mention_edge(&w, edge, 9).await;
         let more = w.episode(at(2024, 3, 1), None).await;
-        w.write(popular, more, ValidTime::UNKNOWN, json!({ "plan": format!("p{i}") }))
-            .await;
+        w.write(
+            popular,
+            more,
+            ValidTime::UNKNOWN,
+            json!({ "plan": format!("p{i}") }),
+        )
+        .await;
     }
     let _ = e;
     let (gizmo, _) = named(&w, "Gizmo").await;
@@ -502,7 +532,11 @@ async fn per_query_weights_move_the_fused_order_by_their_share_of_each_reciproca
     } else {
         vec![hb, ha]
     };
-    assert_eq!(order(SearchWeights::default()).await, by_id, "a tie goes to the lower ID");
+    assert_eq!(
+        order(SearchWeights::default()).await,
+        by_id,
+        "a tie goes to the lower ID"
+    );
     let full_text = SearchWeights {
         full_text: 2.0,
         ..SearchWeights::default()
@@ -533,7 +567,10 @@ async fn per_query_weights_move_the_fused_order_by_their_share_of_each_reciproca
     // mention, as B has, and no Edge.
     let first = &results[0];
     assert_eq!(first.mentions.rank, Some(1));
-    assert!((first.score - (2.0 / 61.0 + 0.5 / 61.0)).abs() < 1e-12, "{first:?}");
+    assert!(
+        (first.score - (2.0 / 61.0 + 0.5 / 61.0)).abs() < 1e-12,
+        "{first:?}"
+    );
 
     // Two Nodes the full-text branch ties, one more mentioned and one more
     // connected than the other.
@@ -541,12 +578,22 @@ async fn per_query_weights_move_the_fused_order_by_their_share_of_each_reciproca
     let (d, _) = named(&w, "Gear two").await;
     for share in ["x", "y"] {
         let e = w.episode(at(2024, 3, 1), None).await;
-        w.write(d, e, ValidTime::UNKNOWN, json!({ "plan": share })).await;
+        w.write(d, e, ValidTime::UNKNOWN, json!({ "plan": share }))
+            .await;
     }
     let (c_version, d_version) = (version_of(&w, c).await.id, version_of(&w, d).await.id);
     let gear = |weights: SearchWeights| {
         let w = &w;
-        async move { hits(&search(w, &SearchRequest::text("gear", current()).weights(weights), 10).await) }
+        async move {
+            hits(
+                &search(
+                    w,
+                    &SearchRequest::text("gear", current()).weights(weights),
+                    10,
+                )
+                .await,
+            )
+        }
     };
     let no_signals = SearchWeights {
         mentions: 0.0,
@@ -598,7 +645,11 @@ async fn per_query_weights_move_the_fused_order_by_their_share_of_each_reciproca
         };
         let r = w
             .caller()
-            .search(w.tenant, &SearchRequest::text("gear", current()).weights(weights), 10)
+            .search(
+                w.tenant,
+                &SearchRequest::text("gear", current()).weights(weights),
+                10,
+            )
             .await;
         assert_eq!(sqlstate(r), "22023", "weight {bad}");
     }
@@ -632,10 +683,17 @@ async fn an_episode_edge_or_summary_in_a_scope_the_caller_cannot_see_changes_no_
     // word.
     let mut hidden_episodes = vec![];
     for i in 0..3 {
-        let e = w.episode_in(hidden, at(2024, 1, 1), "a hidden Episode").await;
+        let e = w
+            .episode_in(hidden, at(2024, 1, 1), "a hidden Episode")
+            .await;
         hidden_episodes.push(e);
         let c = w
-            .node_in(hidden, "company", e, json!({ "name": format!("Sprocket {i}") }))
+            .node_in(
+                hidden,
+                "company",
+                e,
+                json!({ "name": format!("Sprocket {i}") }),
+            )
             .await;
         let edge = w.edge_in(hidden, x, c, e, json!({ "share": i })).await;
         for _ in 0..2 {
@@ -662,7 +720,10 @@ async fn an_episode_edge_or_summary_in_a_scope_the_caller_cannot_see_changes_no_
                 node: x,
                 content: "Sprocket x, much discussed in billing.".into(),
                 as_of_valid: at(2024, 6, 1),
-                citations: hidden_episodes.iter().map(|e| DerivedCitation::of(*e)).collect(),
+                citations: hidden_episodes
+                    .iter()
+                    .map(|e| DerivedCitation::of(*e))
+                    .collect(),
             },
         )
         .await
@@ -694,9 +755,12 @@ async fn a_retracted_episode_is_a_mention_only_at_a_known_at_before_its_retracti
     let w = World::new().await;
     let (a, e1) = named(&w, "Cog a").await;
     let e2 = w.episode(at(2024, 2, 1), None).await;
-    w.write(a, e2, ValidTime::UNKNOWN, json!({ "plan": "basic" })).await;
+    w.write(a, e2, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
     let e3 = w.episode(at(2024, 3, 1), None).await;
-    let before_retraction = w.write(a, e3, ValidTime::UNKNOWN, json!({ "plan": "pro" })).await;
+    let before_retraction = w
+        .write(a, e3, ValidTime::UNKNOWN, json!({ "plan": "pro" }))
+        .await;
     for e in [e1, e2] {
         w.caller().retract_episode(w.tenant, e).await.unwrap();
     }
@@ -712,12 +776,18 @@ async fn a_retracted_episode_is_a_mention_only_at_a_known_at_before_its_retracti
     // Before the Retractions were recorded, all three Episodes mention A.
     assert_eq!(
         mentions(AsOf::at(now(), before_retraction)).await,
-        gnomon::SignalRank { count: 3, rank: Some(1) }
+        gnomon::SignalRank {
+            count: 3,
+            rank: Some(1)
+        }
     );
     // Now e1 and e2 are retracted, and only e3 mentions it.
     assert_eq!(
         mentions(current()).await,
-        gnomon::SignalRank { count: 1, rank: Some(1) }
+        gnomon::SignalRank {
+            count: 1,
+            rank: Some(1)
+        }
     );
 }
 
@@ -771,7 +841,10 @@ async fn erasure_removes_the_search_rows_of_every_summary_and_community_it_remov
             .await
             .unwrap()[0]
             .get(0);
-        assert_eq!(n, 0, "gnomon.{table} keeps rows of what the Erasure removed");
+        assert_eq!(
+            n, 0,
+            "gnomon.{table} keeps rows of what the Erasure removed"
+        );
     }
     support::erasure::assert_search_counts_match_the_token_rows(&admin).await;
     assert!(everyone(&w)
@@ -798,7 +871,16 @@ async fn smoke_check_prints_the_time_of_a_fused_search() {
     let mut rng = Rng::new(66);
     let centres = support::vectors::subtopics(&mut rng, 20, 10);
     let mut corpus = support::vectors::Corpus::default();
-    support::vectors::load(&w.db, &mut corpus, w.tenant, SCOPE, rows, &centres, &mut rng).await;
+    support::vectors::load(
+        &w.db,
+        &mut corpus,
+        w.tenant,
+        SCOPE,
+        rows,
+        &centres,
+        &mut rng,
+    )
+    .await;
 
     let admin = w.db.admin().await;
     // The token rows, which the loader's inserts with triggers off did not
@@ -873,7 +955,12 @@ async fn smoke_check_prints_the_time_of_a_fused_search() {
         // querying mid-frequency words.
         let text = format!("{}", rng.below(rows));
         let started = std::time::Instant::now();
-        let results = search(&w, &SearchRequest::text(&text, current()).with_embedding(&q), 10).await;
+        let results = search(
+            &w,
+            &SearchRequest::text(&text, current()).with_embedding(&q),
+            10,
+        )
+        .await;
         let took = started.elapsed();
         assert!(!results.is_empty());
         // The first call warms the caches, as prototype 5 ran each query once
@@ -949,7 +1036,8 @@ async fn mentions_count_the_citations_of_the_versions_valid_at_the_valid_at_inst
     let mentions = |valid_at: DateTime<Utc>| {
         let w = &w;
         async move {
-            let results = search(w, &SearchRequest::text("bolt", AsOf::current(valid_at)), 10).await;
+            let results =
+                search(w, &SearchRequest::text("bolt", AsOf::current(valid_at)), 10).await;
             assert_eq!(results.len(), 1, "{results:#?}");
             results[0].mentions.count
         }

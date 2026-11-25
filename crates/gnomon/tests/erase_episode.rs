@@ -302,7 +302,10 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .await
         .unwrap()[0]
         .get(0);
-    assert!(marked >= 2, "the words of E's Summary and Community are indexed: {marked}");
+    assert!(
+        marked >= 2,
+        "the words of E's Summary and Community are indexed: {marked}"
+    );
     // E's Alias of a is in name rows with bits, which Resolution finds.
     let alias = format!("{MARKER}-alias");
     let resolved = |text: String| {

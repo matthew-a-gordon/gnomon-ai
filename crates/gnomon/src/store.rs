@@ -2691,7 +2691,7 @@ impl Caller<'_> {
             summary.0,
             embedding,
         )
-            .await
+        .await
     }
 
     /// Stores the embedding of a Community's text, as
@@ -2770,9 +2770,10 @@ fn search_result(r: &Row) -> SearchResult {
         rank: r.get(6),
         vector: branch(7, 8),
         full_text: branch(9, 10),
-        neighbourhood: r
-            .get::<_, Option<i64>>(12)
-            .map(|rank| BranchRank { value: r.get(11), rank }),
+        neighbourhood: r.get::<_, Option<i64>>(12).map(|rank| BranchRank {
+            value: r.get(11),
+            rank,
+        }),
         mentions: SignalRank {
             count: r.get(13),
             rank: r.get(14),
