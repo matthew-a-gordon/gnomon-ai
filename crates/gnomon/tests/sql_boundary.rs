@@ -7855,7 +7855,6 @@ async fn an_episode_edge_or_summary_of_a_scope_the_caller_cannot_see_changes_no_
     let w = &dw.w;
     let search = search_sql(&sql_vector());
     let ranked = |scopes: &'static [&'static str]| {
-        let w = w;
         let search = &search;
         async move {
             let mut client = w.db.login().await;
