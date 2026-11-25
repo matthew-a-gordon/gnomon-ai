@@ -13,6 +13,8 @@ Every table carries a Tenant and every RLS policy checks it, whether or not the 
 
 ## Consequences
 
+- Two tables have no Tenant, because they describe the deployment, not a graph: `gnomon.schema_version`, the ledger of applied migrations (ADR-0006), and `gnomon.tenancy`, the one row that holds the tenancy mode and the default Tenant. Caller roles may read both and write neither.
+
 - RLS policies call two functions that each deployment supplies, so each consumer resolves the Tenant its own way. `gnomon.tenant_id()` returns the Tenant, and `gnomon.allowed_scopes()` returns the set of Scope keys the caller may read.
 - The policy is `tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes())`, so a B-tree on `(tenant_id, scope)` serves both conditions (ADR-0010).
 - A consumer's Scope rule must be a set of allowed keys, or an inlinable SQL expression over one. Hierarchical Scopes are flattened when they are assigned.

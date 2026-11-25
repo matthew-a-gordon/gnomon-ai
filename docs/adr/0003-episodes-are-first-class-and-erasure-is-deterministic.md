@@ -8,6 +8,7 @@ An Episode is an immutable record of its own, not a Node. A Version, Summary, Co
 
 ## Considered options
 
+- A vacuum call after Erasure, run as a NOLOGIN role holding `MAINTAIN` on the tables an Erasure touches. Dropped, as the Consequences say.
 - Sources as Nodes, with citing Edges to them. Provenance would be traversable by the same functions, but Erasure would have to count Edges, and nothing would stop a source Node being versioned or resolved like any other.
 
 ## Consequences
@@ -17,11 +18,11 @@ An Episode is an immutable record of its own, not a Node. A Version, Summary, Co
 - Erasure deletes Search's derived rows in the same transaction (ADR-0010):
   - the full and quantized embeddings of every Version it deletes or recomputes;
   - the token rows and the BM25 counts they feed;
-  - the adjacency rows;
   - the name and Alias rows.
 
-  The Pipeline re-embeds recomputed text afterwards.
-- An Erasure is complete at commit, when nothing derived from the Episode is readable. Copies of the erased bytes stay in dead tuples and index pages until the affected tables are vacuumed.
-  - `VACUUM` cannot run in a transaction, so a separate call, which the deployment runs, vacuums them. That call uses the `MAINTAIN` privilege granted to the gnomon role.
-  - The bytes are gone only when that call has finished.
+  The Pipeline re-embeds recomputed text afterwards. There is no adjacency table to delete from: the neighbourhood branch of Search reads `gnomon.edge` and `gnomon.version` under RLS, through the `edge_source` and `edge_target` indexes, and meets the Search budgets that way (ADR-0010).
+- An Erasure is complete at commit, when no role can read anything derived from the erased Episode.
+  - Dead tuples and index pages keep copies of the erased bytes until Postgres vacuums the tables, which autovacuum does, or until the operator runs `VACUUM`.
+  - gnomon offers no call for it and promises nothing about the bytes on disk, in WAL, in backups or on replicas.
+  - Spec #1 asked for a vacuum call after Erasure. It was built and then dropped by the project owner's decision, because it kept a privileged role and code for a physical guarantee the library cannot give. A plain `VACUUM` leaves the bytes in free space and index pages, and skips pruning a page another process has pinned. A transaction that began before the Erasure committed keeps the tuples through `VACUUM FULL` too, and no call reaches WAL, backups or replicas.
 - Erasure is not exposed over MCP unless a deployment turns it on.

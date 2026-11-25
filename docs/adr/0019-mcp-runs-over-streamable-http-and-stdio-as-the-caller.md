@@ -13,7 +13,7 @@ The MCP route accepts the same issuers as the HTTP API (ADR-0018). Each issuer e
 - Reads: `context`, as the main read tool, with `search`, `get_as_of`, `traverse` and `citations` for a caller who wants rows.
 - Writes: `add_episode` and `retract_episode`.
 - Erasure: `erase_episode`, which appears in the tool list only when `mcp.erasure` is on (ADR-0003). It carries `destructiveHint`.
-- Not exposed: Kind registration, `maintain`, queue control, migrations and the vacuum call.
+- Not exposed: Kind registration, `maintain`, queue control and migrations.
 
 Read tools carry `readOnlyHint`. Descriptions say what a tool returns and use the glossary's terms, because the model reads them. Annotations are hints a client may ignore, and row-level security stays the barrier.
 

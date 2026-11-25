@@ -1,0 +1,16 @@
+# cargo nextest runs each test in its own process. The database suites share
+# one Postgres server across those processes; see crates/gnomon/tests/support
+# and ADR-0020.
+
+[profile.default]
+# A test that waits on the shared server's lock, or on a container's first
+# start, can take a while; anything past this is a hang.
+slow-timeout = { period = "60s", terminate-after = 3 }
+fail-fast = false
+
+# The Erasure oracle reads every table after each of about 120 Erasures, and
+# a passing run takes 80 to 105 s alone. Under a full run's load that can pass
+# 180 s, and a failing run shrinks for longer still.
+[[profile.default.overrides]]
+filter = 'binary_id(gnomon::erase_oracle)'
+slow-timeout = { period = "60s", terminate-after = 8 }

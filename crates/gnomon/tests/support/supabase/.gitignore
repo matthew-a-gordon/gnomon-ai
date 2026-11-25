@@ -1,0 +1,4 @@
+# Exported at lane time by run-lane-3.sh, never committed.
+supabase/migrations/
+supabase/.temp/
+supabase/.branches/

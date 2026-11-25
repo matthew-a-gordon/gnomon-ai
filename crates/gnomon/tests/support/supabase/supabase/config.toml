@@ -1,0 +1,64 @@
+# The Supabase CLI local stack for test lane 3 (ADR-0020, docs/testing.md).
+#
+# Only the database and the API (Kong in front of PostgREST) run. Every other
+# service is off, so the stack needs few ports. All ports sit in one block of
+# ten, 56030 to 56039, clear of the CLI's defaults (54320 to 54329), so this
+# stack never collides with another project's.
+#
+# `run-lane-3.sh`, beside this project, exports gnomon's migrations into
+# `migrations/` with `--target supabase` before it starts the stack, and the
+# CLI applies them to the `postgres` database as `postgres`.
+
+project_id = "gnomon-t3"
+
+[api]
+enabled = true
+port = 56031
+# PostgREST exposes these schemas and no others. The `gnomon` schema is not
+# among them (ADR-0006, user story 7).
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[api.tls]
+enabled = false
+
+[db]
+port = 56032
+shadow_port = 56030
+major_version = 17
+
+[db.pooler]
+enabled = false
+port = 56033
+
+[db.migrations]
+enabled = true
+
+[db.seed]
+enabled = false
+
+[realtime]
+enabled = false
+
+[studio]
+enabled = false
+port = 56034
+
+[local_smtp]
+enabled = false
+port = 56035
+
+[storage]
+enabled = false
+
+[auth]
+enabled = false
+
+[edge_runtime]
+enabled = false
+inspector_port = 56037
+
+[analytics]
+enabled = false
+port = 56036
