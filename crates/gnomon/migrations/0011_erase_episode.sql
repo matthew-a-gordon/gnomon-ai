@@ -7,8 +7,9 @@
 -- closed, from the Contributions that remain (ADR-0007). It is the only route
 -- that deletes or rewrites committed history.
 --
--- Erasure is the third and last SECURITY DEFINER function ADR-0009 allows,
--- beside Kind registration and the merge-rule setter. Like them it is owned
+-- Erasure is one of the four SECURITY DEFINER groups ADR-0009 allows,
+-- beside Kind registration, the merge-rule setter and the search index
+-- trigger. Like them it is owned
 -- by the NOLOGIN `gnomon_definer` and checks the Tenant against
 -- `gnomon.tenant_id()`. This migration grants it to no caller role: each
 -- deployment grants it to the roles it chooses.

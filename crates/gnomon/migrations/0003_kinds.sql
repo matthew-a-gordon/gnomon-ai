@@ -18,7 +18,7 @@
 -- every Tenant, so any Node or Edge can be written before a Tenant registers
 -- a Kind of its own.
 --
--- Kind registration is one of the two SECURITY DEFINER functions (ADR-0009).
+-- Kind registration is one of the four SECURITY DEFINER groups (ADR-0009).
 -- It is owned by `gnomon_definer`, a NOLOGIN role that cannot bypass RLS,
 -- and checks the Tenant against `gnomon.tenant_id()`. This migration grants
 -- no caller role the right to execute it: each deployment grants that to the

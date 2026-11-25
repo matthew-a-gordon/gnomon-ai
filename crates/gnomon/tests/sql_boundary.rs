@@ -4504,9 +4504,9 @@ async fn the_statement_functions_run_as_the_invoker_and_add_no_definer() {
             r.get::<_, String>(0)
         );
     }
-    // ADR-0009 names three definers: Erasure, Kind registration and the
-    // merge-rule setter. Erasure is four functions, of an Episode, a Node, an
-    // Edge and a Scope.
+    // ADR-0009 names four definer groups: Erasure, Kind registration, the
+    // merge-rule setter and the search index trigger. Erasure is four
+    // functions, of an Episode, a Node, an Edge and a Scope.
     let definers =
         w.db.admin()
             .await
