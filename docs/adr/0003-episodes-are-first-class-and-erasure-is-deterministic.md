@@ -23,5 +23,7 @@ An Episode is an immutable record of its own, not a Node. A Version, Summary, Co
   The Pipeline re-embeds recomputed text afterwards.
 - An Erasure is complete at commit, when nothing derived from the Episode is readable. Copies of the erased bytes stay in dead tuples and index pages until the affected tables are vacuumed.
   - `VACUUM` cannot run in a transaction, so a separate call, which the deployment runs, vacuums them. That call uses the `MAINTAIN` privilege granted to the gnomon role.
-  - The bytes are gone only when that call has finished.
+  - Only `VacuumMode::Full` purges the pages. It rewrites each table and its indexes and drops the old files, so the bytes are gone from the tables when that call has finished.
+  - `VacuumMode::Plain` removes the dead tuples and their index entries but does not overwrite the space it frees. The erased bytes stay in the heap's free space and in index pages until Postgres reuses that space.
+  - WAL archives, physical replicas and backups keep their own copies of the bytes. They are outside the call's reach, and a deployment that must purge them does so by its own means.
 - Erasure is not exposed over MCP unless a deployment turns it on.
