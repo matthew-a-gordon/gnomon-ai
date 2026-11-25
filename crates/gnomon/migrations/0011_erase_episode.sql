@@ -180,6 +180,40 @@ create trigger statement_check_insert before insert on gnomon.statement
   for each row when (not gnomon.running_as_definer())
   execute function gnomon.statement_check_insert();
 
+-- At commit, every Version a caller inserted that still stands has a
+-- Citation, so no caller can commit a Version that no Episode cites: Erase
+-- Episode starts from an Episode's Citations and would never find it. The
+-- write path inserts each Version's Citations in the same transaction, so
+-- this finds one at once. A Version the transaction replaced is gone and
+-- needs none. Which rows the check sees depends on the claims at commit, so
+-- a caller whose claims no longer reach the Version's Tenant and Scope is
+-- refused rather than let through. The trigger's condition is evaluated at
+-- insert, so a Version Erasure writes as the definer is never queued, and
+-- Erasure may delete Citations as its replay requires.
+create function gnomon.version_check_cited() returns trigger
+  language plpgsql security invoker set search_path = ''
+  as $$
+  begin
+    if exists (select from gnomon.citation c
+               where c.tenant_id = new.tenant_id and c.scope = new.scope
+                 and c.version_id = new.id) then
+      return null;
+    end if;
+    if new.tenant_id is distinct from gnomon.tenant_id()
+       or not new.scope = any(gnomon.allowed_scopes())
+       or exists (select from gnomon.version v
+                  where v.tenant_id = new.tenant_id and v.id = new.id) then
+      raise exception using errcode = 'GNW01',
+        message = pg_catalog.format('Version %s cites no Episode', new.id);
+    end if;
+    return null;
+  end
+  $$;
+create constraint trigger version_check_cited after insert on gnomon.version
+  deferrable initially deferred
+  for each row when (not gnomon.running_as_definer())
+  execute function gnomon.version_check_cited();
+
 -- During an Erasure a Version still changes only in its Recorded-time end.
 -- One the replay closes is marked closed by no transaction, and one it
 -- reopens is open again.
@@ -1139,6 +1173,7 @@ begin
     where p.oid in (
       'gnomon.running_as_definer()'::regprocedure,
       'gnomon.version_erasure_update()'::regprocedure,
+      'gnomon.version_check_cited()'::regprocedure,
       'gnomon.edge_await_endpoints()'::regprocedure,
       'gnomon.kind_merge_rule_at(uuid, text, timestamptz)'::regprocedure,
       'gnomon.merge_versions(uuid, text, uuid, boolean, timestamptz, timestamptz, timestamptz, text, boolean)'::regprocedure,
@@ -1154,6 +1189,7 @@ begin
   end loop;
   revoke all on function gnomon.running_as_definer() from public;
   revoke all on function gnomon.version_erasure_update() from public;
+  revoke all on function gnomon.version_check_cited() from public;
   revoke all on function gnomon.edge_await_endpoints() from public;
   revoke all on function gnomon.kind_merge_rule_at(uuid, text, timestamptz) from public;
   revoke all on function gnomon.merge_versions(

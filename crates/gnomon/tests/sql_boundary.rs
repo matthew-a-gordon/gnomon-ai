@@ -1389,6 +1389,218 @@ async fn a_node_cannot_hold_two_versions_at_once_even_when_inserted_directly() {
 }
 
 #[tokio::test]
+async fn a_caller_cannot_commit_a_version_that_no_episode_cites() {
+    // The caller closes the open Version of its own Node, as the update
+    // guard allows at the transaction's start, and inserts a Version of
+    // values no Episode states. Every statement succeeds and the commit is
+    // refused, so Erase Episode never meets a Version it cannot find.
+    let n = nodes().await;
+    let before = version_rows(&n.w.db, n.n1).await;
+    let close = "update gnomon.version set recorded_to = transaction_timestamp() where id = $1";
+    let insert = "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
+                    valid_from_precision, valid_to, valid_to_precision, merge_rule)
+                  values ($1, 'support', $2, '{\"name\": \"a person''s details\"}', '-infinity',
+                    'unknown', 'infinity', 'unknown', 'recency')
+                  returning id";
+    let cite = "insert into gnomon.citation (tenant_id, scope, version_id, episode_id, property,
+                  episode_reference_time, episode_recorded_at)
+                select $1, 'support', $2, e.id, 'name', e.reference_time, e.recorded_at
+                from gnomon.episode e where e.id = $3";
+    for role in [USER, WORKER] {
+        for how in [
+            "with no Citation",
+            "after deleting its Citation",
+            "after changing its claims",
+        ] {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
+            let closed = tx
+                .execute_typed(close, &[(&n.open, Type::UUID)])
+                .await
+                .unwrap();
+            assert_eq!(closed, 1);
+            let version: Uuid = tx
+                .query_typed(insert, &[(&n.w.t1, Type::UUID), (&n.n1, Type::UUID)])
+                .await
+                .unwrap()[0]
+                .get(0);
+            match how {
+                "after deleting its Citation" => {
+                    tx.execute_typed(
+                        cite,
+                        &[
+                            (&n.w.t1, Type::UUID),
+                            (&version, Type::UUID),
+                            (&n.w.t1_support, Type::UUID),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                    let deleted = tx
+                        .execute_typed(
+                            "delete from gnomon.citation where version_id = $1",
+                            &[(&version, Type::UUID)],
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(deleted, 1);
+                }
+                // Claims that no longer reach the Scope hide the Version from
+                // the check, and are refused rather than let through.
+                "after changing its claims" => {
+                    tx.query_typed(
+                        "select set_config('request.jwt.claims', $1, true)",
+                        &[(&claims(n.w.t1, &[]), Type::TEXT)],
+                    )
+                    .await
+                    .unwrap();
+                }
+                _ => {}
+            }
+            let err = tx
+                .commit()
+                .await
+                .expect_err(&format!("{role} committed a Version {how}"));
+            assert_eq!(
+                err.code().map(|c| c.code()),
+                Some(gnomon::INVALID_WRITE),
+                "{role} {how}: {err:?}"
+            );
+            assert_eq!(
+                err.as_db_error().unwrap().message(),
+                format!("Version {version} cites no Episode"),
+                "{role} {how}"
+            );
+        }
+    }
+    assert_eq!(version_rows(&n.w.db, n.n1).await, before);
+    let open: Vec<Uuid> =
+        n.w.db
+            .admin()
+            .await
+            .query_typed(
+                "select id from gnomon.version where node_id = $1 and recorded_to = 'infinity'",
+                &[(&n.n1, Type::UUID)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+    assert_eq!(open, vec![n.open]);
+}
+
+#[tokio::test]
+async fn the_write_patch_retract_and_erasure_paths_commit_versions_that_episodes_cite() {
+    // The check that refuses an uncited Version at commit lets every Store
+    // path through: a write, a patch, two writes to one Node in one
+    // transaction, Retract Episode and Erase Episode, which deletes
+    // Citations as its replay requires.
+    let n = nodes().await;
+    n.w.db.grant_erasure(WORKER).await;
+    let store = Store::connect(&n.w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let t = TenantId(n.w.t1);
+    let caller = store.as_worker(t, Scope::new("support"));
+    let mut episodes = Vec::new();
+    for i in 0..4 {
+        episodes.push(
+            caller
+                .record_episode(&NewEpisode {
+                    tenant: Some(t),
+                    scope: Scope::new("support"),
+                    content: format!("Episode {i}"),
+                    reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                    authority: None,
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let day = |m: u32| Utc.with_ymd_and_hms(2024, m, 1, 0, 0, 0).unwrap();
+    let name = |e: EpisodeId, valid: gnomon::ValidTime, name: &str| {
+        gnomon::Patch::new(e, valid, support::erasure::values(json!({ "name": name })))
+    };
+    let new_node = gnomon::NewNode {
+        tenant: Some(t),
+        scope: Scope::new("support"),
+        kind: gnomon::ROOT_NODE_KIND.into(),
+    };
+    let (node, _) = caller
+        .create_node(
+            &new_node,
+            &name(episodes[0], gnomon::ValidTime::UNKNOWN, "Ada"),
+        )
+        .await
+        .expect("a write");
+    caller
+        .write_node(
+            t,
+            node,
+            &name(
+                episodes[1],
+                gnomon::ValidTime::between(day(1), day(6)),
+                "Ada L",
+            ),
+        )
+        .await
+        .expect("a patch");
+    caller
+        .write_nodes(
+            t,
+            &[
+                (
+                    node,
+                    name(episodes[2], gnomon::ValidTime::between(day(2), day(3)), "B"),
+                ),
+                (
+                    node,
+                    name(episodes[2], gnomon::ValidTime::between(day(2), day(4)), "C"),
+                ),
+            ],
+        )
+        .await
+        .expect("two writes to one Node in one transaction");
+    let (alone, _) = caller
+        .create_node(
+            &new_node,
+            &name(episodes[3], gnomon::ValidTime::UNKNOWN, "only one Episode"),
+        )
+        .await
+        .unwrap();
+    let retraction = caller
+        .retract_episode(t, episodes[3])
+        .await
+        .expect("Retract Episode");
+    assert_eq!(retraction.retracted.len(), 1);
+    let erasure = caller
+        .erase_episode(t, episodes[1])
+        .await
+        .expect("Erase Episode");
+    assert_eq!(erasure.recomputed_nodes, vec![node]);
+    caller
+        .erase_node(t, alone)
+        .await
+        .expect("Erasure of a Node");
+    let uncited: i64 = n
+        .w
+        .db
+        .admin()
+        .await
+        .query_typed(
+            "select count(*) from gnomon.version v
+             where v.tenant_id = $1 and not exists (
+               select from gnomon.citation c where c.tenant_id = v.tenant_id and c.version_id = v.id)",
+            &[(&n.w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(uncited, 0);
+}
+
+#[tokio::test]
 async fn a_caller_cannot_read_or_write_another_tenants_or_scopes_nodes() {
     let n = nodes().await;
     for role in [USER, WORKER] {
@@ -2822,12 +3034,29 @@ async fn a_version_inserted_directly_records_the_rule_of_its_nodes_kind() {
             );
         }
     }
-    // The rule the Kind has is accepted, and a closed Version of that Node stays undeletable.
+    // The rule the Kind has is accepted, and a closed Version of that Node
+    // stays undeletable. The Version cites an Episode, as every Version must
+    // at commit.
     let mut client = n.w.db.login().await;
     let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    let version: Uuid = tx
+        .query_typed(
+            &format!("{} returning id", insert("ranked")),
+            &[(&n.w.t1, Type::UUID), (&ranked_node, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
     tx.execute_typed(
-        &insert("ranked"),
-        &[(&n.w.t1, Type::UUID), (&ranked_node, Type::UUID)],
+        "insert into gnomon.citation (tenant_id, scope, version_id, episode_id, property,
+           episode_reference_time, episode_recorded_at)
+         select $1, 'support', $2, e.id, 'name', e.reference_time, e.recorded_at
+         from gnomon.episode e where e.id = $3",
+        &[
+            (&n.w.t1, Type::UUID),
+            (&version, Type::UUID),
+            (&n.w.t1_support, Type::UUID),
+        ],
     )
     .await
     .unwrap();
