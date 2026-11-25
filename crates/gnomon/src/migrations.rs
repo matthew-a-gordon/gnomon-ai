@@ -85,11 +85,9 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0012_erase_node_edge_scope",
         template: include_str!("../migrations/0012_erase_node_edge_scope.sql"),
     },
-    Migration {
-        version: 13,
-        name: "0013_vacuum_after_erasure",
-        template: include_str!("../migrations/0013_vacuum_after_erasure.sql"),
-    },
+    // There is no migration 13. It held the vacuum call's role, which was
+    // removed before any migration was released. The exporter chains each
+    // migration to the one before it in this list, so the gap needs nothing.
     Migration {
         version: 14,
         name: "0014_stage_records",

@@ -559,12 +559,9 @@ grant execute on function gnomon.search_vector(uuid, real[], timestamptz, timest
   to authenticated, gnomon_worker;
 
 -- What Erasure needs: to read and delete both tables, and the functions its
--- policies and `gnomon.erase_version_text` call. The vacuum call vacuums
--- both (migration 0013), which `gnomon.erasure_vacuum_tables()` now lists,
--- since the definer may delete from them.
+-- policies and `gnomon.erase_version_text` call.
 grant select, delete on gnomon.embedding, gnomon.embedding_bit to gnomon_definer;
 grant execute on function gnomon.sentence_text_hash(text) to gnomon_definer;
 grant execute on function gnomon.erasure_reaches_text(uuid, text, text) to gnomon_definer;
-grant maintain on gnomon.embedding, gnomon.embedding_bit to gnomon_maintainer;
 
 insert into gnomon.schema_version (version, name) values (17, '0017_vector_search');

@@ -551,7 +551,7 @@ async fn erase_episode_removes_every_summary_and_community_closed_or_open_that_c
         write_community(&w, &community(SCOPE, &[c], "e and f", &[f, e], &[])).await;
     w.caller().retract_episode(w.tenant, e).await.unwrap();
 
-    let erasure = w.erase(e).await;
+    w.erase(e).await;
 
     for (table, id) in [
         ("summary", closed.0),
@@ -594,25 +594,6 @@ async fn erase_episode_removes_every_summary_and_community_closed_or_open_that_c
         .map(|k| k.id)
         .collect();
     assert_eq!(communities, vec![open_community]);
-    for table in [
-        "gnomon.summary",
-        "gnomon.summary_citation",
-        "gnomon.community",
-        "gnomon.community_member",
-        "gnomon.community_citation",
-    ] {
-        assert!(
-            erasure.touched_tables.iter().any(|t| t == table),
-            "{table} is not among {:?}",
-            erasure.touched_tables
-        );
-    }
-    // The vacuum call takes the tables the Erasure touched.
-    w.db.maintenance_store()
-        .await
-        .vacuum_erasure(&erasure.touched_tables, gnomon::VacuumMode::Plain)
-        .await
-        .expect("the vacuum call vacuums the Summary and Community tables");
 }
 
 #[tokio::test]
@@ -683,11 +664,6 @@ async fn erasing_a_node_removes_its_summaries_in_every_scope_even_one_the_caller
     assert_eq!(
         rows_naming(&w, "summary_citation", "summary_id", y_billing.0).await,
         1
-    );
-    assert!(
-        erasure.touched_tables.iter().any(|t| t == "gnomon.summary"),
-        "{:?}",
-        erasure.touched_tables
     );
     // The Erasure's list is empty again.
     let left: i64 =

@@ -56,8 +56,7 @@
 -- its Episodes (migration 0012), so a Scope's Erasure removes them too. Erase
 -- Node and Erase Edge leave Episodes, and their stage records, alone. The
 -- definer role gets the Tenant and Scope policies and SELECT and DELETE on
--- both tables, and `gnomon_maintainer` gets MAINTAIN on both for the vacuum
--- call (migration 0013). Retract Episode changes neither table.
+-- both tables. Retract Episode changes neither table.
 
 create type gnomon.stage_status as enum ('pending', 'running', 'retry', 'succeeded', 'failed');
 
@@ -416,8 +415,5 @@ grant execute on function gnomon.read_stage_usage(uuid, uuid) to authenticated, 
 -- Erasure deletes an Episode's stage records and usage counts as
 -- gnomon_definer, under the callers' policies above.
 grant select, delete on gnomon.stage_record, gnomon.stage_usage to gnomon_definer;
-
--- The vacuum call vacuums both, because an Erasure deletes from both.
-grant maintain on gnomon.stage_record, gnomon.stage_usage to gnomon_maintainer;
 
 insert into gnomon.schema_version (version, name) values (14, '0014_stage_records');

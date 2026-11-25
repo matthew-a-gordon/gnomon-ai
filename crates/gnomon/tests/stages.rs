@@ -4,9 +4,8 @@
 //! the same record, an expired lease making a record claimable again, the
 //! read of every record of an Episode, Retract Episode keeping them, and the
 //! catalog check that no column of the stage tables can hold text. Erasure
-//! of stage records is covered in erase_episode.rs, erase_graph.rs and
-//! vacuum.rs, and the cross-Tenant and cross-Scope attempts in
-//! sql_boundary.rs.
+//! of stage records is covered in erase_episode.rs and erase_graph.rs, and
+//! the cross-Tenant and cross-Scope attempts in sql_boundary.rs.
 
 mod support;
 

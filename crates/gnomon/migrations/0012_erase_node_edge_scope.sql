@@ -81,8 +81,8 @@
 -- whenever. A write that still holds a lock commits first, and the Erasure
 -- then erases what it wrote too.
 --
--- Copies of the erased bytes stay in dead tuples and index pages until the
--- tables are vacuumed (ADR-0003), and so do the dead rows of
+-- Copies of the erased bytes stay in dead tuples and index pages until
+-- Postgres vacuums the tables (ADR-0003), and so do the dead rows of
 -- `gnomon.erasure_reach`, which hold the IDs of what was erased.
 --
 -- Later tables extend these Erasures in three places, and only there:

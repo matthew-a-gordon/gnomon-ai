@@ -73,15 +73,27 @@ fn plain_export_writes_numbered_sql_files_starting_at_0001() {
         String::from_utf8_lossy(&run.stderr)
     );
 
+    // Each file is its migration's number and name. The numbers start at
+    // 0001 and rise, and need not be contiguous: number 13 is unused.
     let names = exported_files(out.path());
-    assert!(!names.is_empty());
-    for (i, name) in names.iter().enumerate() {
-        let number = format!("{:04}_", i + 1);
-        assert!(
-            name.starts_with(&number) && name.ends_with(".sql"),
-            "{name} is not numbered {number}*.sql"
-        );
-    }
+    let expected: Vec<String> = gnomon::migrations::MIGRATIONS
+        .iter()
+        .map(|m| {
+            assert!(
+                m.name.starts_with(&format!("{:04}_", m.version)),
+                "{}",
+                m.name
+            );
+            format!("{}.sql", m.name)
+        })
+        .collect();
+    assert_eq!(names, expected);
+    assert!(names[0].starts_with("0001_"));
+    let versions: Vec<i32> = gnomon::migrations::MIGRATIONS
+        .iter()
+        .map(|m| m.version)
+        .collect();
+    assert!(versions.windows(2).all(|w| w[0] < w[1]), "{versions:?}");
 }
 
 #[test]

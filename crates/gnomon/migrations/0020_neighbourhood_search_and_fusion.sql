@@ -123,7 +123,7 @@
 -- definer reads and deletes the token and embedding rows of a Summary in a
 -- Scope the caller cannot see when the running Erasure reaches that Summary
 -- (migration 0018). A row the transaction that wrote it deletes takes them
--- with it through the foreign keys. The vacuum call vacuums both tables.
+-- with it through the foreign keys.
 
 -- The token table of Summaries and Communities.
 create table gnomon.derived_search_token (
@@ -1425,12 +1425,9 @@ grant execute on function gnomon.search(
   to authenticated, gnomon_worker;
 
 -- What the search index trigger needs to write the token rows, and Erasure
--- to delete them and the embedding rows. The vacuum call vacuums both
--- tables (migration 0013), which `gnomon.erasure_vacuum_tables()` now lists,
--- since the definer may delete from them.
+-- to delete them and the embedding rows.
 grant select, insert, delete on gnomon.derived_search_token to gnomon_definer;
 grant select, delete on gnomon.derived_embedding to gnomon_definer;
 grant execute on function gnomon.derived_text_tokens(uuid, text, uuid[]) to gnomon_definer;
-grant maintain on gnomon.derived_search_token, gnomon.derived_embedding to gnomon_maintainer;
 
 insert into gnomon.schema_version (version, name) values (20, '0020_neighbourhood_search_and_fusion');

@@ -169,11 +169,6 @@ pub struct EpisodeErasure {
     pub erased_nodes: Vec<NodeId>,
     /// The Edges erased because nothing was left of them, in order of ID.
     pub erased_edges: Vec<EdgeId>,
-    /// The tables the Erasure deleted rows from or rewrote rows in, which
-    /// hold copies of the erased bytes until they are vacuumed, for
-    /// [`Store::vacuum_erasure`](crate::Store::vacuum_erasure). Each is
-    /// schema-qualified, as `gnomon.version`, in order of name.
-    pub touched_tables: Vec<String>,
 }
 
 /// What the Erasure of a Node, an Edge or a Scope removed (ADR-0003). It
@@ -196,7 +191,4 @@ pub struct GraphErasure {
     /// joins an erased Node is erased too, but not named, so the caller
     /// learns no ID of that Scope.
     pub erased_edges: Vec<EdgeId>,
-    /// The tables the Erasure deleted rows from or rewrote rows in, as for
-    /// [`EpisodeErasure::touched_tables`].
-    pub touched_tables: Vec<String>,
 }

@@ -82,9 +82,6 @@
 -- while a Summary of it, or a Community holding it, still names it, as it
 -- does while an Edge still joins it. Only a Summary that cites no erased
 -- Episode can name it then.
---
--- The vacuum call (migration 0013) vacuums all five tables, because the
--- definer may delete from them.
 
 create table gnomon.summary (
   tenant_id uuid not null,
@@ -897,10 +894,5 @@ grant select, delete on gnomon.summary, gnomon.summary_citation, gnomon.communit
 grant execute on function gnomon.erasure_reaches_summary(uuid, uuid) to gnomon_definer;
 grant execute on function gnomon.erase_summaries_and_communities(uuid, uuid[], uuid[])
   to gnomon_definer;
-
--- The vacuum call vacuums all five, which `gnomon.erasure_vacuum_tables()`
--- now lists, since the definer may delete from them.
-grant maintain on gnomon.summary, gnomon.summary_citation, gnomon.community,
-  gnomon.community_member, gnomon.community_citation to gnomon_maintainer;
 
 insert into gnomon.schema_version (version, name) values (18, '0018_summaries_and_communities');

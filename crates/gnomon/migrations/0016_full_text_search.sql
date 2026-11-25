@@ -586,9 +586,7 @@ grant execute on function gnomon.search_full_text(uuid, text, timestamptz, times
 
 -- What the definer needs, for the search index function and for Erasure:
 -- to write and delete the token rows, the counts and the transaction's
--- changes to them, and the functions they call. The vacuum call vacuums all
--- four tables (migration 0013), which `gnomon.erasure_vacuum_tables()` now
--- lists, since the definer may delete from them.
+-- changes to them, and the functions they call.
 grant select, insert, delete on gnomon.search_token to gnomon_definer;
 grant select, insert, update, delete on gnomon.search_token_frequency,
   gnomon.search_scope_length, gnomon.search_count_delta
@@ -596,8 +594,5 @@ grant select, insert, update, delete on gnomon.search_token_frequency,
 grant execute on function gnomon.kind_search(uuid, text) to gnomon_definer;
 grant execute on function gnomon.search_text_tokens(uuid, uuid[]) to gnomon_definer;
 grant execute on function gnomon.index_search_text(uuid, uuid[], boolean) to gnomon_definer;
-grant maintain on gnomon.search_token, gnomon.search_token_frequency, gnomon.search_scope_length,
-  gnomon.search_count_delta
-  to gnomon_maintainer;
 
 insert into gnomon.schema_version (version, name) values (16, '0016_full_text_search');

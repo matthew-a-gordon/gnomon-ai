@@ -711,12 +711,9 @@ grant execute on function gnomon.resolve(uuid, text, real[], timestamptz, intege
   to authenticated, gnomon_worker;
 
 -- What the search index trigger needs to write the name rows, and Erasure
--- to delete them. The vacuum call vacuums the table (migration 0013), which
--- `gnomon.erasure_vacuum_tables()` now lists, since the definer may delete
--- from it.
+-- to delete them.
 grant select, insert, delete on gnomon.node_name to gnomon_definer;
 grant execute on function gnomon.node_names(uuid, uuid[]) to gnomon_definer;
 grant execute on function gnomon.index_node_names(uuid, uuid[]) to gnomon_definer;
-grant maintain on gnomon.node_name to gnomon_maintainer;
 
 insert into gnomon.schema_version (version, name) values (19, '0019_resolution');
