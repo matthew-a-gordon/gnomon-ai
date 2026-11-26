@@ -11,6 +11,11 @@ The Store's Search returns candidates from three branches, each an invoker funct
   - The full vector is stored once per distinct text, keyed by a hash of that text.
   - The top 400 by bit distance are re-ranked at full precision.
 - The full-text branch reads a token table maintained by trigger in the write's transaction, through a B-tree on leakproof equality. Its BM25 counts are kept per Scope and summed over the caller's allowed Scopes.
+- The full-text branch bounds the work it spends on common words. This is planned, not built (#87).
+  - It prunes by max-score first. A word's BM25 contribution is at most its idf times (k1 + 1), so a text that holds only common words is skipped when that bound is below the k-th score so far. The top k is identical to unpruned BM25.
+  - Before scoring, it sums the document frequencies of the query words over the caller's allowed Scopes. If more than M token rows would be read, it falls back to a cutoff: it drops each word that is in more than X% of the caller's visible texts. If every query word is above X, it keeps the rarest one.
+  - X and M are constants in the migrations, set by measurement. They are not parameters of Search.
+  - A Search result does not say whether the cutoff applied.
 
 We chose this because, under RLS, only a leakproof condition can be an index condition (ADR-0004). A vector index scan applies Tenant, Scope and As-of only to the rows it returns. Prototype 1 found HNSW recall@10 of 0.13 for a 100-row Tenant in a 1M-row table. GIN on `tsvector` is not used at all, because `@@` is not leakproof. One plan shape gives exact recall for every Tenant and Scope on core Postgres with pgvector alone, which Supabase and DigitalOcean require: neither offers VectorChord or a BM25 extension. Background and sources are in `docs/research/search.md`.
 
@@ -23,10 +28,20 @@ We chose this because, under RLS, only a leakproof condition can be an index con
 - BM25 statistics per Tenant. Ranking would reveal how often a term appears in Scopes the caller cannot read.
 - An embedding per Node with a time filter. A past read would rank a Node by what it says now.
 - `halfvec`. Measured no faster than full vectors, at 7.1 GB more storage.
+- A document-frequency cutoff alone, with no max-score pruning. It is simple and bounded, but it changes ranking for every query that holds a common word, including questions whose rare words would have decided the top k.
+- Scoring only the rarest N query words. It is bounded, and it changes ranking for long queries.
+- A stop-word list. It depends on the language, and the token table uses the `simple` configuration so that every language splits the same way.
+- A looser budget for natural-language questions. `context` sends them on every call, so the budget would no longer measure the normal case.
 
 ## Consequences
 
 - Measured on 1.8M embeddings, the whole fused Search took 66 ms at p95 for 50,000 visible rows and 167 to 204 ms for 200,000. The budget is 100 ms at p95 up to 50,000 visible rows and 250 ms up to 200,000.
+- That measurement used a query word found in one text. With realistic word frequencies, a natural-language question took 526 ms at p95 for 50,000 visible rows and 1,820 ms for 200,000 (#87). The budgets apply to every query class of the performance suite, natural-language questions included.
+  - The max-score path is tested against an unpruned BM25 function kept for tests only: the top k must match in IDs, scores and order.
+  - The cutoff path changes ranking on purpose. Its recall@10 against unpruned BM25, over the full-text branch alone, must be at least 0.9. That floor is lowered only after a measurement is reported.
+  - If the budgets are still missed with both paths, the next option is a decision of its own, not a wider cutoff or a looser budget. The `SECURITY DEFINER` function using GIN, judged against the threat model of #81, is the option to revisit.
+  - Resolution's full-text half keeps exact BM25 with no cutoff, because a missed candidate can create a duplicate Node. If it misses a budget, max-score pruning is the only allowed change.
+  - The values of X and M, and the timings with them, are to be added by #87.
 - Larger visible sets need an approximate path: a static partial HNSW index on current Versions with an iterative scan. It is planned, not built. Running the three branches concurrently on separate connections may be enough first, and is to be measured before HNSW is added.
 - The pgvector floor is 0.7.0. It becomes 0.8.0 if the HNSW path is added.
 - Embeddings arrive after the write commits. The Pipeline adds them, and the token table covers the gap because it is written in the write's own transaction.
