@@ -93,7 +93,7 @@ Generated prose describing one Node, derived from the Episodes it cites. It belo
 _Avoid_: description, profile, digest
 
 **Community**:
-A group of closely connected Nodes within one Scope, with a generated Summary of the group.
+A group of closely connected Nodes within one Scope, with a generated Summary of the group. A Community keeps its identity while most of its members stay, so its members can change over its life.
 _Avoid_: cluster, group, neighborhood
 
 ### Search
