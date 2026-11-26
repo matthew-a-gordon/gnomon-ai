@@ -9,6 +9,7 @@ Each operation has one route, named after the method the bindings expose: `POST 
 - Errors are one enum. HTTP returns them as RFC 9457 problem details, and the `code` is the same stable string the bindings put on their exceptions. A row-level security denial, a stale schema version, a reused Episode ID with different content and a permanent model refusal each have their own code.
 - List and traversal calls use cursor pagination, with an opaque cursor and a maximum page size set by the server.
 - There is no streaming in the first release. `context` returns one assembled body, and `add_episode` returns after its last stage or, with `wait: false`, the Episode ID.
+- The shared types derive `schemars::JsonSchema`, the same derive rmcp uses for MCP tool schemas (ADR-0019). The server builds the OpenAPI 3.1 document from a route table that lists each method with its request type and its response type. Every route is a POST and every error is a problem details body, so the table needs nothing more. OpenAPI 3.1 schemas are JSON Schema 2020-12, which is what schemars writes.
 - Tenant and Scope come from the verified token (ADR-0018). A body names a Tenant only in multi-tenant mode, and it must match the claims (ADR-0005).
 
 ## The server
@@ -30,6 +31,8 @@ The first release has no rate-limit policy, but the place for one exists. A midd
 - Separate binaries for the API and the worker. Each would be simpler to scale, but packaging and the release matrix double for a split that flags already give.
 - Rate limits in the first release. No consumer has asked for one, and a per-caller limit belongs to the consumer's gateway until one does.
 - Streaming results. No consumer needs it yet.
+- `utoipa` for the OpenAPI document. It is the most widely used generator, but it has its own `ToSchema` trait, so every shared type would derive two schema traits that can disagree.
+- `aide`. It builds on schemars, but it generates the document from axum handler types, and it has fewer users. The route table is shorter than the glue it would replace.
 
 ## Consequences
 

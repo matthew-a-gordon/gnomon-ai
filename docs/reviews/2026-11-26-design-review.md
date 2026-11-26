@@ -408,6 +408,15 @@ These decisions exist in code or tickets but in no ADR:
 
 *Status: ADR-0021 records the crypto provider, and #54 names axum. #81 still plans the threat model. The other decisions in this list are open, together with OTLP behind a Cargo feature. They are taken as one more finding.*
 
+*Status of the open decisions, taken as finding 9: decided.*
+
+- *The Python stubs are hand-written and checked with mypy `stubtest`, and napi-rs generates the `.d.ts` files (ADR-0016, #58).*
+- *The shared types derive `schemars::JsonSchema`, and the OpenAPI 3.1 document is built from a route table (ADR-0017, #50, #56).*
+- *The configuration is one plain serde type with a `GNOMON_` environment overlay and no configuration crate (#27).*
+- *The public API keeps `chrono` (ADR-0001, #82).*
+- *The workspace moves to edition 2024, and `rust-version` equals the pinned CI toolchain (#88, then ADR-0020).*
+- *OTLP is behind an `otlp` Cargo feature that only the server binary enables (ADR-0016, #67).*
+
 *The smaller recommendations in the sections above are now carried by tickets: #53 drops `oct` keys from a fetched JWKS, #65 pins rmcp, #32 measures the Resolution lock under a bulk load, #42 compares TOON with compact JSON and Markdown before fixing the default, and #40 tries the `jina` adapter on vLLM. Cloudflare's current Node.js compatibility page does not name native addons, and Supabase does not document them, so ADR-0016 keeps its caveat.*
 
 ## Suggested order

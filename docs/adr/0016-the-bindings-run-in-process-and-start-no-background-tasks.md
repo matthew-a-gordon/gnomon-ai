@@ -24,7 +24,7 @@ A consumer creates one client object per process, at module scope, and creating 
 
 ## Types
 
-Property values cross the bindings as plain JSON (a Python dict or a JS object), and the Store validates them on every write (ADR-0002). `gnomon kinds export --format json-schema` writes one flattened schema per Kind from a deployment's registry, and a consumer runs its own generator in its build. The bindings generate no Kind-specific classes. The Python package ships `.pyi` stubs and a `py.typed` marker, and the Node package ships `.d.ts` files. Both come from the shared Rust types, are checked into the repository, and a CI test fails when they drift from the build.
+Property values cross the bindings as plain JSON (a Python dict or a JS object), and the Store validates them on every write (ADR-0002). `gnomon kinds export --format json-schema` writes one flattened schema per Kind from a deployment's registry, and a consumer runs its own generator in its build. The bindings generate no Kind-specific classes. The Python package ships `.pyi` stubs and a `py.typed` marker, and the Node package ships `.d.ts` files. Both are checked into the repository. The `.pyi` stubs are written by hand, and a CI test runs mypy `stubtest` against the built module, so a stub that drifts from the module fails. napi-rs generates the `.d.ts` files from the shared Rust types, and a CI test fails when the checked-in files differ from the build.
 
 ## Packaging
 
@@ -34,19 +34,23 @@ The crate, the wheels, the npm packages and the server binary release together u
 - Node: one package per platform in `optionalDependencies`, for the same targets.
 - Server: a static musl binary for linux x64 and arm64, and a container image built from it.
 
+The OTLP exporter is behind an `otlp` Cargo feature that is off by default. The server binary builds with it, and the wheels and npm packages build without it.
+
 ## Considered options
 
 - Synchronous `Formatter` and `TokenCounter` callbacks. No consumer asked for a format beyond the four built-ins, and the typed rows let one build any other shape without a callback. The token counter would cross the FFI once per candidate row, up to 100 times per call, to buy back budget the conservative estimate leaves unused. Deferred, with the conditions for reconsidering in `.out-of-scope/binding-formatter-and-token-counter-callbacks.md`.
 - Configuration only, with no callbacks. It would avoid the cancellation and callback-latency questions below, but a consumer with a model provider gnomon has no adapter for would need a proxy.
 - Telling serverless consumers to deploy the server for its worker. The bindings would be smaller, but it removes the reason for in-process bindings in ADR-0001.
 - A larger pool with a background keepalive. It cuts reconnect time on a warm function, but the keepalive is a background task, and many concurrent function instances could exhaust a pooler's connection limit.
+- Generating the `.pyi` stubs with `pyo3-stub-gen` or with PyO3's `experimental-inspect` and `maturin generate-stubs`. `pyo3-stub-gen` is pre-1.0, and its return type for an `async fn` is unconfirmed. PyO3 marks its own generator as in development (`docs/research/bindings.md`). Reconsider when PyO3's generator leaves development.
 - Generating typed classes per Kind at install or import time. It needs a database connection at build time and a generator in each language.
 - Separate version numbers per package. A consumer would have to match binding and server versions against a schema version.
 
 ## Consequences
 
 - Dropping a Python awaitable cancels the Rust future, and dropping a JS Promise does not. Neither passes cancellation to a callback, so every callback runs under the call's deadline (`docs/research/bindings.md`).
-- Callback latency has not been measured. Python stub generation is experimental, which is why the stubs are reviewed in the repository.
+- Callback latency has not been measured.
+- A change to a Python-facing signature needs a hand edit to the `.pyi` stubs, and `stubtest` fails the build until it is made.
 - Cloudflare Workers and Supabase Edge Functions are expected to rule out a native module, so they use the server. That rests on a claim the research did not confirm from a primary source.
 - Free-threaded Python wheels wait until the stable ABI covers them. macOS x64 and WASI are not shipped.
 - The conformance suite replays each case through the Rust API, both bindings, the HTTP API and the MCP tools (ADR-0017).
