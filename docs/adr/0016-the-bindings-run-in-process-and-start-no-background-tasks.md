@@ -8,11 +8,13 @@ The Python (PyO3) and Node (napi-rs) bindings expose the Pipeline API as the mai
 
 The queue is run by a bounded call, `run_queue`, which claims due stage records, runs them, and returns when a deadline or a stage limit is reached or the queue is empty (ADR-0011). The server's polling loop is a loop around the same call. In the bindings `add_episode` waits for its stages by default (`wait: true`). A consumer who wants `wait: false` runs `run_queue` from its own scheduler, or runs the server's worker.
 
-A consumer may replace each of the Pipeline's five seams with a function in its own language:
+A consumer may replace three of the Pipeline's seams with a function in its own language, and the rest stay in Rust:
 
 - `ModelClient`, `Embedder` and `Reranker` take async callbacks. Each call is a network round trip, so the cost of crossing the FFI is small beside it.
-- `Formatter` and `TokenCounter` take synchronous callbacks. The token counter is called per candidate row while `context` fills its budget, so the built-in counter stays the default and the documentation says an override is slower.
+- `Formatter` and `TokenCounter` cannot be replaced from a binding. A binding names one of the built-in formats, and `context` sizes rows with the bytes-based estimate. A Rust consumer can still implement either trait.
 - `CommunityDetector` cannot be replaced from a binding.
+
+`context` returns the rows it selected alongside the formatted text, in the same order. The rows are the ones that fit the budget in the chosen format, so a consumer who wants another shape builds it from the rows in its own language, with no FFI round trip per row. A consumer whose shape is longer than the chosen format picks the closest built-in or leaves headroom in the budget. The row types come from the shared Rust types, and a row's properties are plain JSON. The HTTP API returns the rows and the text. MCP returns only the text, because its reader is a model.
 
 We chose this because ADR-0001 put the Pipeline in the core so that it is written once, and a consumer in a serverless function needs the whole of it without deploying a long-lived process.
 
@@ -34,6 +36,7 @@ The crate, the wheels, the npm packages and the server binary release together u
 
 ## Considered options
 
+- Synchronous `Formatter` and `TokenCounter` callbacks. No consumer asked for a format beyond the four built-ins, and the typed rows let one build any other shape without a callback. The token counter would cross the FFI once per candidate row, up to 100 times per call, to buy back budget the conservative estimate leaves unused. Deferred, with the conditions for reconsidering in `.out-of-scope/binding-formatter-and-token-counter-callbacks.md`.
 - Configuration only, with no callbacks. It would avoid the cancellation and callback-latency questions below, but a consumer with a model provider gnomon has no adapter for would need a proxy.
 - Telling serverless consumers to deploy the server for its worker. The bindings would be smaller, but it removes the reason for in-process bindings in ADR-0001.
 - A larger pool with a background keepalive. It cuts reconnect time on a warm function, but the keepalive is a background task, and many concurrent function instances could exhaust a pooler's connection limit.

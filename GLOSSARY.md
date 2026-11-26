@@ -103,7 +103,7 @@ Finding the Versions, Summaries and Communities that match a query, as they stoo
 _Avoid_: retrieval, lookup, query
 
 **Context**:
-The text the Pipeline assembles for a model from Search results and As-of reads, in a chosen format and within a token budget.
+The Search results and As-of reads the Pipeline selects for a model within a token budget, returned as typed rows and as text in a chosen format.
 _Avoid_: prompt, payload, retrieval result
 
 **Sentence**:
