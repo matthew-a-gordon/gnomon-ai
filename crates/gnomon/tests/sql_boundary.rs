@@ -348,9 +348,6 @@ const ONTOLOGY_TABLES: &[&str] = &["kind", "kind_rule", "kind_merge"];
 /// it holds no row once the Erasure returns.
 const ERASURE_REACH: &str = "erasure_reach";
 
-/// The BM25 counts of each Scope, which only the token table's triggers
-/// write (`0004_search.sql`).
-
 #[tokio::test]
 async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_tenant_scope_policy()
 {
@@ -859,7 +856,7 @@ async fn a_caller_cannot_redirect_kind_registration_through_its_search_path() {
 }
 
 /// The roles the type-shadowing test's domain check ran as, in order.
-async fn roles(tx: &Transaction<'_>) -> String {
+async fn recorded_roles(tx: &Transaction<'_>) -> String {
     let r: Option<String> = tx
         .query_typed(
             "select pg_catalog.current_setting('gnomon_test.roles', true)",
@@ -924,9 +921,9 @@ async fn temporary_types_named_like_built_in_types_run_nothing_of_the_callers_as
     // check runs, as the caller.
     tx.batch_execute("select 'armed'::text").await.unwrap();
     assert!(
-        roles(&tx).await.contains(USER),
+        recorded_roles(&tx).await.contains(USER),
         "the domains did not shadow the built-in types: {:?}",
-        roles(&tx).await
+        recorded_roles(&tx).await
     );
 
     tx.query_typed(REGISTER_PERSON, &[(&w.t1, Type::UUID)])
@@ -971,7 +968,7 @@ async fn temporary_types_named_like_built_in_types_run_nothing_of_the_callers_as
     .await
     .expect("an Erasure");
 
-    let ran_as = roles(&tx).await;
+    let ran_as = recorded_roles(&tx).await;
     let as_definer = ran_as
         .split_whitespace()
         .filter(|r| *r == "gnomon_definer")
@@ -5868,7 +5865,7 @@ async fn no_role_holds_maintain_and_no_caller_can_vacuum_reindex_or_cluster_a_gn
     );
 }
 
-/// The stage tables (ADR-0011, `0003_reads_and_writes.sql`).
+/// The stage tables (ADR-0011), which `0001_schema.sql` creates.
 const STAGE_TABLES: &[&str] = &["stage_record", "stage_usage"];
 
 /// `world()` with stage records for its Episodes: each Episode's graph stage
@@ -6148,7 +6145,8 @@ async fn a_caller_cannot_delete_a_stage_record_or_change_what_it_names() {
 }
 
 /// The token table of full-text Search, the BM25 counts of each Scope and
-/// each transaction's changes to them (ADR-0010, `0004_search.sql`).
+/// each transaction's changes to them (ADR-0010), which `0001_schema.sql`
+/// creates.
 const SEARCH_TABLES: &[&str] = &[
     "search_token",
     "search_token_frequency",
@@ -6390,8 +6388,8 @@ async fn the_search_index_function_is_a_definer_no_role_may_execute_and_callers_
     }
 }
 
-/// The full vectors and quantized rows of vector Search (ADR-0010,
-/// `0004_search.sql`).
+/// The full vectors and quantized rows of vector Search (ADR-0010), which
+/// `0001_schema.sql` creates.
 const EMBEDDING_TABLES: &[&str] = &["embedding", "embedding_bit"];
 
 /// `searchable_world()` with an embedding stored for every Version, as each

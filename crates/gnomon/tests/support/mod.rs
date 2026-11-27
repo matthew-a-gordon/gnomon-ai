@@ -166,22 +166,21 @@ async fn connect(config: &Config) -> Client {
     client
 }
 
-/// The line of `gnomon.embedding_dimension()` that states the dimension.
-const DIMENSION_LINE: &str = "as $$ select 1536 $$";
-
 /// The migration files, in the order a chain applies them, with the
 /// dimension line changed to `dimension`, as a consumer whose model has
 /// another width edits it.
 pub fn migration_files(dimension: u32) -> Vec<(String, String)> {
+    // The line of `gnomon.embedding_dimension()` that states the dimension.
+    let line = format!("as $$ select {DEFAULT_DIMENSION} $$");
     gnomon::migrations::MIGRATIONS
         .iter()
         .map(|m| {
             if m.version == 1 {
-                assert!(m.sql.contains(DIMENSION_LINE), "0001 states no dimension");
+                assert!(m.sql.contains(&line), "0001 states no dimension");
             }
             let sql = m
                 .sql
-                .replace(DIMENSION_LINE, &format!("as $$ select {dimension} $$"));
+                .replace(&line, &format!("as $$ select {dimension} $$"));
             (format!("{}.sql", m.name), sql)
         })
         .collect()

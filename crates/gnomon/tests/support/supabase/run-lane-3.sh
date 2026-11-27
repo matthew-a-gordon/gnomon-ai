@@ -39,7 +39,7 @@ mkdir -p "$workdir/supabase/migrations"
 n=0
 for file in crates/gnomon/migrations/*.sql; do
   n=$((n + 1))
-  cp "$file" "$workdir/supabase/migrations/2025010100000${n}_gnomon_$(basename "$file")"
+  cp "$file" "$workdir/supabase/migrations/$(printf '20250101%06d' "$n")_gnomon_$(basename "$file")"
 done
 "${cli[@]}" start --workdir "$workdir"
 

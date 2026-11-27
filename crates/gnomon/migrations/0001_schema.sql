@@ -10,7 +10,7 @@
 -- order, each in one transaction (ADR-0006). Once released, a file never
 -- changes: a later release adds new files.
 --
--- Floor: PostgreSQL 17, pgvector 0.7.0 and btree_gist (ADR-0023). Nothing
+-- The floor is PostgreSQL 17, pgvector 0.7.0 and btree_gist (ADR-0023). Nothing
 -- here uses a PG 18-only feature.
 --
 -- Search paths. Every gnomon function sets its `search_path`, and every path
@@ -176,7 +176,7 @@ $$;
 -- Every gnomon object lives here. PostgREST does not expose this schema.
 create schema gnomon;
 
--- The ledger the Rust core reads to refuse a schema it does not expect.
+-- The ledger the Store reads to refuse a schema it does not expect.
 -- It is the one table with no Tenant: it describes the schema, not a graph.
 -- Callers may read it and nothing else.
 create table gnomon.schema_version (
@@ -348,7 +348,7 @@ create function gnomon.default_tenant() returns uuid
     select t.default_tenant_id from gnomon.tenancy t where t.mode = 'single'
   $$;
 
--- The Tenant of one Store call, checked. Every call of the Rust core's
+-- The Tenant of one Store call, checked. Every call of the Store's
 -- Store API runs this first, in the call's transaction, with the Tenant the
 -- call names or null:
 --
@@ -1406,8 +1406,8 @@ create table gnomon.derived_embedding (
     on update cascade on delete cascade,
   check (num_nonnulls(summary_id, community_id) = 1)
 );
--- A full vector is read by a re-rank probe from one heap page, as migration
--- 0017 stores `gnomon.embedding`.
+-- A full vector is read by a re-rank probe from one heap page, as
+-- `gnomon.embedding` stores it.
 do $$
 begin
   if gnomon.embedding_dimension() <= 1900 then

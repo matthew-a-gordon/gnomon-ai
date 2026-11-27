@@ -9,9 +9,9 @@ pub enum Extensions {
     /// The database has no `extensions` schema, so the first file creates
     /// pgvector and btree_gist in the migrating role's default schema.
     Default,
-    /// The database has an `extensions` schema, owned by the migration role
-    /// as Supabase's lets `postgres` grant on it, so the first file creates
-    /// both there.
+    /// The database has an `extensions` schema, so the first file creates
+    /// both there. The migration role owns it, so it may grant USAGE on it,
+    /// as `postgres` may on Supabase's.
     InExtensions,
 }
 
