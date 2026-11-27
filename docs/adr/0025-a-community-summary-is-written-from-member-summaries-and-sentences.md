@@ -4,9 +4,9 @@ status: accepted
 
 # A Community's Summary is written from member Summaries and Sentences, and follows every change to them
 
-The Pipeline writes a Community's Summary with the main model from two inputs: the current Summary of each member Node in the Community's Scope, and the Sentences of the Edges between members whose Version is current in Recorded time and valid at the Community's `as_of_valid` instant. Its Citations are the union of the inputs' Citations. A member with no Summary adds none, and a Community with no input that carries a Citation is not written.
+The Pipeline writes a Community's Summary with the main model from two inputs: the current Summary of each member Node in the Community's Scope, and the Sentences of the Edges between members whose Version is current in Recorded time and valid at the Community's `as_of_valid` instant. Its Citations are the union of the inputs' Citations. A member with no Summary adds none. A Community with no input that carries a Citation is not written, and the stored Community it would have replaced ends.
 
-A refresh regenerates a Community when its member set changed or an input did. One change is a member joining or leaving, or a member's Summary or a Sentence between members being added, replaced or dropped. The minimum number of changes (ADR-0014) applies to each Community on its own and is 1 unless a deployment raises it. A new Community is always written, and an ending one always ends (ADR-0022). `maintain` ignores the minimum, so it regenerates every stale Community, and a second run with no new writes changes nothing.
+A refresh regenerates a Community when its member set changed or an input did. One change is a member joining or leaving, or a member's Summary or a Sentence between members being added, replaced or dropped. The minimum number of changes (ADR-0014) applies to each Community on its own and is 1 unless a deployment raises it. A new Community is always written, and an ending one always ends (ADR-0022). `maintain` ignores the minimum for Summaries and Communities alike. It regenerates every stale Node Summary before it handles Communities, then regenerates every stale Community, so a Community is built from current member Summaries. A second run with no new writes changes nothing.
 
 A linked group is the new and stored Communities connected by shared members. A refresh finishes a group's model calls first, then commits its writes and ends in one transaction. When any Community of a group must be written, the whole group is written. The Summaries, the staleness rule, the minimum and the commits are planned, not built (#38, #39).
 
@@ -17,6 +17,8 @@ We chose these inputs because they bound the model call and keep the Citations e
 - The member Nodes' current Versions and the Sentences between members. A Node can have many current Versions, so the size cap would not bound the input for them.
 - The member Summaries alone. They also describe Edges to Nodes outside the Community, and nothing in the input would mark which Edges join members.
 - Citations of the member Versions only. Erasing an Episode that only an Edge cites would leave its content in the Summary.
+- Keeping the stored Community when nothing citable is left to write from. Search would go on returning text that no current input supports.
+- A `maintain` that fills in only missing Node Summaries. A Community it regenerated could be built from stale ones.
 - Regenerating only when the member set changed. It costs the fewest model calls and leaves retracted, corrected and ended statements in the Summary until a Node joins or leaves.
 - Regenerating on a member change or when an input was retracted, corrected or ended. The Store would have to record why each input changed.
 - A minimum counted over the whole Scope. A busy Community would trigger calls for quiet ones, and one retraction could wait for unrelated changes.
