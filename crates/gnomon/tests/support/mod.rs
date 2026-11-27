@@ -327,20 +327,6 @@ impl Server {
         }
     }
 
-    /// The superuser's connection settings for database `db`.
-    pub fn admin_config_for(&self, db: &str) -> Config {
-        self.admin_config(db)
-    }
-
-    /// The role that applies the migrations: the migration role, or else
-    /// the superuser.
-    pub fn migration_role_name(&self) -> String {
-        self.migration_role
-            .clone()
-            .or_else(|| self.admin.get_user().map(str::to_owned))
-            .expect("the server names its superuser")
-    }
-
     /// The superuser's connection to database `db`.
     fn admin_config(&self, db: &str) -> Config {
         let mut c = self.admin.clone();

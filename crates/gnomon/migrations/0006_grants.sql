@@ -3,7 +3,9 @@
 -- `gnomon_definer` (ADR-0009).
 
 -- Grants. First every grant a default privilege made on the schema and on
--- its functions and tables is revoked, so each holds only the grants below.
+-- its functions, tables and sequences is revoked, so each holds only the
+-- grants below. The sequences are those of the identity columns, and no
+-- caller holds any right on them.
 do $$
 declare
   g record;
@@ -17,9 +19,10 @@ begin
     from pg_proc p, aclexplode(p.proacl) a
     where p.pronamespace = 'gnomon'::regnamespace and a.grantee <> p.proowner
     union
-    select format('table %s', c.oid::regclass), a.grantee
+    select format(case when c.relkind = 'S' then 'sequence %s' else 'table %s' end,
+                  c.oid::regclass), a.grantee
     from pg_class c, aclexplode(c.relacl) a
-    where c.relnamespace = 'gnomon'::regnamespace and c.relkind <> 'S' and a.grantee <> c.relowner
+    where c.relnamespace = 'gnomon'::regnamespace and a.grantee <> c.relowner
   loop
     execute format(
       'revoke all on %s from %s', g.object,
@@ -30,7 +33,18 @@ $$;
 revoke all on schema gnomon from public;
 revoke all on all functions in schema gnomon from public;
 
+-- The schema. PostgREST does not expose it, and only these three roles may
+-- reach it.
 grant usage on schema gnomon to authenticated, gnomon_worker, gnomon_definer;
+
+-- The tables. Callers read their own Tenant's and Scopes' rows under RLS,
+-- and insert only the columns a write may choose, so an ID, a Recorded time
+-- or a transaction mark always takes its default. They update only the few
+-- columns a write changes, and delete only the rows of the tables whose
+-- guard triggers let a transaction delete what it wrote. The definer role
+-- reads
+-- and deletes what Erasure, Kind registration and the search index trigger
+-- need (ADR-0009). No role holds a right on the identity sequences.
 
 grant select on gnomon.schema_version to authenticated, gnomon_worker;
 
@@ -143,8 +157,13 @@ grant select, insert, delete on gnomon.derived_search_token to gnomon_definer;
 grant select, insert on gnomon.derived_embedding to authenticated, gnomon_worker;
 grant select, delete on gnomon.derived_embedding to gnomon_definer;
 
+-- The functions. Callers execute the Store functions and the helpers those
+-- call as the invoker. The definer role executes the helpers its own
+-- functions call. Kind registration, the merge-rule setter, Erasure and the
+-- search index trigger are granted to no role: a deployment grants the first
+-- three to the roles it chooses, and the trigger to none.
 grant execute on function gnomon.embedding_dimension()
-  to authenticated, gnomon_worker;
+  to authenticated, gnomon_worker, gnomon_definer;
 grant execute on function gnomon.uuid_v7()
   to authenticated, gnomon_worker, gnomon_definer;
 grant execute on function gnomon.tenant_id()
@@ -195,8 +214,6 @@ grant execute on function gnomon.instant_or_unknown(timestamptz)
   to authenticated, gnomon_worker, gnomon_definer;
 grant execute on function gnomon.node_lock_key(uuid, uuid)
   to authenticated, gnomon_worker, gnomon_definer;
-grant execute on function gnomon.lock_node_for_write(uuid, uuid)
-  to authenticated, gnomon_worker;
 grant execute on function gnomon.create_node(uuid, text, text)
   to authenticated, gnomon_worker;
 grant execute on function gnomon.list_citations(uuid, uuid)
@@ -218,8 +235,6 @@ grant execute on function gnomon.contribution_kind(uuid, uuid, uuid)
 grant execute on function gnomon.contribution_bound(uuid, bigint, text)
   to authenticated, gnomon_worker;
 grant execute on function gnomon.recompute_versions(uuid, uuid, boolean, timestamptz, timestamptz)
-  to authenticated, gnomon_worker;
-grant execute on function gnomon.recompute_node(uuid, uuid, timestamptz, timestamptz)
   to authenticated, gnomon_worker;
 grant execute on function gnomon.create_edge(uuid, text, text, uuid, uuid)
   to authenticated, gnomon_worker;
@@ -369,11 +384,6 @@ grant execute on function gnomon.erasure_reaches_summary(uuid, uuid)
   to gnomon_definer;
 grant execute on function gnomon.erase_summaries_and_communities(uuid, uuid[], uuid[])
   to gnomon_definer;
-
--- The range type's constructor, which the exclusion constraint on
--- `gnomon.version` calls with the caller's rights.
-grant execute on function gnomon.uuid_range(uuid, uuid, text)
-  to authenticated, gnomon_worker, gnomon_definer;
 
 -- Hand the definer functions to the definer role, after their grants are
 -- revoked: the migration role may revoke them only while it owns the

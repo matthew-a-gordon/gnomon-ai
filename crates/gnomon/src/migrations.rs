@@ -10,8 +10,8 @@ use std::str::FromStr;
 
 use chrono::SubsecRound;
 
-/// The placeholder a migration template uses for the embedding dimension.
-const DIMENSION_PLACEHOLDER: &str = "{{embedding_dimension}}";
+/// The line of `gnomon.embedding_dimension()` that states the dimension.
+const DIMENSION_LINE: &str = "as $$ select 1536 $$";
 
 /// One numbered migration. Once released, its template never changes.
 #[derive(Debug, Clone, Copy)]
@@ -365,9 +365,10 @@ impl Target {
         dimension: EmbeddingDimension,
         parent: Option<&str>,
     ) -> String {
-        let sql = m
-            .template
-            .replace(DIMENSION_PLACEHOLDER, &dimension.get().to_string());
+        let sql = m.template.replace(
+            DIMENSION_LINE,
+            &format!("as $$ select {} $$", dimension.get()),
+        );
         match self {
             Self::Plain => sql,
             Self::Supabase if m.version == CREATES_PGVECTOR => {

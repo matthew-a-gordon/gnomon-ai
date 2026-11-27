@@ -1,11 +1,39 @@
--- gnomon 0001: the schema. The floor checks, pgvector, the caller roles and
--- the definer role, the gnomon schema and its types, the schema_version
--- ledger, UUID v7, the tenancy mode and the reference Tenant and Scope
--- functions, and every table with its indexes and its Tenant and Scope
--- policies.
+-- gnomon 0001: the schema. The floor checks, the extensions, the caller
+-- roles and the definer role, the gnomon schema and its types, the
+-- schema_version ledger, UUID v7, the tenancy mode, the reference Tenant and
+-- Scope functions, and every table with its indexes and its Tenant and
+-- Scope policies.
 --
--- Floor: PostgreSQL 17 and pgvector 0.7.0. Nothing here uses a PG 18-only
--- feature.
+-- The six files define every object once. A consumer copies them into its
+-- own migration chain, unchanged but for the embedding dimension (see
+-- `gnomon.embedding_dimension()` below), and its tooling applies them in
+-- order, each in one transaction (ADR-0006). Once released, a file never
+-- changes: a later release adds new files.
+--
+-- Floor: PostgreSQL 17, pgvector 0.7.0 and btree_gist (ADR-0023). Nothing
+-- here uses a PG 18-only feature.
+--
+-- Search paths. Every gnomon function sets its `search_path`, and every path
+-- ends with `pg_temp` (ADR-0009). Postgres searches the temporary schema
+-- first for tables and types unless the path names it, so with an empty path
+-- a caller's temporary type could stand in for a built-in one inside a
+-- definer function. A function that uses pgvector has `pg_catalog,
+-- <pgvector's schema>, pg_temp`, and every other `pg_catalog, pg_temp`.
+--
+-- Tenancy modes (ADR-0005). Every row carries a Tenant, and every policy
+-- checks it. The mode decides how a call that names no Tenant is treated:
+--
+--   single-tenant  the call uses the default Tenant, which this file
+--                  creates. A caller whose claims bind no Tenant acts in
+--                  the default Tenant too.
+--   multi-tenant   the call fails, and never falls back to the default.
+--
+-- The files install single-tenant mode. A deployment that serves several
+-- Tenants switches once, at install or later, by running
+-- `select gnomon.switch_to_multi_tenant()` as the role that applied the
+-- files. The default Tenant then becomes its first Tenant: no row moves, so
+-- every row stays readable under that Tenant. The switch cannot be undone.
+-- The mode is a row, not DDL, so gnomon applies no DDL at runtime.
 
 do $$
 begin
@@ -15,7 +43,24 @@ begin
 end
 $$;
 
-create extension if not exists vector;
+-- The extensions: pgvector for Search and btree_gist for the exclusion
+-- constraint on Versions (ADR-0023). Each is created when it is missing, in
+-- `extensions` when that schema exists, as on Supabase, and in the
+-- migrating role's default schema otherwise. One already installed stays
+-- where it is. btree_gist is trusted, so the migrating role needs only
+-- CREATE on the database for it. On Azure Flexible Server both must be in
+-- `azure.extensions` first.
+do $$
+begin
+  if exists (select from pg_catalog.pg_namespace where nspname = 'extensions') then
+    create extension if not exists vector with schema extensions;
+    create extension if not exists btree_gist with schema extensions;
+  else
+    create extension if not exists vector;
+    create extension if not exists btree_gist;
+  end if;
+end
+$$;
 
 do $$
 declare
@@ -107,6 +152,27 @@ begin
 end
 $$;
 
+-- pgvector's names. The SQL in this file names pgvector's types, functions
+-- and operators without a schema, so the file sets `search_path` to
+-- `pg_catalog, <pgvector's schema>, pg_temp` for its own statements, and
+-- each function that uses pgvector keeps that path with `set search_path
+-- from current`. No caller's path can then change what a name means, as
+-- long as no untrusted role may CREATE in pgvector's schema. Moving the
+-- extension to another schema later breaks those functions. The runner's
+-- own path is saved first and restored at the end of the file, because a
+-- runner may apply several files in one session or one transaction.
+do $$
+begin
+  perform pg_catalog.set_config('gnomon.saved_search_path',
+                                pg_catalog.current_setting('search_path'), false);
+  perform pg_catalog.set_config('search_path', (
+    select pg_catalog.format('pg_catalog, %I, pg_temp', n.nspname)
+    from pg_catalog.pg_extension e
+    join pg_catalog.pg_namespace n on n.oid = e.extnamespace
+    where e.extname = 'vector'), false);
+end
+$$;
+
 -- Every gnomon object lives here. PostgREST does not expose this schema.
 create schema gnomon;
 
@@ -124,17 +190,20 @@ alter table gnomon.schema_version enable row level security;
 create policy schema_version_read on gnomon.schema_version
   for select to authenticated, gnomon_worker using (true);
 
--- The embedding dimension this chain was exported with. Vector columns in
--- later migrations are typed with the same value.
+-- The embedding dimension: the width of every embedding the Store keeps,
+-- and of their quantized bits. This line is the one place that states it. A
+-- consumer whose model has another width edits the number before applying
+-- the files. The vector and bit columns are untyped by width and checked
+-- against this function.
 create function gnomon.embedding_dimension() returns integer
-  language sql immutable parallel safe security invoker set search_path = ''
-  as $$ select {{embedding_dimension}} $$;
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  as $$ select 1536 $$;
 
 -- UUID v7 (RFC 9562): a 48-bit Unix millisecond timestamp, then random bits,
 -- with the version and variant set. PG 18's uuidv7() is not used, because
 -- the floor is PG 17. gen_random_uuid() is core since PG 13.
 create function gnomon.uuid_v7() returns uuid
-  language sql volatile parallel safe security invoker set search_path = ''
+  language sql volatile parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
     select encode(
       set_bit(
@@ -171,7 +240,7 @@ insert into gnomon.tenancy (mode, default_tenant_id) values ('single', gnomon.uu
 -- truncate, whoever runs them, the table's owner included. The switch's
 -- time is the transaction's, whatever the update says.
 create function gnomon.tenancy_guard_update() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if old.mode = 'single' and new.mode = 'multi'
@@ -190,7 +259,7 @@ create function gnomon.tenancy_guard_update() returns trigger
   $$;
 
 create function gnomon.tenancy_guard_remove() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     raise exception using errcode = 'GNT03',
@@ -242,7 +311,7 @@ create policy tenancy_switch on gnomon.tenancy for update
 -- Tenant, and a replacement must return `coalesce(<its Tenant>,
 -- gnomon.default_tenant())`.
 create function gnomon.tenant_id() returns uuid
-  language sql stable parallel safe security invoker set search_path = ''
+  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $fn$
         select coalesce(
           nullif(
@@ -255,7 +324,7 @@ create function gnomon.tenant_id() returns uuid
       $fn$;
 
 create function gnomon.allowed_scopes() returns text[]
-  language sql stable parallel safe security invoker set search_path = ''
+  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
     select coalesce(
       array(
@@ -274,7 +343,7 @@ create function gnomon.allowed_scopes() returns text[]
 -- so a caller whose claims bind no Tenant never reaches it once the
 -- deployment serves several Tenants.
 create function gnomon.default_tenant() returns uuid
-  language sql stable parallel safe security invoker set search_path = ''
+  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
     select t.default_tenant_id from gnomon.tenancy t where t.mode = 'single'
   $$;
@@ -292,7 +361,7 @@ create function gnomon.default_tenant() returns uuid
 -- RLS, so a direct SQL caller that names another Tenant still reaches
 -- nothing (ADR-0009).
 create function gnomon.call_tenant(p_tenant_id uuid) returns uuid
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_mode text;
@@ -334,7 +403,7 @@ create function gnomon.call_tenant(p_tenant_id uuid) returns uuid
 -- A role that the update cannot reach gets an error, never a silent
 -- single-tenant deployment.
 create function gnomon.switch_to_multi_tenant() returns uuid
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_mode text;
@@ -449,10 +518,6 @@ create type gnomon.time_precision as enum ('unknown', 'year', 'month', 'day', 'i
 -- Reference time, then Recorded time.
 create type gnomon.merge_rule as enum ('recency', 'ranked');
 
--- A range of uuid, so that the exclusion constraints can test equality with
--- the core GiST range operators. Postgres also creates its multirange type and
--- the constructor functions of both, which are internal functions.
-create type gnomon.uuid_range as range (subtype = uuid);
 
 -- A Node: a stable identity of a Kind, in one Scope. What is known about it
 -- is held in its Versions.
@@ -634,9 +699,11 @@ create table gnomon.version (
   check ((valid_from = '-infinity') = (valid_from_precision = 'unknown')),
   check ((valid_to = 'infinity') = (valid_to_precision = 'unknown')),
   check ((recorded_to = 'infinity') = (closed_in is null)),
+  -- No two Versions of a Node or an Edge overlap in both Valid time and
+  -- Recorded time. btree_gist gives uuid its GiST equality.
   constraint version_no_overlap exclude using gist (
-    gnomon.uuid_range(tenant_id, tenant_id, '[]') with &&,
-    gnomon.uuid_range(versioned_id, versioned_id, '[]') with &&,
+    tenant_id with =,
+    versioned_id with =,
     tstzrange(valid_from, valid_to) with &&,
     tstzrange(recorded_from, recorded_to) with &&
   ),
@@ -1033,35 +1100,24 @@ create policy search_scope_length_pending on gnomon.search_scope_length
 -- The key of a quantized row's foreign key to its Version.
 create unique index version_embedding_key on gnomon.version (tenant_id, scope, id, recorded_to);
 
-do $migration$
-declare
-  ext text := (
-    select n.nspname
-    from pg_catalog.pg_extension e
-    join pg_catalog.pg_namespace n on n.oid = e.extnamespace
-    where e.extname = 'vector');
-  run text;
-begin
-  foreach run in array array[
-$sql$
 -- The full vector of one text in one Scope.
 create table gnomon.embedding (
   tenant_id uuid not null,
   scope text not null,
   text_hash text not null check (text_hash ~ '^[0-9a-f]{64}$'),
-  embedding @extschema@.vector({{embedding_dimension}}) not null
-    check (@extschema@.vector_norm(embedding) > 0),
+  embedding vector not null
+    check (vector_dims(embedding) = gnomon.embedding_dimension())
+    check (vector_norm(embedding) > 0),
   primary key (tenant_id, scope, text_hash)
-)
-$sql$,
-$sql$
+);
+
 -- The quantized row of one Version.
 create table gnomon.embedding_bit (
   tenant_id uuid not null,
   scope text not null,
   version_id uuid not null,
   text_hash text not null,
-  q bit({{embedding_dimension}}) not null,
+  q bit varying not null check (length(q) = gnomon.embedding_dimension()),
   valid_from timestamptz not null,
   valid_to timestamptz not null,
   recorded_from timestamptz not null,
@@ -1072,13 +1128,7 @@ create table gnomon.embedding_bit (
     on update cascade on delete cascade,
   foreign key (tenant_id, scope, text_hash)
     references gnomon.embedding (tenant_id, scope, text_hash)
-)
-$sql$
-  ] loop
-    execute replace(run, '@extschema@', quote_ident(ext));
-  end loop;
-end
-$migration$;
+);
 -- A full vector is read by a re-rank probe from one heap page. A row of
 -- more than about 1,900 dimensions does not fit in a page, and is stored out
 -- of line without compression instead.
@@ -1230,7 +1280,7 @@ create index community_citation_tenant_scope on gnomon.community_citation
   (tenant_id, scope, community_id);
 
 -- RLS: the Tenant and the Scopes of the call, for the callers and for the
--- definer, as on every other table (ADR-0005, migration 0011).
+-- definer, as on every other table (ADR-0005).
 do $$
 declare
   t text;
@@ -1263,7 +1313,7 @@ create table gnomon.node_name (
   recorded_to timestamptz not null,
   -- The bits of the stored full vector of the text, or null while none is
   -- stored.
-  q bit({{embedding_dimension}}),
+  q bit varying check (length(q) = gnomon.embedding_dimension()),
   -- The text's hash while the row has bits, for the foreign key to the full
   -- vector.
   embedded_hash text generated always as (case when q is not null then text_hash end) stored,
@@ -1331,17 +1381,6 @@ create unique index summary_embedding_key on gnomon.summary (tenant_id, scope, i
 create unique index community_embedding_key on gnomon.community
   (tenant_id, scope, id, recorded_to);
 
-do $migration$
-declare
-  ext text := (
-    select n.nspname
-    from pg_catalog.pg_extension e
-    join pg_catalog.pg_namespace n on n.oid = e.extnamespace
-    where e.extname = 'vector');
-  run text;
-begin
-  foreach run in array array[
-$sql$
 -- The embedding of one Summary's or Community's text.
 create table gnomon.derived_embedding (
   tenant_id uuid not null,
@@ -1349,11 +1388,12 @@ create table gnomon.derived_embedding (
   summary_id uuid,
   community_id uuid,
   derived_id uuid generated always as (coalesce(summary_id, community_id)) stored,
-  embedding @extschema@.vector({{embedding_dimension}}) not null
-    check (@extschema@.vector_norm(embedding) > 0),
+  embedding vector not null
+    check (vector_dims(embedding) = gnomon.embedding_dimension())
+    check (vector_norm(embedding) > 0),
   -- The bits of `embedding`, and the row's `as_of_valid` and Recorded time,
   -- which a trigger sets.
-  q bit({{embedding_dimension}}) not null,
+  q bit varying not null check (length(q) = gnomon.embedding_dimension()),
   as_of_valid timestamptz not null,
   recorded_from timestamptz not null,
   recorded_to timestamptz not null,
@@ -1365,13 +1405,7 @@ create table gnomon.derived_embedding (
     references gnomon.community (tenant_id, scope, id, recorded_to)
     on update cascade on delete cascade,
   check (num_nonnulls(summary_id, community_id) = 1)
-)
-$sql$
-  ] loop
-    execute replace(run, '@extschema@', quote_ident(ext));
-  end loop;
-end
-$migration$;
+);
 -- A full vector is read by a re-rank probe from one heap page, as migration
 -- 0017 stores `gnomon.embedding`.
 do $$
@@ -1402,5 +1436,14 @@ create policy derived_embedding_tenant_scope on gnomon.derived_embedding
   for all to authenticated, gnomon_worker, gnomon_definer
   using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
   with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
+
+-- The runner's own search path again (see pgvector's names above).
+do $$
+begin
+  perform pg_catalog.set_config('search_path',
+                                pg_catalog.current_setting('gnomon.saved_search_path'), false);
+  perform pg_catalog.set_config('gnomon.saved_search_path', '', false);
+end
+$$;
 
 insert into gnomon.schema_version (version, name) values (1, '0001_schema');
