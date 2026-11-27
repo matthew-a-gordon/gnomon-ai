@@ -17,6 +17,24 @@ The suite runs in four lanes, and none replaces another:
 
 Lane 3 exists apart from lane 2 because the two test different things. The bare image tests the database. The CLI stack tests the path a Supabase consumer takes: migrations the CLI applies, the stack's own roles, and PostgREST in front of the database. Lane 3 runs with the stack's pooler off. Supavisor is lane 4's.
 
+## What CI runs, and when
+
+GitHub Actions runs `.github/workflows/ci.yml` on each pull request and on demand (`workflow_dispatch`), never on a push to `main`. Three jobs run in parallel:
+
+| Job | Runs |
+|---|---|
+| `test-pg17` | `cargo nextest run --workspace`, which is lane 1 |
+| `test-supabase` | The same with `GNOMON_TEST_IMAGE=supabase`, which is lane 2 |
+| `lint` | `cargo fmt --all --check`, and `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+
+A ruleset on `main` requires the three checks, accepted only from GitHub Actions, and requires the branch to be up to date, so the pull request run tests what lands on `main`. The repository admin role can bypass it, so the owner can still commit documents directly. No run caches anything. We accept that each new pull request builds from nothing, and that a direct commit to `main` runs no tests. The builds leave out debug information.
+
+The repository is public, so the workflow token only reads the repository, the workflow uses no secret, it is triggered by `pull_request` and never `pull_request_target`, and every third-party action is pinned to a full commit SHA. Lanes 3 and 4 run on demand.
+
+Only the performance suite asserts a time budget, and CI does not run it, because it needs a quiet machine. CI builds it through Clippy's `--all-features`. The time limits in `.config/nextest.toml` stop a hung test and are not budgets.
+
+`rust-toolchain.toml` pins the toolchain CI uses. That version is also the minimum supported Rust version, so `rust-version` in `Cargo.toml` moves with it. Nothing is released, so a recent minimum costs no consumer anything.
+
 ## Considered options
 
 - `sqlx` as the test driver. Its `statement_cache_capacity(0)` still sends named statements (the `prototype/pooler-prepared-statements` branch), so the suites would not test the statement mode the Store uses.

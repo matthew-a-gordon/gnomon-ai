@@ -2,6 +2,24 @@
 
 The suite runs with plain `cargo test` or with `cargo nextest run`, and every test passes under both. ADR-0020 records why the suite is built this way. The performance suite is separate and runs only on demand: see "The performance suite" below.
 
+## What CI runs
+
+`.github/workflows/ci.yml` runs on each pull request, and on demand through `workflow_dispatch`. It does not run on pushes to `main`, and it caches nothing. ADR-0020 records why.
+
+| Job | Runs |
+|---|---|
+| `test-pg17` | `cargo nextest run --workspace` on `pgvector/pgvector:pg17` |
+| `test-supabase` | The same on `supabase/postgres` 17.x (`GNOMON_TEST_IMAGE=supabase`) |
+| `lint` | `cargo fmt --all --check`, and `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+
+The three names are the required status checks of the ruleset on `main`. A change to a job's name changes the ruleset too.
+
+Both test jobs fetch the pinned Supabase CLI and pull their database image before the tests start, so neither download counts against a test's time limit. The workflow names each image itself, so a new image tag in `tests/support/server.rs` goes into `ci.yml` too. Builds leave out debug information (`CARGO_PROFILE_DEV_DEBUG=0`).
+
+`rust-toolchain.toml` pins the Rust version, and rustup installs it on your machine as it does in CI. It is also the minimum supported Rust version: change `rust-version` in `Cargo.toml` with it. The versions of cargo-nextest and uv are set at the top of `ci.yml`.
+
+Lanes 3 and 4 and the performance suite run on demand. Only the performance suite asserts a time budget.
+
 ## What runs where
 
 - `crates/gnomon/tests/export.rs` drives `gnomon migrations export` through the binary for the plain and supabase targets. It needs no database. It shows that a re-export after a new release adds only the new migrations, with Supabase versions after every migration already in the chain, and refuses to rewrite a released one. It also compares the supabase and alembic output with the released copies in `crates/gnomon/tests/golden`, because consumers commit that output and a re-export refuses a released file that changed. A unit test in `crates/gnomon/src/migrations.rs` exports a fake newer release on every target.

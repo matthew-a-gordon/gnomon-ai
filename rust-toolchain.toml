@@ -1,0 +1,6 @@
+# The pinned toolchain. CI builds with it, and it is the minimum supported Rust
+# version: `rust-version` in Cargo.toml moves with it (ADR-0020).
+[toolchain]
+channel = "1.93.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
