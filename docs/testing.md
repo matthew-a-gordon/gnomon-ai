@@ -14,7 +14,7 @@ The suite runs with plain `cargo test` or with `cargo nextest run`, and every te
 
 The three names are the required status checks of the ruleset on `main`. A change to a job's name changes the ruleset too.
 
-Both test jobs fetch the pinned Supabase CLI and pull their database image before the tests start, so neither download counts against a test's time limit. The workflow names each image itself, so a new image tag in `tests/support/server.rs` goes into `ci.yml` too. Builds leave out debug information (`CARGO_PROFILE_DEV_DEBUG=0`).
+Both test jobs install the pinned Supabase CLI with Supabase's `setup-cli` action and pull their database image before the tests start, so neither download counts against a test's time limit. They set `GNOMON_TEST_SUPABASE_CLI=supabase`, so the suite runs the installed CLI. The workflow names each image itself, so a new image tag in `tests/support/server.rs` goes into `ci.yml` too. Builds leave out debug information (`CARGO_PROFILE_DEV_DEBUG=0`).
 
 `rust-toolchain.toml` pins the Rust version, and rustup installs it on your machine as it does in CI. It is also the minimum supported Rust version: change `rust-version` in `Cargo.toml` with it. The versions of cargo-nextest and uv are set at the top of `ci.yml`.
 
@@ -23,7 +23,7 @@ Lanes 3 and 4 and the performance suite run on demand. Only the performance suit
 ## What runs where
 
 - `crates/gnomon/tests/export.rs` drives `gnomon migrations export` through the binary for the plain and supabase targets. It needs no database. It shows that a re-export after a new release adds only the new migrations, with Supabase versions after every migration already in the chain, and refuses to rewrite a released one. It also compares the supabase and alembic output with the released copies in `crates/gnomon/tests/golden`, because consumers commit that output and a re-export refuses a released file that changed. A unit test in `crates/gnomon/src/migrations.rs` exports a fake newer release on every target.
-- `crates/gnomon/tests/supabase_target.rs` applies the supabase export with the Supabase CLI's own runner, `supabase migration up`, to a database of the suite's server: an earlier release, then a consumer's later migration, then the new release, of which the CLI applies only the new migration. It needs `npx`.
+- `crates/gnomon/tests/supabase_target.rs` applies the supabase export with the Supabase CLI's own runner, `supabase migration up`, to a database of the suite's server: an earlier release, then a consumer's later migration, then the new release, of which the CLI applies only the new migration. It needs `npx`, or an installed CLI that `GNOMON_TEST_SUPABASE_CLI` names.
 - `crates/gnomon/tests/alembic.rs` drives the alembic target and checks the result with Alembic itself: the down-revision links `alembic history` reports, a single head, the consumer's own revisions before and after gnomon's, and `alembic upgrade head` giving a schema the Store accepts, first from an empty chain and then from an earlier release's. It needs `uvx`, and its last two tests need a database.
 - `crates/gnomon/tests/supabase_cli.rs` is lane 3 only, ignored elsewhere. On the Supabase CLI stack it shows that the CLI applied every gnomon migration as `postgres`, that PostgREST reaches no gnomon table or function, and that no schema PostgREST exposes holds what the migrations created.
 - `crates/gnomon/tests/store_api.rs` is seam 1: the Rust core's Store API against real Postgres. Two of its tests record the wire through a proxy: by default every call sends only unnamed statements, inside one transaction that sets its role and claims locally, and with named statements turned on each statement is prepared once per connection and reused. The second connects straight to the server, behind any pooler, because a lane's pooler may not support named statements. A third shows that a batch As-of read of fifty Nodes sends exactly what a read of one Node sends, and that it and a traversal are each one Store function call in one transaction.
@@ -78,7 +78,7 @@ To check that nothing is left: `docker ps -a --filter name=gnomon-test`. To remo
 `GNOMON_TEST_TARGET` picks the export target whose own tool builds the template database. The suite then runs against a schema that tool applied.
 
 - `plain`, the default, applies each file in one transaction.
-- `supabase` exports into a temporary `supabase/migrations` and runs `supabase migration up --remote=<url>` with the pinned CLI through `npx`. Lane 3 uses it.
+- `supabase` exports into a temporary `supabase/migrations` and runs `supabase migration up --remote=<url>` with the pinned CLI through `npx`. Lane 3 uses it. `GNOMON_TEST_SUPABASE_CLI` names an installed CLI to run instead, such as `supabase`. Install the version that `SUPABASE_CLI` in `tests/support/mod.rs` pins.
 - `alembic` exports into a temporary Alembic project and runs `alembic upgrade head` through `uvx`, with Alembic, SQLAlchemy and psycopg pinned, so nothing is installed globally. Its `env.py` runs every pending revision in one transaction, as Alembic's own template does.
 
 ```sh

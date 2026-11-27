@@ -46,19 +46,27 @@ jobs:
       - name: Install uv, for uvx
         run: pipx install "uv==$UV_VERSION"
 
-      # The harness would fetch these inside the first tests that need them, and
-      # that time would count against those tests' limits. Several tests run npx
-      # at once, which is also unsafe while the package is not yet installed.
-      - name: Fetch the Supabase CLI
+      # The test harness holds the one pin of the CLI's version. Without a
+      # version the action would install the latest release.
+      - name: Read the pinned Supabase CLI version
+        id: supabase-cli
         run: |
-          cli=$(sed -n 's/^pub const SUPABASE_CLI: &str = "\(.*\)";$/\1/p' crates/gnomon/tests/support/mod.rs)
-          test -n "$cli"
-          npx --yes "$cli" --version
+          version=$(sed -n 's/^pub const SUPABASE_CLI: &str = "supabase@\(.*\)";$/\1/p' crates/gnomon/tests/support/mod.rs)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - uses: supabase/setup-cli@689adcfb80d947100a1eab127289b97d1fb07b13 # v3.2.0
+        with:
+          version: ${{ steps.supabase-cli.outputs.version }}
+
+      # The harness would pull this inside the first tests that need it, and
+      # that time would count against those tests' limits.
       - name: Pull the test database image
         run: docker pull "$TEST_IMAGE_REF"
 
       - run: cargo nextest run --workspace
+        env:
+          GNOMON_TEST_SUPABASE_CLI: supabase
 
     env:
       GNOMON_TEST_IMAGE: pgvector
