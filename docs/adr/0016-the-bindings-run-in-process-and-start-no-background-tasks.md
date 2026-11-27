@@ -24,7 +24,12 @@ A consumer creates one client object per process, at module scope, and creating 
 
 ## Types
 
-Property values cross the bindings as plain JSON (a Python dict or a JS object), and the Store validates them on every write (ADR-0002). `gnomon kinds export --format json-schema` writes one flattened schema per Kind from a deployment's registry, and a consumer runs its own generator in its build. The bindings generate no Kind-specific classes. The Python package ships `.pyi` stubs and a `py.typed` marker, and the Node package ships `.d.ts` files. Both are checked into the repository. The `.pyi` stubs are written by hand, and a CI test runs mypy `stubtest` against the built module, so a stub that drifts from the module fails. napi-rs generates the `.d.ts` files from the shared Rust types, and a CI test fails when the checked-in files differ from the build.
+Property values cross the bindings as plain JSON (a Python dict or a JS object), and the Store validates them on every write (ADR-0002). `gnomon kinds export --format json-schema` writes one flattened schema per Kind from a deployment's registry, and a consumer runs its own generator in its build. The bindings generate no Kind-specific classes. The Python package ships `.pyi` stubs and a `py.typed` marker, and the Node package ships `.d.ts` files. Both are generated, checked into the repository, and a CI test fails when the checked-in files differ from the build. napi-rs generates the `.d.ts` files. PyO3's `experimental-inspect` feature and `maturin generate-stubs` generate the `.pyi` stubs, from the oldest Python version the wheels support (`abi3-py310`).
+
+- An async method is built with `pyo3_async_runtimes::tokio::future_into_py`, which returns `Bound<PyAny>`, so its `#[pyo3(signature = ...)]` states its Python return type, such as `collections.abc.Coroutine[typing.Any, typing.Any, Context]`. Plain JSON values are annotated the same way.
+- Each exception is a `#[pyclass(extends = PyException)]`, because PyO3 does not introspect `create_exception!` yet.
+- The module is an inline `#[pymodule] mod` with no `#[pymodule_init]` function that takes the module, so the stubs are complete.
+- CI also runs mypy `stubtest` against the built module, and a test fails when a public function or method in the stubs returns `typing.Any` or `Incomplete`. That catches a missing annotation.
 
 ## Packaging
 
@@ -42,7 +47,8 @@ The OTLP exporter is behind an `otlp` Cargo feature that is off by default. The 
 - Configuration only, with no callbacks. It would avoid the cancellation and callback-latency questions below, but a consumer with a model provider gnomon has no adapter for would need a proxy.
 - Telling serverless consumers to deploy the server for its worker. The bindings would be smaller, but it removes the reason for in-process bindings in ADR-0001.
 - A larger pool with a background keepalive. It cuts reconnect time on a warm function, but the keepalive is a background task, and many concurrent function instances could exhaust a pooler's connection limit.
-- Generating the `.pyi` stubs with `pyo3-stub-gen` or with PyO3's `experimental-inspect` and `maturin generate-stubs`. `pyo3-stub-gen` is pre-1.0, and its return type for an `async fn` is unconfirmed. PyO3 marks its own generator as in development (`docs/research/bindings.md`). Reconsider when PyO3's generator leaves development.
+- Hand-written `.pyi` stubs checked with `stubtest`, which PyO3's typing guide still calls the best current solution. Every new method or changed argument would need a second edit in a second file, and `stubtest` reports a missing one only after the fact. Most of PyO3's generator is done (PyO3 issue 5137), and the gaps that matter to gnomon have the workarounds above.
+- `pyo3-stub-gen`. It is released and widely used, but it needs its own macro on every item, placed before PyO3's, a `stub_gen` binary and an `rlib` crate type. A `future_into_py` method needs a return override in it too. It is the fallback if a gap in PyO3's generator blocks the bindings.
 - Generating typed classes per Kind at install or import time. It needs a database connection at build time and a generator in each language.
 - Separate version numbers per package. A consumer would have to match binding and server versions against a schema version.
 
@@ -50,7 +56,7 @@ The OTLP exporter is behind an `otlp` Cargo feature that is off by default. The 
 
 - Dropping a Python awaitable cancels the Rust future, and dropping a JS Promise does not. Neither passes cancellation to a callback, so every callback runs under the call's deadline (`docs/research/bindings.md`).
 - Callback latency has not been measured.
-- A change to a Python-facing signature needs a hand edit to the `.pyi` stubs, and `stubtest` fails the build until it is made.
+- PyO3 marks `experimental-inspect` as in development, so its output can change between PyO3 releases. PyO3 is pinned and bumped on purpose, and the checked-in stubs show any change in the pull request that bumps it.
 - Cloudflare Workers and Supabase Edge Functions are expected to rule out a native module, so they use the server. That rests on a claim the research did not confirm from a primary source.
 - Free-threaded Python wheels wait until the stable ABI covers them. macOS x64 and WASI are not shipped.
 - The conformance suite replays each case through the Rust API, both bindings, the HTTP API and the MCP tools (ADR-0017).

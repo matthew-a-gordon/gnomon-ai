@@ -410,7 +410,7 @@ These decisions exist in code or tickets but in no ADR:
 
 *Status of the open decisions, taken as finding 9: decided.*
 
-- *The Python stubs are hand-written and checked with mypy `stubtest`, and napi-rs generates the `.d.ts` files (ADR-0016, #58).*
+- *PyO3's `experimental-inspect` generates the Python stubs, checked with a diff, mypy `stubtest` and a test that no public return is `Any`. napi-rs generates the `.d.ts` files (ADR-0016, #58). This was first decided as hand-written stubs, from the research and PyO3's typing guide. PyO3's tracking issue 5137 shows most of the generator done, and the two gaps that matter here, exceptions and `future_into_py` return types, have workarounds. `pyo3-stub-gen` is the fallback.*
 - *The shared types derive `schemars::JsonSchema`, and the OpenAPI 3.1 document is built from a route table (ADR-0017, #50, #56).*
 - *The configuration is one plain serde type with a `GNOMON_` environment overlay and no configuration crate (#27).*
 - *The public API keeps `chrono` (ADR-0001, #82).*
