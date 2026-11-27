@@ -67,5 +67,5 @@ A prototype has no named mutation. The two-runs check above stands in its place.
 - A Node moves only to a neighbour's community. So a warm start can keep two halves that no Edge joins as one Community, which a cold run splits (`tests/warm_start_limits.rs`, with the early stop and without it). No Community of this run was disconnected under either strategy.
 - The size cap never bound, because the largest Community had 80 Nodes against a cap of 100.
 - No Community under three Nodes was detected. So starting from the stored Communities, as the Pipeline will, would have given the detector the same input as the whole previous partition did.
-- The same seed on every refresh makes cold runs on similar graphs agree more than runs with changing seeds would.
+- Both strategies used one detector seed on every refresh, as #91 asks. A seed that changes between refreshes was not measured.
 - Only the sequential path ran. `leiden-rs`'s default `rayon` feature takes a parallel path on a graph this size, and its stability and repeatability were not measured.
