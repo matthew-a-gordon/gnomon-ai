@@ -1,4 +1,4 @@
-//! Stage records (ADR-0011, migration 0014).
+//! Stage records (ADR-0011, `0003_reads_and_writes.sql`).
 //!
 //! The Pipeline's `add_episode` commits each stage's output together with the
 //! stage's record, so a retry resumes at the first unfinished stage. A

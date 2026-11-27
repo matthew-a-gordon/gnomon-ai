@@ -1,4 +1,6 @@
--- gnomon migration 0003: Kinds and the Ontology.
+-- gnomon 0002: Kinds. The root and reserved Kinds, Kind registration and
+-- its JSON Schema profile, Kind reads and lineage, and the merge rules
+-- (ADR-0002, ADR-0007, ADR-0012).
 --
 -- A Kind is a named class of Node or of Edge. It declares its properties in
 -- a profile of JSON Schema 2020-12, may specialize one parent Kind, and, for
@@ -20,104 +22,87 @@
 --
 -- Kind registration is one of the four SECURITY DEFINER groups (ADR-0009).
 -- It is owned by `gnomon_definer`, a NOLOGIN role that cannot bypass RLS,
--- and checks the Tenant against `gnomon.tenant_id()`. This migration grants
--- no caller role the right to execute it: each deployment grants that to the
--- roles it chooses.
+-- and checks the Tenant against `gnomon.tenant_id()`. The files grant no
+-- caller role the right to execute it: each deployment grants that to the
+-- roles it chooses. The role that applies the files needs CREATEROLE, or
+-- must already be able to SET ROLE to an existing `gnomon_definer`, so that
+-- it can create the role and hand it the function.
 --
--- The role that applies this migration needs CREATEROLE, or must already be
--- able to SET ROLE to an existing `gnomon_definer`, so that it can create the
--- role and hand it the function.
-
--- The definer role. It owns the definer functions and nothing else, never
--- logs in, and stays under RLS, so the Tenant policies below still apply
--- inside the definer functions. A role of that name that already exists must
--- hold no more than this.
-do $$
-begin
-  if not exists (select from pg_roles where rolname = 'gnomon_definer') then
-    create role gnomon_definer nologin noinherit nobypassrls;
-  end if;
-  if exists (
-    select from pg_roles
-    where rolname = 'gnomon_definer'
-      and (rolcanlogin or rolsuper or rolbypassrls or rolcreaterole or rolcreatedb or rolreplication)
-  ) then
-    raise exception 'the gnomon role gnomon_definer must be NOLOGIN, must not bypass RLS, '
-      'and must not create roles or databases or replicate';
-  end if;
-  if exists (
-    select from pg_auth_members m join pg_roles r on r.oid = m.member
-    where r.rolname = 'gnomon_definer'
-  ) then
-    raise exception 'the gnomon role gnomon_definer must not be a member of another role';
-  end if;
-end
-$$;
-
-grant usage on schema gnomon to gnomon_definer;
-grant execute on function gnomon.tenant_id() to gnomon_definer;
-
--- One row per registered Kind, flattened with its ancestors.
-create table gnomon.kind (
-  tenant_id uuid not null,
-  name text not null
-    check (name ~ '^[A-Za-z][A-Za-z0-9_]{0,62}$' and name not in ('node', 'edge')),
-  kind_of text not null check (kind_of in ('node', 'edge')),
-  -- The parent Kind: a registered Kind of the same kind_of, or that root Kind.
-  parent text not null,
-  -- Every ancestor, the root first and the parent last.
-  ancestors text[] not null check (cardinality(ancestors) > 0),
-  -- The flattened property schema: {"type": "object", "properties": {...},
-  -- "required": [...]}, the Kind's own properties with its ancestors'.
-  properties jsonb not null,
-  -- What feeds Search, inherited and own: property names, or `name` and
-  -- `aliases` (Node Kinds) or `sentence` (Edge Kinds).
-  search text[] not null,
-  -- The Node Kinds an Edge Kind may join, at its source and at its target.
-  -- A Node of one of these Kinds, or of any Kind below one, qualifies.
-  source_kinds text[],
-  target_kinds text[],
-  -- The arguments the Kind was registered with, so that registering the same
-  -- Kind again is recognised as a repeat.
-  definition jsonb not null,
-  registered_at timestamptz not null default transaction_timestamp(),
-  primary key (tenant_id, name),
-  check (
-    (kind_of = 'edge') = (source_kinds is not null and target_kinds is not null)
-  )
-);
-
--- The compiled rules: one jsonpath predicate per property of the flattened
--- Kind. `jsonb_path_match(value, rule)` is true exactly when the value
--- satisfies the property's schema, and is never null. A null value ends a
--- property, so the write path checks only non-null values against the rule.
-create table gnomon.kind_rule (
-  tenant_id uuid not null,
-  kind text not null,
-  property text not null,
-  rule jsonpath not null,
-  primary key (tenant_id, kind, property),
-  foreign key (tenant_id, kind) references gnomon.kind (tenant_id, name)
-);
-
--- Every Scope of a Tenant shares its Ontology, so these policies check the
--- Tenant alone. The primary keys lead with the Tenant and serve them.
-alter table gnomon.kind enable row level security;
-alter table gnomon.kind_rule enable row level security;
-
-create policy kind_tenant on gnomon.kind
-  for select to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id());
-create policy kind_tenant_register on gnomon.kind
-  for insert to gnomon_definer
-  with check (tenant_id = gnomon.tenant_id());
-
-create policy kind_rule_tenant on gnomon.kind_rule
-  for select to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id());
-create policy kind_rule_tenant_register on gnomon.kind_rule
-  for insert to gnomon_definer
-  with check (tenant_id = gnomon.tenant_id());
+-- Ranked merge and Authority. A Kind can turn ranked merge on. A Node of a
+-- Kind that ranks has its Versions' values chosen by Authority, then
+-- Reference time, then Recorded time (ADR-0007). Without ranked merge the
+-- order is Reference time, then Recorded time. Authority is an integer the
+-- consumer gives an Episode, and an Episode with none ranks as 0.
+--
+-- Authority decides only between Contributions whose Valid times overlap.
+-- The merge cuts a Node's Valid time into segments at every Contribution
+-- bound and picks each property's winner in each segment, so a period that
+-- only one Contribution covers keeps that Contribution whatever its
+-- Authority, and Authority never reaches across a gap.
+--
+-- Authority ranks statements as it ranks values. A null from a
+-- lower-Authority Episode, an End of validity, loses to the values a
+-- higher-Authority Episode supplied where their Valid times overlap, and a
+-- bound statement moves a Contribution's bound only if its Episode's
+-- Authority is at least that of the Contribution's Episode. A losing
+-- statement is never deleted: it stays held, and takes effect if the
+-- higher-Authority Episode is erased.
+--
+-- The rule is a property of a Kind. A child Kind inherits its ancestors'
+-- rule: it ranks if it or any ancestor does, so a child Kind may turn ranked
+-- merge on and may not turn it off while an ancestor ranks. Each change of a
+-- Kind's own rule is a new row of `gnomon.kind_merge`, the latest of which
+-- holds, so no row is updated. Only `gnomon.set_merge_rule` writes it, a
+-- SECURITY DEFINER function like Kind registration (ADR-0009), granted to no
+-- caller role.
+--
+-- Each Version records the rule that chose its values in `merge_rule`, and a
+-- change to a Kind's rule applies to later writes only: it changes no
+-- existing Version. A write recomputes its Valid time widened to the whole of
+-- every open Version it overlaps or touches, so a Version outside that window
+-- keeps the rule it was written under, and one inside it is chosen again
+-- under the Kind's rule at the time of the write. A Version that choice
+-- leaves unchanged keeps its recorded rule. Erasure recomputes each Version
+-- under its recorded rule.
+--
+-- Bound statements are read as stored. A statement from an Episode that
+-- loses on Authority is recorded as a Refinement or a Correction as the
+-- earlier bound decides, even though the merge ignores it, so one
+-- `state_bound` call can return `correction` while some of the rows it wrote
+-- are held.
+--
+-- The reserved Edge Kinds `same_as` and `different_from`. Resolution records
+-- its findings as Edges, not as merged Nodes (ADR-0012). When two Nodes
+-- prove to be one thing, a `same_as` Edge says so, and a `different_from`
+-- Edge records that two are not. Every Ontology has both Kinds, each joining
+-- any Node to any other Node. They are ordinary Edges, so Valid time,
+-- Citations, Retraction and Erasure apply to them with no new mechanism, and
+-- reads do not collapse the Nodes they join.
+--
+-- Like the root Kinds, the reserved Kinds are not rows:
+-- `gnomon.reserved_kinds()` defines them once for every Tenant, so a Tenant
+-- has them from the moment it first appears, whenever that is, and no
+-- consumer registers them. Each is an Edge Kind below the root Kind `edge`,
+-- with no properties of its own.
+--
+-- Both are symmetric: an Edge of either joins its two Nodes in no direction.
+-- The Store keeps one such Edge per Kind, pair of Nodes and Scope, with its
+-- endpoints stored in a canonical order, the lower Node ID as the source.
+-- Creating one from A to B and then from B to A returns the same Edge, and a
+-- traversal follows it from either Node in either direction. A Retraction
+-- ends it and it stays the same Edge, so a later write states that it holds
+-- again. An Erasure deletes it, and creating it again creates a new Edge.
+-- The Edge lives in one Scope like any Edge, so the same pair of Nodes may
+-- have one in each Scope.
+--
+-- No consumer can remove, redefine or reuse the two names. They are not
+-- rows, so there is nothing to delete or rewrite, and Kind registration
+-- refuses to register a Kind of either name: a trigger on `gnomon.kind`
+-- refuses the row it would insert. A Kind cannot specialize one, because
+-- registration finds no registered parent of that name, and no Edge Kind
+-- can name one as an endpoint, because neither is a Node Kind. The
+-- merge-rule setter finds no registered Kind of either name either, so both
+-- keep the recency rule.
 
 -- The root Kinds every Ontology has. Node Kinds search the name and Aliases
 -- by default and Edge Kinds the Sentence (ADR-0002, ADR-0010); child Kinds
@@ -130,7 +115,7 @@ create function gnomon.root_kinds()
     source_kinds text[],
     target_kinds text[]
   )
-  language sql immutable parallel safe security invoker set search_path = ''
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
     values
       ('node', 'node', array['name', 'aliases'], null::text[], null::text[]),
@@ -141,7 +126,7 @@ create function gnomon.root_kinds()
 -- (ADR-0002). `format` is limited to date, date-time and uuid.
 create function gnomon.kind_profile_keywords()
   returns text[]
-  language sql immutable parallel safe security invoker set search_path = ''
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
     select array[
       'type', 'properties', 'required', 'enum', 'const', 'items',
@@ -153,7 +138,7 @@ create function gnomon.kind_profile_keywords()
 -- A property name as one JSON Pointer token (RFC 6901), for error messages.
 create function gnomon.json_pointer_token(p_key text)
   returns text
-  language sql immutable parallel safe security invoker set search_path = ''
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$ select replace(replace(p_key, '~', '~0'), '/', '~1') $$;
 
 -- Validates one schema of the profile and compiles it to a jsonpath
@@ -176,7 +161,7 @@ create function gnomon.json_pointer_token(p_key text)
 -- maps unknown to false.
 create function gnomon.compile_kind_schema(p_schema jsonb, p_subject text, p_at text)
   returns text
-  language plpgsql immutable parallel safe security invoker set search_path = ''
+  language plpgsql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     supported constant text[] := gnomon.kind_profile_keywords();
@@ -463,7 +448,7 @@ create function gnomon.compile_kind_schema(p_schema jsonb, p_subject text, p_at 
 -- unknown mapped to false, so `jsonb_path_match` is always true or false.
 create function gnomon.compile_kind_property(p_schema jsonb, p_at text)
   returns jsonpath
-  language sql immutable parallel safe security invoker set search_path = ''
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
     select format(
       'strict !(!(%1$s) || (%1$s) is unknown)',
@@ -499,7 +484,7 @@ create function gnomon.register_kind(
   p_source_kinds text[],
   p_target_kinds text[]
 ) returns void
-  language plpgsql volatile security definer set search_path = ''
+  language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
   as $$
   declare
     reserved constant text[] := array['name', 'aliases', 'sentence'];
@@ -719,7 +704,7 @@ create function gnomon.kind_endpoints(
   p_parent_kinds text[],
   p_end text
 ) returns text[]
-  language plpgsql stable parallel safe security invoker set search_path = ''
+  language plpgsql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     k text;
@@ -751,8 +736,175 @@ create function gnomon.kind_endpoints(
   end
   $$;
 
--- Reads one Kind of the caller's Tenant, flattened: a root Kind or a
--- registered one, with its compiled rules as {property: rule}.
+-- A refused write raises SQLSTATE GNW01, an invalid write, with a message
+-- that says why. The messages come from these files, so every image
+-- refuses a write the same way.
+
+-- The properties every Node has whatever its Kind, and their rules: a name,
+-- and Aliases, the other names it is known by (ADR-0002).
+create function gnomon.node_builtin_rules()
+  returns table (property text, rule jsonpath)
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  as $$
+    values
+      ('name', 'strict $.type() == "string"'::jsonpath),
+      ('aliases', 'strict $.type() == "array" && !exists($[*] ? (@.type() != "string"))'::jsonpath)
+  $$;
+
+-- The merge rule a Kind has: `ranked` if it or any ancestor ranks, else
+-- `recency`. A root Kind, a Kind the Tenant has not registered and a Kind
+-- nobody changed use `recency`.
+create function gnomon.kind_merge_rule(p_tenant_id uuid, p_kind text)
+  returns text
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
+  as $$
+    select case when exists (
+      select from gnomon.kind k
+      cross join lateral unnest(k.ancestors || k.name) a(name)
+      where k.tenant_id = p_tenant_id and k.name = p_kind
+        and (select m.merge_rule from gnomon.kind_merge m
+              where m.tenant_id = k.tenant_id and m.kind = a.name
+              order by m.id desc limit 1) = 'ranked'
+    ) then 'ranked' else 'recency' end
+  $$;
+
+-- Sets a Kind's own merge rule, `recency` or `ranked`. It applies to later
+-- writes only. A Kind below a Kind that ranks cannot turn ranked merge off,
+-- and a root Kind has no rule of its own to set.
+--
+-- This is a definer function, owned by gnomon_definer, so that callers need
+-- no write grant on `kind_merge`. It refuses any Tenant but the caller's, and
+-- RLS checks the Tenant again on the row it writes. Setting the rule a Kind
+-- already has changes nothing.
+create function gnomon.set_merge_rule(p_tenant_id uuid, p_kind text, p_rule text)
+  returns void
+  language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
+  as $$
+  declare
+    v_ancestors text[];
+    v_blocker text;
+    v_own text;
+  begin
+    if p_tenant_id is null or p_tenant_id is distinct from gnomon.tenant_id() then
+      raise exception using errcode = 'insufficient_privilege',
+        message = 'setting a merge rule may set it only in the caller''s own Tenant';
+    end if;
+    -- Rule changes of a Tenant serialise, so a parent turning ranked on and a
+    -- child turning it off cannot both pass their checks.
+    perform pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended('gnomon.set_merge_rule/' || p_tenant_id::text, 0));
+    if p_rule is null or p_rule not in ('recency', 'ranked') then
+      raise exception using errcode = 'GNK01',
+        message = 'a merge rule is recency or ranked';
+    end if;
+    if exists (select from gnomon.root_kinds() r where r.name = p_kind) then
+      raise exception using errcode = 'GNK01',
+        message = format('"%s" is a root Kind, which has no merge rule of its own; register a Kind', p_kind);
+    end if;
+    select k.ancestors into v_ancestors
+      from gnomon.kind k where k.tenant_id = p_tenant_id and k.name = p_kind;
+    if not found then
+      raise exception using errcode = 'GNK01',
+        message = format('Kind "%s" is not registered', p_kind);
+    end if;
+    if p_rule = 'recency' then
+      select a.name into v_blocker
+        from unnest(v_ancestors) a(name)
+        where (select m.merge_rule from gnomon.kind_merge m
+                where m.tenant_id = p_tenant_id and m.kind = a.name
+                order by m.id desc limit 1) = 'ranked'
+        limit 1;
+      if v_blocker is not null then
+        raise exception using errcode = 'GNK01',
+          message = format(
+            'Kind "%s" cannot turn ranked merge off: its ancestor "%s" ranks, and a child Kind '
+            'may turn ranked merge on but not off', p_kind, v_blocker);
+      end if;
+    end if;
+    select m.merge_rule into v_own
+      from gnomon.kind_merge m
+      where m.tenant_id = p_tenant_id and m.kind = p_kind
+      order by m.id desc limit 1;
+    if coalesce(v_own, 'recency') = p_rule then
+      return;
+    end if;
+    insert into gnomon.kind_merge (tenant_id, kind, merge_rule) values (p_tenant_id, p_kind, p_rule);
+  end
+  $$;
+
+create function gnomon.kind_check_reserved() returns trigger
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
+  as $$
+  begin
+    if new.kind_of = 'edge' and new.properties -> 'properties' ? 'holds' then
+      raise exception using errcode = 'GNK01',
+        message = 'property name "holds" is reserved: every Edge records through it where the Edge holds';
+    end if;
+    return new;
+  end
+  $$;
+
+create trigger kind_check_reserved before insert on gnomon.kind
+  for each row execute function gnomon.kind_check_reserved();
+
+-- The property every Edge has whatever its Kind, and its rule: `holds`,
+-- which only true states. A JSON null ends it, which ends the Edge.
+create function gnomon.edge_builtin_rules()
+  returns table (property text, rule jsonpath)
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  as $$
+    values ('holds', 'strict $.type() == "boolean" && $ == true'::jsonpath)
+  $$;
+
+-- The merge rule a Kind had at a Recorded time: as `gnomon.kind_merge_rule`,
+-- reading only the rule changes made by then.
+create function gnomon.kind_merge_rule_at(p_tenant_id uuid, p_kind text, p_at timestamptz)
+  returns text
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
+  as $$
+    select case when exists (
+      select from gnomon.kind k
+      cross join lateral unnest(k.ancestors || k.name) a(name)
+      where k.tenant_id = p_tenant_id and k.name = p_kind
+        and (select m.merge_rule from gnomon.kind_merge m
+              where m.tenant_id = k.tenant_id and m.kind = a.name and m.set_at <= p_at
+              order by m.id desc limit 1) = 'ranked'
+    ) then 'ranked' else 'recency' end
+  $$;
+
+-- The reserved Edge Kinds every Ontology has. Each searches the Sentence, as
+-- the root Edge Kind does, joins any Node to any Node, and is symmetric.
+create function gnomon.reserved_kinds()
+  returns table (
+    name text,
+    kind_of text,
+    parent text,
+    search text[],
+    source_kinds text[],
+    target_kinds text[],
+    is_symmetric boolean
+  )
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  as $$
+    values
+      ('same_as', 'edge', 'edge', array['sentence'], array['node'], array['node'], true),
+      ('different_from', 'edge', 'edge', array['sentence'], array['node'], array['node'], true)
+  $$;
+
+-- The Kinds a Node or an Edge of `p_kind` belongs to: the Kind and its
+-- ancestors, with the reserved Kinds below the root Kind `edge`.
+create function gnomon.kind_lineage(p_tenant_id uuid, p_kind text)
+  returns text[]
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
+  as $$
+    select coalesce(
+      (select array[r.name] from gnomon.root_kinds() r where r.name = p_kind),
+      (select array[r.parent, r.name] from gnomon.reserved_kinds() r where r.name = p_kind),
+      (select k.ancestors || k.name from gnomon.kind k
+       where k.tenant_id = p_tenant_id and k.name = p_kind)
+    )
+  $$;
+
 create function gnomon.read_kind(p_tenant_id uuid, p_name text)
   returns table (
     name text,
@@ -763,14 +915,21 @@ create function gnomon.read_kind(p_tenant_id uuid, p_name text)
     rules jsonb,
     search text[],
     source_kinds text[],
-    target_kinds text[]
+    target_kinds text[],
+    is_symmetric boolean
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select r.name, r.kind_of, null::text, '{}'::text[],
            '{"type": "object", "properties": {}, "required": []}'::jsonb, '{}'::jsonb,
-           r.search, r.source_kinds, r.target_kinds
+           r.search, r.source_kinds, r.target_kinds, false
     from gnomon.root_kinds() r
+    where r.name = p_name and p_tenant_id = gnomon.tenant_id()
+    union all
+    select r.name, r.kind_of, r.parent, array[r.parent],
+           '{"type": "object", "properties": {}, "required": []}'::jsonb, '{}'::jsonb,
+           r.search, r.source_kinds, r.target_kinds, r.is_symmetric
+    from gnomon.reserved_kinds() r
     where r.name = p_name and p_tenant_id = gnomon.tenant_id()
     union all
     select k.name, k.kind_of, k.parent, k.ancestors, k.properties,
@@ -779,87 +938,46 @@ create function gnomon.read_kind(p_tenant_id uuid, p_name text)
              from gnomon.kind_rule x
              where x.tenant_id = k.tenant_id and x.kind = k.name
            ), '{}'::jsonb),
-           k.search, k.source_kinds, k.target_kinds
+           k.search, k.source_kinds, k.target_kinds, false
     from gnomon.kind k
     where k.tenant_id = p_tenant_id and k.name = p_name
   $$;
 
--- Grants. First every grant a default privilege made on this migration's
--- objects is revoked, so each object holds only the grants below.
-do $$
-declare
-  g record;
-begin
-  for g in
-    select format('function %s', p.oid::regprocedure) as object, a.grantee
-    from pg_proc p, aclexplode(p.proacl) a
-    where p.oid in (
-      'gnomon.kind_profile_keywords()'::regprocedure,
-      'gnomon.json_pointer_token(text)'::regprocedure,
-      'gnomon.root_kinds()'::regprocedure,
-      'gnomon.compile_kind_schema(jsonb, text, text)'::regprocedure,
-      'gnomon.compile_kind_property(jsonb, text)'::regprocedure,
-      'gnomon.kind_endpoints(uuid, text[], text[], text)'::regprocedure,
-      'gnomon.read_kind(uuid, text)'::regprocedure,
-      'gnomon.register_kind(uuid, text, text, text, jsonb, text[], text[], text[])'::regprocedure
-    ) and a.grantee <> p.proowner
-    union
-    select format('table %s', c.oid::regclass), a.grantee
-    from pg_class c, aclexplode(c.relacl) a
-    where c.oid in ('gnomon.kind'::regclass, 'gnomon.kind_rule'::regclass)
-      and a.grantee <> c.relowner
-  loop
-    execute format(
-      'revoke all on %s from %s', g.object,
-      case when g.grantee = 0 then 'public' else g.grantee::regrole::text end);
-  end loop;
-  -- A function is executable by PUBLIC unless revoked, with no ACL entry
-  -- until then.
-  revoke all on function gnomon.kind_profile_keywords() from public;
-  revoke all on function gnomon.json_pointer_token(text) from public;
-  revoke all on function gnomon.root_kinds() from public;
-  revoke all on function gnomon.compile_kind_schema(jsonb, text, text) from public;
-  revoke all on function gnomon.compile_kind_property(jsonb, text) from public;
-  revoke all on function gnomon.kind_endpoints(uuid, text[], text[], text) from public;
-  revoke all on function gnomon.read_kind(uuid, text) from public;
-  revoke all on function gnomon.register_kind(uuid, text, text, text, jsonb, text[], text[], text[])
-    from public;
-end
-$$;
+-- Kind registration refuses a Kind of either name, of Nodes or of Edges,
+-- whatever its definition. It inserts each Kind it registers, so this
+-- trigger refuses the row before anything is written. The function runs as
+-- the definer during registration, which holds EXECUTE on
+-- `gnomon.reserved_kinds()`.
+create function gnomon.kind_check_reserved_name() returns trigger
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
+  as $$
+  begin
+    if exists (select from gnomon.reserved_kinds() r where r.name = new.name) then
+      raise exception using errcode = 'GNK01',
+        message = format(
+          '"%s" is a reserved Edge Kind, which every Ontology already has; '
+          'a Kind cannot take its name', new.name);
+    end if;
+    return new;
+  end
+  $$;
 
--- Hand Kind registration to the definer role, after its grants are revoked:
--- the migration role may revoke them only while it owns the function.
--- Owning a function needs SET ROLE on the new owner, which a CREATEROLE
--- migration role may grant itself on a role it created. The owner also needs
--- CREATE on the schema. Both are held only for this step.
-do $$
-declare
-  joined boolean := not pg_has_role(current_user, 'gnomon_definer', 'SET');
-begin
-  if joined then
-    execute format('grant gnomon_definer to %I', current_user);
-  end if;
-  grant create on schema gnomon to gnomon_definer;
-  alter function gnomon.register_kind(uuid, text, text, text, jsonb, text[], text[], text[])
-    owner to gnomon_definer;
-  revoke create on schema gnomon from gnomon_definer;
-  if joined then
-    execute format('revoke gnomon_definer from %I', current_user);
-  end if;
-end
-$$;
+create trigger kind_check_reserved_name before insert on gnomon.kind
+  for each row execute function gnomon.kind_check_reserved_name();
 
--- Callers read Kinds and never write them. Only Kind registration writes
--- them, as gnomon_definer. Kind registration itself is granted to no one
--- here: each deployment grants EXECUTE to the roles it chooses.
-grant select on gnomon.kind, gnomon.kind_rule to authenticated, gnomon_worker;
-grant select, insert on gnomon.kind, gnomon.kind_rule to gnomon_definer;
-grant execute on function gnomon.root_kinds() to authenticated, gnomon_worker, gnomon_definer;
-grant execute on function gnomon.read_kind(uuid, text) to authenticated, gnomon_worker;
-grant execute on function gnomon.kind_profile_keywords() to gnomon_definer;
-grant execute on function gnomon.json_pointer_token(text) to gnomon_definer;
-grant execute on function gnomon.compile_kind_schema(jsonb, text, text) to gnomon_definer;
-grant execute on function gnomon.compile_kind_property(jsonb, text) to gnomon_definer;
-grant execute on function gnomon.kind_endpoints(uuid, text[], text[], text) to gnomon_definer;
+-- Whether an Edge of `p_kind` joins its Nodes in no direction.
+create function gnomon.is_symmetric_kind(p_kind text)
+  returns boolean
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  as $$
+    select coalesce(
+      (select r.is_symmetric from gnomon.reserved_kinds() r where r.name = p_kind), false)
+  $$;
 
-insert into gnomon.schema_version (version, name) values (3, '0003_kinds');
+-- One Edge of a symmetric Kind per pair of Nodes in a Scope. The Scope is
+-- part of the key, as every Edge lives in one Scope, so a caller's Edge never
+-- collides with one in a Scope it cannot see.
+create unique index edge_symmetric on gnomon.edge (tenant_id, scope, kind, source_id, target_id)
+  where gnomon.is_symmetric_kind(kind);
+
+insert into gnomon.schema_version (version, name) values (2, '0002_kinds');

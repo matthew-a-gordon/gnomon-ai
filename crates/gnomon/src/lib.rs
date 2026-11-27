@@ -2,8 +2,9 @@
 //!
 //! A [`Store`] runs every call as a caller under RLS: [`Store::as_user`] for
 //! an end user with verified JWT claims, and [`Store::as_worker`] for
-//! background work in one Tenant and Scope. [`migrations`] exports the schema
-//! the Store expects into a consumer's migration chain.
+//! background work in one Tenant and Scope. [`migrations`] lists the files
+//! of the schema the Store expects, which a consumer copies into its own
+//! migration chain.
 
 mod connect;
 mod edge;
@@ -159,11 +160,12 @@ pub enum Error {
     /// `None`).
     #[error(
         "the gnomon schema is at version {found:?}, but this build of gnomon expects version \
-         {expected}; apply the migrations from `gnomon migrations export`"
+         {expected}; apply the migration files in crates/gnomon/migrations that the database \
+         lacks, in order"
     )]
     SchemaVersion { expected: i32, found: Option<i32> },
     /// `gnomon.embedding_dimension()` returned a width pgvector cannot
-    /// store, so the schema was not exported by gnomon.
+    /// store, so the line that states it was edited wrongly.
     #[error("the gnomon schema reports embedding dimension {0}, which is not 1 to 16000")]
     InvalidEmbeddingDimension(i32),
     /// Kind registration refused the definition: a keyword outside the JSON

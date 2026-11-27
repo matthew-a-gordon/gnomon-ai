@@ -1,5 +1,5 @@
 //! Seam 1, Summaries and Communities (ADR-0003, ADR-0014, ADR-0015,
-//! migration 0018), through the Rust core's Store API against real Postgres:
+//! `0003_reads_and_writes.sql`), through the Rust core's Store API against real Postgres:
 //! writing and reading a Summary of a Node and a Community of Nodes with
 //! their Citations, regenerating one by closing the old row, the one-Scope
 //! rule, Tenant and Scope isolation, and Erasure of an Episode, a Node and a

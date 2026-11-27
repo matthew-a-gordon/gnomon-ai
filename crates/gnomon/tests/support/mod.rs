@@ -1,21 +1,17 @@
 //! The harness both database suites share (ADR-0020).
 //!
 //! Each test gets a fresh database, copied from a template database that
-//! holds gnomon's migrations as the `gnomon` binary exports them. The server
-//! comes from one of two places:
+//! holds gnomon's migration files, applied in order, each in one
+//! transaction, as a consumer's tooling applies them. The server comes from
+//! one of two places:
 //!
 //! - By default, a container of the image `GNOMON_TEST_IMAGE` names:
 //!   `pgvector` (the default, `pgvector/pgvector:pg17`) or `supabase`
 //!   (`supabase/postgres` 17.x). See [`server`].
 //! - `GNOMON_TEST_DATABASE_URL`, a superuser on a server someone else runs,
-//!   such as the Supabase CLI stack or a pooler lane. Then
-//!   `GNOMON_TEST_MIGRATION_ROLE` optionally names the role that applies the
-//!   migrations, when it is not that superuser.
-//!
-//! `GNOMON_TEST_TARGET` picks the export target whose own tooling applies
-//! the migrations to the template: `plain` (the default) applies each file in
-//! one transaction, `supabase` runs `supabase migration up` through `npx`,
-//! and `alembic` runs `alembic upgrade head` through `uvx`. See [`Target`].
+//!   such as a pooler lane. Then `GNOMON_TEST_MIGRATION_ROLE` optionally
+//!   names the role that applies the migrations, when it is not that
+//!   superuser.
 //!
 //! The same tests run against every server. Nothing here assumes a port.
 
@@ -23,6 +19,7 @@
 
 pub mod alembic;
 pub mod erasure;
+pub mod install;
 pub mod perf;
 pub mod server;
 pub mod tls;
@@ -37,7 +34,6 @@ use std::process::Command;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls};
 
-pub use gnomon::migrations::Target;
 pub use server::Server;
 
 /// The role the Store logs in as. The harness grants it the caller roles and
@@ -101,7 +97,7 @@ pub fn user(
 
 /// Stores a Sentence of an Edge Version through `gnomon.store_sentence`,
 /// as an end user who sees the Version's Scope, after the Version
-/// committed (migration 0021).
+/// committed (`0004_search.sql`).
 pub async fn store_sentence(
     db: &TestDb,
     tenant: gnomon::TenantId,
@@ -150,7 +146,8 @@ pub const ERASE_EDGE: &str = "gnomon.erase_edge(uuid, uuid)";
 pub const ERASE_SCOPE: &str = "gnomon.erase_scope(uuid, text)";
 pub const ERASURES: &[&str] = &[ERASE_EPISODE, ERASE_NODE, ERASE_EDGE, ERASE_SCOPE];
 
-/// The embedding dimension the suites export with unless a test chooses one.
+/// The embedding dimension the files state, which the suites use unless a
+/// test chooses another.
 pub const DEFAULT_DIMENSION: u32 = 1536;
 
 pub struct TestDb {
@@ -169,42 +166,40 @@ async fn connect(config: &Config) -> Client {
     client
 }
 
-/// Writes the migrations with the `gnomon` binary, as a consumer would.
-pub fn export_plain(dimension: u32, out: &Path) {
-    export_to(Target::Plain, dimension, out)
+/// The migration files, in the order a chain applies them, with the
+/// dimension line changed to `dimension`, as a consumer whose model has
+/// another width edits it.
+pub fn migration_files(dimension: u32) -> Vec<(String, String)> {
+    // The line of `gnomon.embedding_dimension()` that states the dimension.
+    let line = format!("as $$ select {DEFAULT_DIMENSION} $$");
+    gnomon::migrations::MIGRATIONS
+        .iter()
+        .map(|m| {
+            if m.version == 1 {
+                assert!(m.sql.contains(&line), "0001 states no dimension");
+            }
+            let sql = m
+                .sql
+                .replace(&line, &format!("as $$ select {dimension} $$"));
+            (format!("{}.sql", m.name), sql)
+        })
+        .collect()
 }
 
-/// Writes the migrations for `target` into `out` with the `gnomon` binary.
-pub fn export_to(target: Target, dimension: u32, out: &Path) {
-    let run = Command::new(env!("CARGO_BIN_EXE_gnomon"))
-        .args(["migrations", "export", "--target", &target.to_string()])
-        .arg("--embedding-dimension")
-        .arg(dimension.to_string())
-        .arg("--out")
-        .arg(out)
-        .output()
-        .expect("the gnomon binary runs");
-    assert!(
-        run.status.success(),
-        "export failed: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
-}
-
-/// The exported files, in the order a chain applies them.
-pub fn exported(dimension: u32) -> Vec<(String, String)> {
-    let out = tempfile::tempdir().unwrap();
-    export_plain(dimension, out.path());
-    let mut files: Vec<_> = std::fs::read_dir(out.path())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
-    files.sort();
-    files
+/// Writes the migration files into `dir` as a consumer copies them, each
+/// named `<prefix><file name>`, and returns the paths.
+pub fn copy_migration_files(
+    dir: &Path,
+    prefix: impl Fn(usize) -> String,
+) -> Vec<std::path::PathBuf> {
+    std::fs::create_dir_all(dir).unwrap();
+    migration_files(DEFAULT_DIMENSION)
         .into_iter()
-        .map(|p| {
-            let name = p.file_name().unwrap().to_string_lossy().into_owned();
-            (name, std::fs::read_to_string(&p).unwrap())
+        .enumerate()
+        .map(|(i, (name, sql))| {
+            let path = dir.join(format!("{}{name}", prefix(i)));
+            std::fs::write(&path, sql).unwrap();
+            path
         })
         .collect()
 }
@@ -212,18 +207,6 @@ pub fn exported(dimension: u32) -> Vec<(String, String)> {
 /// The Supabase CLI the suite runs, pinned so every run applies migrations
 /// the same way.
 pub const SUPABASE_CLI: &str = "supabase@3.2.0";
-
-/// The export target whose tooling applies the migrations to a template:
-/// the one `GNOMON_TEST_TARGET` names, `plain` by default.
-pub fn target_from_env() -> Target {
-    match std::env::var("GNOMON_TEST_TARGET") {
-        Err(_) => Target::Plain,
-        Ok(name) if name.is_empty() => Target::Plain,
-        Ok(name) => name
-            .parse()
-            .unwrap_or_else(|e| panic!("GNOMON_TEST_TARGET: {e}")),
-    }
-}
 
 /// A command that runs the Supabase CLI: the installed one that
 /// `GNOMON_TEST_SUPABASE_CLI` names, or else the pinned one through `npx`.
@@ -264,7 +247,7 @@ pub fn supabase_migration_up(workdir: &Path, url: &str) -> Result<String, String
 
 impl Server {
     /// A URL for the role that applies the migrations, connected to `db`,
-    /// for the tools of the supabase and alembic targets. Its password is
+    /// for a consumer's migration tool, such as the Supabase CLI or Alembic. Its password is
     /// `GNOMON_TEST_MIGRATION_PASSWORD`, or the superuser's when that is
     /// unset, as on the Supabase CLI stack and the test images.
     fn migration_url(&self, scheme: &str, db: &str) -> String {
@@ -284,46 +267,22 @@ impl Server {
         )
     }
 
-    /// Applies the migrations exported for `target` to database `db`, with
-    /// that target's own tooling.
-    async fn apply(&self, target: Target, dimension: u32, db: &str) {
-        match target {
-            Target::Plain => {
-                let mut client = self.admin(db).await;
-                if let Some(role) = &self.migration_role {
-                    client
-                        .batch_execute(&format!("set role {}", quote_ident(role)))
-                        .await
-                        .expect("switch to the migration role");
-                }
-                for (file, sql) in &exported(dimension) {
-                    let tx = client.transaction().await.unwrap();
-                    tx.batch_execute(sql)
-                        .await
-                        .unwrap_or_else(|e| panic!("apply {file}: {e:?}"));
-                    tx.commit().await.unwrap();
-                }
-            }
-            Target::Supabase => {
-                let workdir = tempfile::tempdir().unwrap();
-                export_to(
-                    target,
-                    dimension,
-                    &workdir.path().join("supabase/migrations"),
-                );
-                supabase_migration_up(workdir.path(), &self.migration_url("postgresql", db))
-                    .unwrap_or_else(|e| panic!("supabase migration up failed: {e}"));
-            }
-            Target::Alembic => {
-                let project = alembic::Project::new();
-                export_to(target, dimension, &project.versions());
-                project
-                    .alembic(
-                        &["upgrade", "head"],
-                        Some(&self.migration_url("postgresql+psycopg", db)),
-                    )
-                    .unwrap_or_else(|e| panic!("alembic upgrade head failed: {e}"));
-            }
+    /// Applies the migration files to database `db` as the migration role,
+    /// each file in one transaction.
+    async fn apply(&self, dimension: u32, db: &str) {
+        let mut client = self.admin(db).await;
+        if let Some(role) = &self.migration_role {
+            client
+                .batch_execute(&format!("set role {}", quote_ident(role)))
+                .await
+                .expect("switch to the migration role");
+        }
+        for (file, sql) in &migration_files(dimension) {
+            let tx = client.transaction().await.unwrap();
+            tx.batch_execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("apply {file}: {e:?}"));
+            tx.commit().await.unwrap();
         }
     }
 
@@ -346,19 +305,13 @@ impl Server {
             .unwrap_or_default()
     }
 
-    /// The template database holding the migrations exported with
+    /// The template database holding the migration files applied with
     /// `dimension`, built once per server and migration set. Every process
     /// takes the server's lock first, so two never build one at once.
     async fn template(&self, dimension: u32) -> String {
-        // The plain export names the migration set. A supabase export's
-        // file names change with its clock, so they cannot.
-        let target = target_from_env();
         let mut h = DefaultHasher::new();
-        exported(dimension).hash(&mut h);
-        let name = match target {
-            Target::Plain => format!("gnomon_template_{dimension}_{:016x}", h.finish()),
-            _ => format!("gnomon_template_{target}_{dimension}_{:016x}", h.finish()),
-        };
+        migration_files(dimension).hash(&mut h);
+        let name = format!("gnomon_template_{dimension}_{:016x}", h.finish());
 
         let _lock = self.lock();
         let server = self.admin("postgres").await;
@@ -390,7 +343,7 @@ impl Server {
             ))
             .await
             .expect("create the template database");
-        self.apply(target, dimension, &building).await;
+        self.apply(dimension, &building).await;
         server
             .batch_execute(&format!("alter database {building} rename to {name}"))
             .await
@@ -442,7 +395,7 @@ impl TestDb {
         TestDb { server, name }
     }
 
-    /// A new database with gnomon's migrations exported and applied.
+    /// A new database with gnomon's migration files applied.
     pub async fn migrated() -> TestDb {
         Self::migrated_with_dimension(DEFAULT_DIMENSION).await
     }
@@ -550,7 +503,7 @@ impl TestDb {
     }
 
     /// This database's URL for the role that applies the migrations, with
-    /// `scheme`, for a target's own migration tool.
+    /// `scheme`, for a consumer's migration tool.
     pub fn migration_url(&self, scheme: &str) -> String {
         self.server.migration_url(scheme, &self.name)
     }

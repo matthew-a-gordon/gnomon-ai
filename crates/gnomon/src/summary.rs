@@ -1,4 +1,4 @@
-//! Summaries and Communities (ADR-0014, ADR-0015, migration 0018).
+//! Summaries and Communities (ADR-0014, ADR-0015, `0003_reads_and_writes.sql`).
 //!
 //! The Pipeline writes a [`Summary`] of a Node and a [`Community`] of Nodes
 //! with its Summary, each with Citations to the Episodes it was derived from.

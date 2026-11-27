@@ -14,7 +14,7 @@ Each operation has one route, named after the method the bindings expose: `POST 
 
 ## The server
 
-`gnomon serve` is one command in one binary. It runs the HTTP API, MCP (ADR-0019) and the queue worker (#43) by default, and flags turn each off, so a deployment can run API-only replicas beside a worker-only replica from one configuration document. The same binary has the `gnomon migrations export` and `gnomon kinds export` subcommands and the `gnomon token mint-worker` command (ADR-0018).
+`gnomon serve` is one command in one binary. It runs the HTTP API, MCP (ADR-0019) and the queue worker (#43) by default, and flags turn each off, so a deployment can run API-only replicas beside a worker-only replica from one configuration document. The same binary has the `gnomon kinds export` subcommand and the `gnomon token mint-worker` command (ADR-0018). The schema is plain SQL files a consumer copies, so no command exports it (ADR-0006).
 
 - `/healthz` reports liveness only. `/readyz` reports ready when the database answers, `gnomon.schema_version` is in the range the binary accepts (ADR-0006), and each JWKS issuer has loaded keys at least once. A later JWKS refresh failure does not drop readiness, because cached keys still verify.
 - On SIGTERM the server stops accepting requests and stops claiming stages. It waits for in-flight requests and the running stage for a configured grace period. A stage still running after that is abandoned, and its lease running out lets another worker retry it (ADR-0011).

@@ -1,4 +1,4 @@
-//! Seam 1, Resolution (ADR-0010, ADR-0012, migration 0019): a mention
+//! Seam 1, Resolution (ADR-0010, ADR-0012, `0004_search.sql`): a mention
 //! matched against the current names and Aliases of the Nodes the graph
 //! already has, by full text and by vector, through the Rust core's Store
 //! API against real Postgres. The adversarial cases live in sql_boundary.rs.

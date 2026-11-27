@@ -5,14 +5,14 @@
 //! filtered by Tenant, Scope and the As-of instants. The text it searches is
 //! what each Kind marks as searchable: the properties a Kind names, a Node's
 //! name and Aliases, and an Edge Version's Sentence once the Pipeline has
-//! stored one (ADR-0013). Migration 0016 says how the token table behind it
+//! stored one (ADR-0013). `0004_search.sql` says how the token table behind it
 //! is kept.
 //!
 //! [`Caller::search_vector`](crate::Caller::search_vector) returns the
 //! Versions whose stored embeddings are nearest a query embedding, by cosine
 //! distance at full precision, filtered the same way. The Pipeline stores
 //! each embedding after the write commits, with
-//! [`Caller::store_embedding`](crate::Caller::store_embedding). Migration 0017
+//! [`Caller::store_embedding`](crate::Caller::store_embedding). `0004_search.sql`
 //! says how the search stays exact over the rows the caller can see.
 //!
 //! [`Caller::search`](crate::Caller::search) is the one Search call a
@@ -21,7 +21,7 @@
 //! reorders the fused candidates by two graph signals, mentions and
 //! connectedness, counted over the rows the caller can see. A signal never
 //! adds a candidate. Each result reports where each branch and signal ranked
-//! it. Migration 0020 says how.
+//! it. `0004_search.sql` says how.
 
 use crate::{AsOf, CommunityId, EdgeId, NodeId, Scope, SummaryId, VersionId};
 

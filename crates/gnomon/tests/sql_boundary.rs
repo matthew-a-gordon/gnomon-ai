@@ -348,9 +348,6 @@ const ONTOLOGY_TABLES: &[&str] = &["kind", "kind_rule", "kind_merge"];
 /// it holds no row once the Erasure returns.
 const ERASURE_REACH: &str = "erasure_reach";
 
-/// The BM25 counts of each Scope, which only the token table's triggers
-/// write (migration 0016).
-
 #[tokio::test]
 async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_tenant_scope_policy()
 {
@@ -493,7 +490,8 @@ const DEFINERS: &[&str] = &[
 ];
 
 #[tokio::test]
-async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but_the_definers() {
+async fn every_gnomon_function_runs_as_the_invoker_with_a_search_path_ending_in_pg_temp_but_the_definers()
+ {
     let w = world().await;
     let client = w.db.login().await;
     let functions = client
@@ -501,17 +499,7 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
             "select p.oid::regprocedure::text, p.prosecdef, coalesce(p.proconfig, '{}'),
                     p.proowner::regrole::text
              from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-             where n.nspname = 'gnomon'
-               -- The constructors Postgres creates with gnomon.uuid_range
-               -- and its multirange are internal functions, which take no
-               -- search path and run no SQL.
-               and not (
-                 p.prolang = (select oid from pg_language where lanname = 'internal')
-                 and exists (
-                   select from pg_range r
-                   where r.rngtypid = p.prorettype or r.rngmultitypid = p.prorettype
-                 )
-               )",
+             where n.nspname = 'gnomon'",
             &[],
         )
         .await
@@ -560,11 +548,25 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
         if definer {
             assert_eq!(owner, "gnomon_definer", "{name} is owned by {owner}");
         }
-        assert!(
-            config
-                .iter()
-                .any(|c| c == "search_path=\"\"" || c == "search_path="),
-            "{name} does not pin search_path to '': {config:?}"
+        // With an empty path, Postgres still searches the temporary schema
+        // first for tables and types, so every path lists it, last.
+        let path = config
+            .iter()
+            .find_map(|c| c.strip_prefix("search_path="))
+            .unwrap_or_else(|| panic!("{name} does not pin search_path: {config:?}"));
+        let schemas: Vec<&str> = path
+            .split(',')
+            .map(|p| p.trim().trim_matches('"'))
+            .collect();
+        assert_eq!(
+            schemas.first(),
+            Some(&"pg_catalog"),
+            "{name}: search_path {path:?} does not start with pg_catalog"
+        );
+        assert_eq!(
+            schemas.last(),
+            Some(&"pg_temp"),
+            "{name}: search_path {path:?} does not end with pg_temp"
         );
     }
 }
@@ -573,6 +575,9 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
 async fn the_definer_role_cannot_log_in_or_bypass_rls_and_no_role_belongs_to_it_or_it_to_one() {
     let w = world().await;
     let client = w.db.login().await;
+    // A migrating role acts as the definer role for one step, under the
+    // server's lock when a test applies the files (tests/install.rs).
+    let _lock = support::Server::get().await.lock();
     let row = client
         .query_typed(
             "select rolcanlogin, rolsuper or rolbypassrls,
@@ -847,6 +852,130 @@ async fn a_caller_cannot_redirect_kind_registration_through_its_search_path() {
         real.len(),
         1,
         "registration wrote somewhere other than gnomon.kind"
+    );
+}
+
+/// The roles the type-shadowing test's domain check ran as, in order.
+async fn recorded_roles(tx: &Transaction<'_>) -> String {
+    let r: Option<String> = tx
+        .query_typed(
+            "select pg_catalog.current_setting('gnomon_test.roles', true)",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    r.unwrap_or_default()
+}
+
+/// Built-in types a function body names without a schema. The temporary
+/// schema holds a domain of each name in the type-shadowing test.
+const SHADOWED_TYPES: &[&str] = &[
+    "text",
+    "jsonb",
+    "uuid",
+    "timestamptz",
+    "int4",
+    "int8",
+    "bool",
+    "float8",
+    "varbit",
+    "tsvector",
+    "xid8",
+    "name",
+    "regclass",
+    "oid",
+];
+
+#[tokio::test]
+async fn temporary_types_named_like_built_in_types_run_nothing_of_the_callers_as_the_definer() {
+    // With `search_path = ''`, Postgres still searches the temporary schema
+    // first for tables and types. A caller creates a domain named like each
+    // built-in type, whose check records the role it runs as, then calls
+    // every group of definer functions: Kind registration, the merge-rule
+    // setter, a write that fires the search index trigger, and an Erasure.
+    // A function that resolved one of those names to the caller's domain
+    // would run the caller's check as `gnomon_definer`.
+    let w = world().await;
+    w.db.grant_kind_registration(USER).await;
+    w.db.grant_erasure(USER).await;
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(w.t1, &["support", "billing"])).await;
+    let mut setup = String::from(
+        "create function pg_temp.record_role() returns pg_catalog.bool
+           language plpgsql set search_path = pg_catalog
+           as $$ begin
+             perform set_config('gnomon_test.roles',
+               coalesce(current_setting('gnomon_test.roles', true), '') || ' ' || current_user,
+               false);
+             return true;
+           end $$;",
+    );
+    for t in SHADOWED_TYPES {
+        setup.push_str(&format!(
+            "create domain pg_temp.{t} as pg_catalog.{t} check (pg_temp.record_role());"
+        ));
+    }
+    tx.batch_execute(&setup).await.unwrap();
+    // The caller's own statements resolve the names to its domains, so the
+    // check runs, as the caller.
+    tx.batch_execute("select 'armed'::text").await.unwrap();
+    assert!(
+        recorded_roles(&tx).await.contains(USER),
+        "the domains did not shadow the built-in types: {:?}",
+        recorded_roles(&tx).await
+    );
+
+    tx.query_typed(REGISTER_PERSON, &[(&w.t1, Type::UUID)])
+        .await
+        .expect("Kind registration");
+    tx.query_typed(
+        "select gnomon.set_merge_rule($1, 'person', 'ranked')",
+        &[(&w.t1, Type::UUID)],
+    )
+    .await
+    .expect("the merge-rule setter");
+    let node: Uuid = tx
+        .query_typed(
+            "select gnomon.create_node($1, 'support', 'person')",
+            &[(&w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    write_node(
+        &tx,
+        w.t1,
+        node,
+        Some(w.t1_support),
+        json!({ "name": "Ada Lovelace", "role": "engineer" }),
+    )
+    .await
+    .expect("a write that fires the search index trigger");
+    let indexed: i64 = tx
+        .query_typed(
+            "select count(*) from gnomon.search_token where tenant_id = $1",
+            &[(&w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert!(indexed > 0, "the write wrote no token rows");
+    tx.query_typed(
+        ERASE_EPISODE,
+        &[(&w.t1, Type::UUID), (&w.t1_billing, Type::UUID)],
+    )
+    .await
+    .expect("an Erasure");
+
+    let ran_as = recorded_roles(&tx).await;
+    let as_definer = ran_as
+        .split_whitespace()
+        .filter(|r| *r == "gnomon_definer")
+        .count();
+    assert_eq!(
+        as_definer, 0,
+        "the caller's domain check ran {as_definer} times as gnomon_definer"
     );
 }
 
@@ -1973,7 +2102,7 @@ async fn a_caller_cannot_recompute_another_tenants_node() {
         let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
         let err = tx
             .query_typed(
-                "select * from gnomon.recompute_node($1, $2, '-infinity', 'infinity')",
+                "select * from gnomon.recompute_versions($1, $2, false, '-infinity', 'infinity')",
                 &[(&tenant, Type::UUID), (&n.n2, Type::UUID)],
             )
             .await
@@ -2339,7 +2468,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         .await
         .unwrap();
     // A Summary of the Node and a Community holding it, each citing the
-    // Episode (ADR-0014, migration 0018).
+    // Episode (ADR-0014, `0003_reads_and_writes.sql`).
     single
         .write_summary(
             None,
@@ -2367,7 +2496,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         )
         .await
         .unwrap();
-    // Its embedding, for Search (migration 0020). Its token rows and the
+    // Its embedding, for Search (`0004_search.sql`). Its token rows and the
     // Summary's are written with them.
     single
         .store_community_embedding(None, community, &support::vectors::Rng::new(8).unit())
@@ -3230,13 +3359,13 @@ async fn gnomon_grants(client: &Client) -> Vec<String> {
 #[tokio::test]
 async fn global_default_privileges_give_callers_no_right_the_migrations_do_not() {
     // The role that applies the migrations grants callers everything on
-    // every table, function and schema it creates, in any schema,
-    // before the first migration runs. Each migration revokes what that
-    // grants on its own objects, so the chain ends with the grants a chain
-    // without default privileges has, and an Episode stays immutable.
+    // every table, sequence, function and schema it creates, in any
+    // schema, before the first migration runs. The last file revokes what
+    // that grants on gnomon's objects, so the chain ends with the grants a
+    // chain without default privileges has, and an Episode stays immutable.
     let db = TestDb::empty_with_login().await;
     let operator = db.operator().await;
-    for objects in ["tables", "functions", "schemas"] {
+    for objects in ["tables", "sequences", "functions", "schemas"] {
         operator
             .batch_execute(&format!(
                 "alter default privileges grant all on {objects} to authenticated, gnomon_worker"
@@ -3244,7 +3373,7 @@ async fn global_default_privileges_give_callers_no_right_the_migrations_do_not()
             .await
             .unwrap();
     }
-    for (file, sql) in support::exported(support::DEFAULT_DIMENSION) {
+    for (file, sql) in support::migration_files(support::DEFAULT_DIMENSION) {
         operator
             .batch_execute(&sql)
             .await
@@ -4295,7 +4424,7 @@ async fn a_statement_row_alone_changes_no_version() {
     .unwrap();
     let rows = tx
         .query_typed(
-            "select changed from gnomon.recompute_node($1, $2, '-infinity', 'infinity')",
+            "select changed from gnomon.recompute_versions($1, $2, false, '-infinity', 'infinity')",
             &[(&t1, Type::UUID), (&n.n1, Type::UUID)],
         )
         .await
@@ -5736,7 +5865,7 @@ async fn no_role_holds_maintain_and_no_caller_can_vacuum_reindex_or_cluster_a_gn
     );
 }
 
-/// The stage tables (ADR-0011, migration 0014).
+/// The stage tables (ADR-0011), which `0001_schema.sql` creates.
 const STAGE_TABLES: &[&str] = &["stage_record", "stage_usage"];
 
 /// `world()` with stage records for its Episodes: each Episode's graph stage
@@ -6016,7 +6145,8 @@ async fn a_caller_cannot_delete_a_stage_record_or_change_what_it_names() {
 }
 
 /// The token table of full-text Search, the BM25 counts of each Scope and
-/// each transaction's changes to them (ADR-0010, migration 0016).
+/// each transaction's changes to them (ADR-0010), which `0001_schema.sql`
+/// creates.
 const SEARCH_TABLES: &[&str] = &[
     "search_token",
     "search_token_frequency",
@@ -6258,8 +6388,8 @@ async fn the_search_index_function_is_a_definer_no_role_may_execute_and_callers_
     }
 }
 
-/// The full vectors and quantized rows of vector Search (ADR-0010,
-/// migration 0017).
+/// The full vectors and quantized rows of vector Search (ADR-0010), which
+/// `0001_schema.sql` creates.
 const EMBEDDING_TABLES: &[&str] = &["embedding", "embedding_bit"];
 
 /// `searchable_world()` with an embedding stored for every Version, as each
@@ -6363,7 +6493,7 @@ async fn embedding_rows(db: &TestDb) -> Vec<String> {
     support::erasure::rows_of(&db.admin().await, &tables).await
 }
 
-/// A unit vector of the exported dimension, as SQL text.
+/// A unit vector of the embedding dimension, as SQL text.
 fn sql_vector() -> String {
     let v = support::vectors::Rng::new(5).unit();
     format!(
@@ -6649,7 +6779,7 @@ async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_c
         ))
         .await
         .unwrap();
-    for (file, sql) in support::exported(support::DEFAULT_DIMENSION) {
+    for (file, sql) in support::migration_files(support::DEFAULT_DIMENSION) {
         operator
             .batch_execute(&sql)
             .await
@@ -6774,7 +6904,7 @@ async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_c
     assert!(found.iter().any(|c| c.node == twin));
 }
 
-// Summaries and Communities (ADR-0009, ADR-0014, ADR-0015, migration 0018).
+// Summaries and Communities (ADR-0009, ADR-0014, ADR-0015, `0003_reads_and_writes.sql`).
 // Callers write them through invoker functions or directly, and every check
 // is the tables' own: RLS, column grants, foreign keys that carry the Scope,
 // and guard triggers. Only Erasure deletes committed rows, and its reach
@@ -7375,7 +7505,7 @@ async fn the_definers_summary_reach_covers_only_the_summaries_of_a_node_its_own_
     tx.rollback().await.unwrap();
 }
 
-// Resolution (ADR-0009, ADR-0010, migration 0019). The search index trigger
+// Resolution (ADR-0009, ADR-0010, `0004_search.sql`). The search index trigger
 // writes the name rows, and callers update only a name row's bits in their
 // own Scopes, which a trigger derives from the stored full vector whatever
 // the caller supplies.
@@ -7708,7 +7838,7 @@ async fn callers_hold_only_select_and_a_bits_update_on_the_name_table_and_the_de
     );
 }
 
-// Search (ADR-0010, migration 0020). The fused call, its token rows and
+// Search (ADR-0010, `0004_search.sql`). The fused call, its token rows and
 // embeddings of Summaries and Communities, and its graph signals run as the
 // caller under RLS. No caller writes a token row, and an embedding row a
 // caller inserts is derived from the stored row whatever it supplied.
@@ -8280,7 +8410,7 @@ async fn an_episode_edge_or_summary_of_a_scope_the_caller_cannot_see_changes_no_
     assert_ne!(ranked(&["support", "billing"]).await, both_before);
 }
 
-// Sentences and the gap listing (ADR-0009, ADR-0013, migration 0021).
+// Sentences and the gap listing (ADR-0009, ADR-0013, `0004_search.sql`).
 
 /// The Edges of `edges()`, each Edge Version's ID, and an Edge of Tenant
 /// one's `billing` Scope from its Node to itself. Tenant two's Edge and the
@@ -9004,7 +9134,7 @@ async fn callers_insert_a_sentence_and_change_only_its_text_and_both_functions_a
         let (name, definer, config, grantees): (String, bool, Vec<String>, Vec<String>) =
             (f.get(0), f.get(1), f.get(2), f.get(3));
         assert!(!definer, "{name} is a definer");
-        assert_eq!(config, ["search_path=\"\""], "{name}");
+        assert_eq!(config, ["search_path=pg_catalog, pg_temp"], "{name}");
         assert_eq!(grantees, ["authenticated", "gnomon_worker"], "{name}");
     }
 }

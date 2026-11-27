@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::erasure::World;
 
-/// The dimension the suites export the migrations with.
+/// The embedding dimension the suites use.
 pub const DIM: usize = super::DEFAULT_DIMENSION as usize;
 
 /// A small seeded generator (SplitMix64), so the suites need no crate for it.
