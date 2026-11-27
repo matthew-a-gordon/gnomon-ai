@@ -112,6 +112,14 @@ To resolve any of the four your own way, replace it with `create or replace func
 - Grant whatever outside gnomon it calls to `authenticated`, `gnomon_worker`, `gnomon_writer`, `gnomon_definer` and `gnomon_eraser`.
 - Answer for worker claims too. Tell a worker call by its `role` claim, because a worker call may carry `sub`.
 - End every `search_path` it sets, or that a function it calls sets, in `pg_temp` (ADR-0009).
+- Write it in PL/pgSQL, as the reference versions are. A SQL function with a `SET` clause is never inlined, and PostgreSQL 17 plans its body again for each statement that calls it, while PL/pgSQL keeps its plans for the session. One write runs hundreds of statements that call these functions (ADR-0005).
+
+gnomon's policies call each function in a sub-select of its own, so PostgreSQL runs it once for a statement and not once for each row the policy checks, and the conditions stay index conditions. A policy of your own that calls them should do the same, and cast a Scope set so that `any` reads it as one array:
+
+```sql
+using (tenant_id = (select gnomon.tenant_id())
+       and scope = any ((select gnomon.allowed_scopes())::text[]))
+```
 
 For example, a deployment that keeps each user's Scopes in a membership table of its own:
 
@@ -125,13 +133,16 @@ create table membership.member (
 );
 
 create function membership.scopes(p_writable boolean) returns text[]
-  language sql stable security definer set search_path = pg_catalog, pg_temp
+  language plpgsql stable security definer set search_path = pg_catalog, pg_temp
   as $$
-    select coalesce(pg_catalog.array_agg(m.scope order by m.scope), '{}')
-    from membership.member m
-    where m.user_id = nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb
-                        ->> 'sub'
-      and (m.writable or not p_writable)
+  begin
+    return (
+      select coalesce(pg_catalog.array_agg(m.scope order by m.scope), '{}')
+      from membership.member m
+      where m.user_id = nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb
+                          ->> 'sub'
+        and (m.writable or not p_writable));
+  end
   $$;
 revoke all on function membership.scopes(boolean) from public;
 grant usage on schema membership
@@ -140,24 +151,29 @@ grant execute on function membership.scopes(boolean)
   to authenticated, gnomon_worker, gnomon_writer, gnomon_definer, gnomon_eraser;
 
 create or replace function gnomon.allowed_scopes() returns text[]
-  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  language plpgsql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
-    select case
-      when c ->> 'role' = 'gnomon_worker' then
-        array(select pg_catalog.jsonb_array_elements_text(c -> 'app_metadata' -> 'scopes'))
-      else membership.scopes(false)
-    end
-    from (select nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb as c) x
+  declare
+    c jsonb := nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb;
+  begin
+    if c ->> 'role' = 'gnomon_worker' then
+      return array(select pg_catalog.jsonb_array_elements_text(c -> 'app_metadata' -> 'scopes'));
+    end if;
+    return membership.scopes(false);
+  end
   $$;
 
 create or replace function gnomon.writable_scopes() returns text[]
-  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  language plpgsql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
-    select case
-      when c ->> 'role' = 'gnomon_worker' then gnomon.allowed_scopes()
-      else membership.scopes(true)
-    end
-    from (select nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb as c) x
+  declare
+    c jsonb := nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb;
+  begin
+    if c ->> 'role' = 'gnomon_worker' then
+      return gnomon.allowed_scopes();
+    end if;
+    return membership.scopes(true);
+  end
   $$;
 ```
 

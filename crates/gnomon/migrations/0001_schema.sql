@@ -295,9 +295,16 @@ create policy tenancy_switch on gnomon.tenancy for update
   using (mode = 'single') with check (mode = 'multi');
 
 -- The Tenant, the Scopes and the user of the current call (ADR-0005). Every
--- read policy is `tenant_id = gnomon.tenant_id() and scope =
--- any(gnomon.allowed_scopes())`, and every write policy also needs `scope =
--- any(gnomon.writable_scopes())`.
+-- read policy is
+--
+--   tenant_id = (select gnomon.tenant_id())
+--   and scope = any ((select gnomon.allowed_scopes())::text[])
+--
+-- and every write policy also needs `scope = any ((select
+-- gnomon.writable_scopes())::text[])`. Each call is a sub-select of its own,
+-- so PostgreSQL runs it once per statement as an InitPlan and not once for
+-- each row the policy checks, and the conditions stay index conditions. The
+-- cast keeps the sub-select one array, which `any` compares against.
 --
 --   gnomon.tenant_id()        the Tenant
 --   gnomon.allowed_scopes()   the Scope keys the caller may read
@@ -332,47 +339,59 @@ create policy tenancy_switch on gnomon.tenancy for update
 -- gnomon that it calls must be usable by every one of these roles. Its
 -- `search_path`, and that of every function it calls, ends in `pg_temp`
 -- (see Search paths above).
+--
+-- They are PL/pgSQL (ADR-0005). A SQL function with a `SET` clause is never
+-- inlined, and PostgreSQL 17 plans its body again for each statement that
+-- calls it, while PL/pgSQL keeps its plans for the session. One write runs
+-- hundreds of statements that call these functions, so a replacement is
+-- best written in PL/pgSQL too, and called in a sub-select from a policy.
 create function gnomon.tenant_id() returns uuid
-  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  language plpgsql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $fn$
-        select coalesce(
-          nullif(
-            nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb
-              -> 'app_metadata' ->> 'tenant_id',
-            ''
-          )::uuid,
-          (select t.default_tenant_id from gnomon.tenancy t where t.mode = 'single')
-        )
-      $fn$;
+  begin
+    return coalesce(
+      nullif(
+        nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb
+          -> 'app_metadata' ->> 'tenant_id',
+        ''
+      )::uuid,
+      (select t.default_tenant_id from gnomon.tenancy t where t.mode = 'single')
+    );
+  end
+  $fn$;
 
 create function gnomon.allowed_scopes() returns text[]
-  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  language plpgsql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
-    select coalesce(
-      array(
-        select pg_catalog.jsonb_array_elements_text(s)
-        from (
-          select nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb
-            -> 'app_metadata' -> 'scopes' as s
-        ) c
-        where pg_catalog.jsonb_typeof(s) = 'array'
-      ),
-      '{}'
-    )
+  declare
+    v_scopes jsonb := nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb
+                        -> 'app_metadata' -> 'scopes';
+  begin
+    if v_scopes is null or pg_catalog.jsonb_typeof(v_scopes) <> 'array' then
+      return '{}';
+    end if;
+    return array(select pg_catalog.jsonb_array_elements_text(v_scopes));
+  end
   $$;
 
 -- By default a caller may write every Scope it may read.
 create function gnomon.writable_scopes() returns text[]
-  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
-  as $$ select gnomon.allowed_scopes() $$;
+  language plpgsql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  as $$
+  begin
+    return gnomon.allowed_scopes();
+  end
+  $$;
 
 -- By default the `sub` claim, or null when it is missing or empty.
 create function gnomon.user_id() returns text
-  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  language plpgsql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
-    select nullif(
+  begin
+    return nullif(
       nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub',
-      '')
+      '');
+  end
   $$;
 
 -- The default Tenant in single-tenant mode, and null in multi-tenant mode,
@@ -530,19 +549,19 @@ alter table gnomon.kind_rule enable row level security;
 
 create policy kind_tenant on gnomon.kind
   for select to authenticated, gnomon_worker, gnomon_writer, gnomon_definer, gnomon_eraser
-  using (tenant_id = gnomon.tenant_id());
+  using (tenant_id = (select gnomon.tenant_id()));
 
 create policy kind_tenant_register on gnomon.kind
   for insert to gnomon_definer
-  with check (tenant_id = gnomon.tenant_id());
+  with check (tenant_id = (select gnomon.tenant_id()));
 
 create policy kind_rule_tenant on gnomon.kind_rule
   for select to authenticated, gnomon_worker, gnomon_writer, gnomon_definer, gnomon_eraser
-  using (tenant_id = gnomon.tenant_id());
+  using (tenant_id = (select gnomon.tenant_id()));
 
 create policy kind_rule_tenant_register on gnomon.kind_rule
   for insert to gnomon_definer
-  with check (tenant_id = gnomon.tenant_id());
+  with check (tenant_id = (select gnomon.tenant_id()));
 
 -- Every Version and Contribution has a precision on each Valid-time bound
 -- (ADR-0008). The coarsest is `unknown`, and an unknown bound is stored as
@@ -844,11 +863,11 @@ alter table gnomon.kind_merge enable row level security;
 
 create policy kind_merge_tenant on gnomon.kind_merge
   for select to authenticated, gnomon_worker, gnomon_writer, gnomon_definer, gnomon_eraser
-  using (tenant_id = gnomon.tenant_id());
+  using (tenant_id = (select gnomon.tenant_id()));
 
 create policy kind_merge_tenant_set on gnomon.kind_merge
   for insert to gnomon_definer
-  with check (tenant_id = gnomon.tenant_id());
+  with check (tenant_id = (select gnomon.tenant_id()));
 
 -- The merge reads a Node's or an Edge's Contributions by `versioned_id`.
 create index contribution_versioned on gnomon.contribution
@@ -1017,23 +1036,23 @@ alter table gnomon.search_count_delta enable row level security;
 -- and the commit deletes them.
 create policy search_token_frequency_tenant_scope on gnomon.search_token_frequency
   for select to authenticated, gnomon_worker
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
+  using (tenant_id = (select gnomon.tenant_id()) and scope = any ((select gnomon.allowed_scopes())::text[]));
 
 create policy search_scope_length_tenant_scope on gnomon.search_scope_length
   for select to authenticated, gnomon_worker
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
+  using (tenant_id = (select gnomon.tenant_id()) and scope = any ((select gnomon.allowed_scopes())::text[]));
 
 create policy search_count_delta_tenant_scope on gnomon.search_count_delta
   for select to authenticated, gnomon_worker
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
+  using (tenant_id = (select gnomon.tenant_id()) and scope = any ((select gnomon.allowed_scopes())::text[]));
 
 -- The definer records the changes of its own transaction, in any Scope of
 -- the Tenant, because they come from the token rows that transaction wrote
 -- or deleted, an erased Edge's of a Scope the caller cannot see among them.
 create policy search_count_delta_own on gnomon.search_count_delta
   for all to gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and written_in = pg_current_xact_id_if_assigned())
-  with check (tenant_id = gnomon.tenant_id() and written_in = pg_current_xact_id());
+  using (tenant_id = (select gnomon.tenant_id()) and written_in = pg_current_xact_id_if_assigned())
+  with check (tenant_id = (select gnomon.tenant_id()) and written_in = pg_current_xact_id());
 
 -- The definer changes the counts only of a Scope whose changes its own
 -- transaction recorded. The condition is a subquery, not a function call,
@@ -1041,12 +1060,12 @@ create policy search_count_delta_own on gnomon.search_count_delta
 -- every row the policy checks.
 create policy search_token_frequency_pending on gnomon.search_token_frequency
   for all to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
+  using (tenant_id = (select gnomon.tenant_id())
          and exists (select from gnomon.search_count_delta d
                      where d.tenant_id = search_token_frequency.tenant_id
                        and d.written_in = pg_current_xact_id_if_assigned()
                        and d.scope = search_token_frequency.scope))
-  with check (tenant_id = gnomon.tenant_id()
+  with check (tenant_id = (select gnomon.tenant_id())
               and exists (select from gnomon.search_count_delta d
                           where d.tenant_id = search_token_frequency.tenant_id
                             and d.written_in = pg_current_xact_id_if_assigned()
@@ -1054,12 +1073,12 @@ create policy search_token_frequency_pending on gnomon.search_token_frequency
 
 create policy search_scope_length_pending on gnomon.search_scope_length
   for all to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
+  using (tenant_id = (select gnomon.tenant_id())
          and exists (select from gnomon.search_count_delta d
                      where d.tenant_id = search_scope_length.tenant_id
                        and d.written_in = pg_current_xact_id_if_assigned()
                        and d.scope = search_scope_length.scope))
-  with check (tenant_id = gnomon.tenant_id()
+  with check (tenant_id = (select gnomon.tenant_id())
               and exists (select from gnomon.search_count_delta d
                           where d.tenant_id = search_scope_length.tenant_id
                             and d.written_in = pg_current_xact_id_if_assigned()
@@ -1424,10 +1443,12 @@ do $$
 declare
   t record;
   v_read constant text :=
-    'tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes())';
+    'tenant_id = (select gnomon.tenant_id())'
+    ' and scope = any ((select gnomon.allowed_scopes())::text[])';
   v_write constant text :=
-    'tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes())'
-    ' and scope = any(gnomon.writable_scopes())';
+    'tenant_id = (select gnomon.tenant_id())'
+    ' and scope = any ((select gnomon.allowed_scopes())::text[])'
+    ' and scope = any ((select gnomon.writable_scopes())::text[])';
 begin
   for t in
     select * from (values
@@ -1481,7 +1502,8 @@ begin
     end if;
     execute format(
       'create policy %1$s_eraser on gnomon.%1$I for all to gnomon_eraser
-         using (tenant_id = gnomon.tenant_id()) with check (tenant_id = gnomon.tenant_id())',
+         using (tenant_id = (select gnomon.tenant_id()))
+         with check (tenant_id = (select gnomon.tenant_id()))',
       t.name);
     if t.inserts then
       execute format(

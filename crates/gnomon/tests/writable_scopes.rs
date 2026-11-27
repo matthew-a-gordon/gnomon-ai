@@ -628,13 +628,16 @@ create table membership.member (
   primary key (user_id, scope)
 );
 create function membership.scopes(p_writable boolean) returns text[]
-  language sql stable security definer set search_path = pg_catalog, pg_temp
+  language plpgsql stable security definer set search_path = pg_catalog, pg_temp
   as $$
-    select coalesce(pg_catalog.array_agg(m.scope order by m.scope), '{}')
-    from membership.member m
-    where m.user_id = nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb
-                        ->> 'sub'
-      and (m.writable or not p_writable)
+  begin
+    return (
+      select coalesce(pg_catalog.array_agg(m.scope order by m.scope), '{}')
+      from membership.member m
+      where m.user_id = nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb
+                          ->> 'sub'
+        and (m.writable or not p_writable));
+  end
   $$;
 revoke all on function membership.scopes(boolean) from public;
 grant usage on schema membership
@@ -642,23 +645,28 @@ grant usage on schema membership
 grant execute on function membership.scopes(boolean)
   to authenticated, gnomon_worker, gnomon_writer, gnomon_definer, gnomon_eraser;
 create or replace function gnomon.allowed_scopes() returns text[]
-  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  language plpgsql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
-    select case
-      when c ->> 'role' = 'gnomon_worker' then
-        array(select pg_catalog.jsonb_array_elements_text(c -> 'app_metadata' -> 'scopes'))
-      else membership.scopes(false)
-    end
-    from (select nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb as c) x
+  declare
+    c jsonb := nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb;
+  begin
+    if c ->> 'role' = 'gnomon_worker' then
+      return array(select pg_catalog.jsonb_array_elements_text(c -> 'app_metadata' -> 'scopes'));
+    end if;
+    return membership.scopes(false);
+  end
   $$;
 create or replace function gnomon.writable_scopes() returns text[]
-  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  language plpgsql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
-    select case
-      when c ->> 'role' = 'gnomon_worker' then gnomon.allowed_scopes()
-      else membership.scopes(true)
-    end
-    from (select nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb as c) x
+  declare
+    c jsonb := nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb;
+  begin
+    if c ->> 'role' = 'gnomon_worker' then
+      return gnomon.allowed_scopes();
+    end if;
+    return membership.scopes(true);
+  end
   $$;
 insert into membership.member values
   ('member', 'support', true),

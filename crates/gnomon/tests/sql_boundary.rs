@@ -273,6 +273,14 @@ async fn a_caller_cannot_redirect_the_store_functions_through_its_search_path() 
 // The catalog, read as the caller would see it. These pin the acceptance
 // criteria for every table and function a later migration adds.
 
+/// The policies' conditions on the Tenant, the readable Scopes and the
+/// writable Scopes, as PostgreSQL prints them: each a sub-select (ADR-0005).
+const TENANT_CONDITION: &str = "(tenant_id = ( SELECT gnomon.tenant_id() AS tenant_id))";
+const READABLE_CONDITION: &str =
+    "(scope = ANY (( SELECT gnomon.allowed_scopes() AS allowed_scopes)::text[]))";
+const WRITABLE_CONDITION: &str =
+    "(scope = ANY (( SELECT gnomon.writable_scopes() AS writable_scopes)::text[]))";
+
 /// The Ontology's tables. They carry a Tenant and no Scope, because every
 /// Scope of a Tenant shares one Ontology, and their policies check the Tenant
 /// alone.
@@ -327,9 +335,9 @@ async fn every_gnomon_table_has_rls_and_every_policy_but_the_erasers_and_the_cou
             "gnomon.{name}: graph tables have a scope column and Ontology tables none"
         );
         let expected = if ontology {
-            "(tenant_id = gnomon.tenant_id())"
+            TENANT_CONDITION.to_owned()
         } else {
-            "((tenant_id = gnomon.tenant_id()) AND (scope = ANY (gnomon.allowed_scopes())))"
+            format!("({TENANT_CONDITION} AND {READABLE_CONDITION})")
         };
         for p in &policies {
             let (using, check, roles): (Option<String>, Option<String>, Vec<String>) =
@@ -343,7 +351,7 @@ async fn every_gnomon_table_has_rls_and_every_policy_but_the_erasers_and_the_cou
             // Scopes of what they erase and of what they return.
             // The Ontology's tables check the Tenant alone for every role.
             if roles == ["gnomon_eraser"] && !ontology {
-                let tenant = Some("(tenant_id = gnomon.tenant_id())".to_owned());
+                let tenant = Some(TENANT_CONDITION.to_owned());
                 assert_eq!(using, tenant, "gnomon.{name}: the eraser's USING");
                 assert_eq!(check, tenant, "gnomon.{name}: the eraser's CHECK");
                 continue;
@@ -354,7 +362,7 @@ async fn every_gnomon_table_has_rls_and_every_policy_but_the_erasers_and_the_cou
             // 0016). No caller writes either table.
             if BM25_COUNT_TABLES.contains(&name.as_str()) && roles == ["gnomon_definer"] {
                 let pending = format!(
-                    "((tenant_id = gnomon.tenant_id()) AND (EXISTS ( SELECT\n   \
+                    "({TENANT_CONDITION} AND (EXISTS ( SELECT\n   \
                      FROM gnomon.search_count_delta d\n  \
                      WHERE ((d.tenant_id = {name}.tenant_id) AND \
                      (d.written_in = pg_current_xact_id_if_assigned()) AND \
@@ -362,12 +370,11 @@ async fn every_gnomon_table_has_rls_and_every_policy_but_the_erasers_and_the_cou
                 );
                 let (own_using, own_check) = if name == "search_count_delta" {
                     (
-                        "((tenant_id = gnomon.tenant_id()) AND \
-                         (written_in = pg_current_xact_id_if_assigned()))"
-                            .to_owned(),
-                        "((tenant_id = gnomon.tenant_id()) AND \
-                         (written_in = pg_current_xact_id()))"
-                            .to_owned(),
+                        format!(
+                            "({TENANT_CONDITION} AND \
+                             (written_in = pg_current_xact_id_if_assigned()))"
+                        ),
+                        format!("({TENANT_CONDITION} AND (written_in = pg_current_xact_id()))"),
                     )
                 } else {
                     (pending.clone(), pending)
@@ -379,12 +386,12 @@ async fn every_gnomon_table_has_rls_and_every_policy_but_the_erasers_and_the_cou
             // The writer role writes only a Scope the caller may both read
             // and write, and some of its policies add a condition (#81).
             if roles == ["gnomon_writer"] {
-                let writable = "((tenant_id = gnomon.tenant_id()) AND \
-                                (scope = ANY (gnomon.allowed_scopes())) AND \
-                                (scope = ANY (gnomon.writable_scopes()))";
+                let writable = format!(
+                    "({TENANT_CONDITION} AND {READABLE_CONDITION} AND {WRITABLE_CONDITION}"
+                );
                 for e in [&using, &check].into_iter().flatten() {
                     assert!(
-                        e.starts_with(writable),
+                        e.starts_with(&writable),
                         "gnomon.{name}: the writer's policy is {e}"
                     );
                 }
@@ -398,6 +405,103 @@ async fn every_gnomon_table_has_rls_and_every_policy_but_the_erasers_and_the_cou
             }
         }
     }
+}
+
+/// The functions each deployment supplies to tell a policy who is calling
+/// (ADR-0005), and whether each returns a set of Scope keys.
+const POLICY_FUNCTIONS: &[(&str, bool)] = &[
+    ("tenant_id", false),
+    ("allowed_scopes", true),
+    ("writable_scopes", true),
+    ("user_id", false),
+];
+
+/// Every place a gnomon policy calls one of [`POLICY_FUNCTIONS`] other than
+/// as a sub-select of its own, as `table.policy USING|CHECK: function`. A
+/// call in a sub-select runs once for the statement, and a call outside one
+/// runs for every row the policy checks (ADR-0005). A call inside a larger
+/// sub-select counts as outside one. The Scope functions' sub-selects are
+/// cast to `text[]`, the one form `any` reads as an array.
+async fn policy_calls_outside_a_sub_select(
+    client: &impl tokio_postgres::GenericClient,
+) -> Vec<String> {
+    let policies = client
+        .query_typed(
+            "select tablename::text, policyname::text, qual, with_check from pg_policies
+             where schemaname = 'gnomon' order by 1, 2",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(policies.len() > 40, "too few policies: {}", policies.len());
+    let mut found = vec![];
+    for p in &policies {
+        let (table, name): (String, String) = (p.get(0), p.get(1));
+        for (clause, expr) in [
+            ("USING", p.get::<_, Option<String>>(2)),
+            ("CHECK", p.get(3)),
+        ] {
+            let Some(expr) = expr else { continue };
+            for (function, array) in POLICY_FUNCTIONS {
+                let call = format!("gnomon.{function}()");
+                let sub_select = if *array {
+                    format!("( SELECT {call} AS {function})::text[]")
+                } else {
+                    format!("( SELECT {call} AS {function})")
+                };
+                let calls = expr.matches(&call).count();
+                let in_sub_selects = expr.matches(&sub_select).count();
+                if calls != in_sub_selects {
+                    found.push(format!("{table}.{name} {clause}: {function}"));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Every policy calls the policy functions in sub-selects of their own
+/// (ADR-0005), and the check names each policy that calls one otherwise.
+#[tokio::test]
+async fn every_policy_calls_the_policy_functions_in_a_sub_select() {
+    let db = TestDb::migrated().await;
+    let mut admin = db.admin().await;
+    let tx = admin.transaction().await.unwrap();
+    assert_eq!(
+        policy_calls_outside_a_sub_select(&tx).await,
+        Vec::<String>::new()
+    );
+
+    tx.batch_execute(
+        "create policy probe_bare on gnomon.node for select to authenticated
+           using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
+         create policy probe_one_bare on gnomon.node for insert to gnomon_writer
+           with check (tenant_id = (select gnomon.tenant_id())
+                       and scope = any ((select gnomon.allowed_scopes())::text[])
+                       and scope = any (gnomon.writable_scopes()));
+         create policy probe_correlated on gnomon.episode for select to authenticated
+           using (exists (select from gnomon.node n
+                          where n.tenant_id = episode.tenant_id
+                            and n.scope = any (gnomon.allowed_scopes())));
+         create policy probe_user on gnomon.episode for update to gnomon_writer
+           using (true) with check (recorded_by = gnomon.user_id());
+         create policy probe_good on gnomon.episode for delete to gnomon_writer
+           using (tenant_id = (select gnomon.tenant_id())
+                  and recorded_by = (select gnomon.user_id()));",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        policy_calls_outside_a_sub_select(&tx).await,
+        vec![
+            "episode.probe_correlated USING: allowed_scopes".to_owned(),
+            "episode.probe_user CHECK: user_id".to_owned(),
+            "node.probe_bare USING: tenant_id".to_owned(),
+            "node.probe_bare USING: allowed_scopes".to_owned(),
+            "node.probe_one_bare CHECK: writable_scopes".to_owned(),
+        ]
+    );
+    tx.rollback().await.unwrap();
 }
 
 /// The SECURITY DEFINER functions `gnomon_definer` owns (ADR-0009): Kind
