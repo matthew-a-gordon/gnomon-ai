@@ -10,7 +10,13 @@
 -- 30%, 10%), and 30% of texts are held by two Versions in turn, as a
 -- Refinement leaves them. Valid time starts unknown for a fifth of the Nodes
 -- and ends for 30% of the rest.
+--
+-- The generator is seeded, and every ID it makes is a hash of a row number,
+-- so two builds of one size hold the same texts, vectors, times and IDs
+-- whatever the migration files say. A run before a change and one
+-- after it then measure the same rows.
 set maintenance_work_mem = '512MB';
+select setseed(0.21);
 create schema perf;
 create function perf.normal_vec(scale float8, salt int) returns {{ext}}.vector
   language sql volatile as $$
@@ -44,7 +50,7 @@ create unlogged table perf.node as
            random() as u_unknown, random() as u_from, random() as u_to, random() as u_len,
            random() as u_rec
     from c where cum - chain < {{texts}})
-  select i, gen_random_uuid() as uuid, first_text, chain,
+  select i, md5('node ' || i)::uuid as uuid, first_text, chain,
          case when u_unknown < 0.2 then null
               else timestamptz '2020-01-01 00:00:00+00' + floor(u_from * 2000) * interval '1 day' end as vf,
          case when u_unknown >= 0.2 and u_to >= 0.7
@@ -54,13 +60,13 @@ create unlogged table perf.node as
   from d;
 create unlogged table perf.vers as
   select *, ((row_number() over (order by node_i, seq) - 1) / 500)::int as batch from (
-    select f.id, f.node_i, f.text_id, f.seq, f.rf,
+    select md5('version ' || f.node_i || ' ' || f.seq)::uuid as id, f.node_i, f.text_id, f.seq, f.rf,
            lead(f.rf) over (partition by f.node_i order by f.seq) as rt
     from (
-      select e.id, e.node_i, e.text_id, e.seq,
+      select e.node_i, e.text_id, e.seq,
              e.rstart + sum(e.off) over (partition by e.node_i order by e.seq) * interval '1 day' as rf
       from (
-        select gen_random_uuid() as id, t.node_i, t.text_id, t.rstart,
+        select t.node_i, t.text_id, t.rstart,
                row_number() over (partition by t.node_i order by t.text_id, r.rep) as seq,
                case when row_number() over (partition by t.node_i order by t.text_id, r.rep) = 1
                     then 0 else 1 + floor(random() * 60) end as off
@@ -129,7 +135,7 @@ with nodes as (
   select id, row_number() over (order by id) as i from gnomon.node
   where tenant_id = '{{tenant}}' and scope = '{{scope}}' and kind = 'company'),
 pairs as (
-  select gnomon.uuid_v7() as edge, a.id as source, b.id as target
+  select md5('edge ' || a.i)::uuid as edge, a.id as source, b.id as target
   from nodes a join nodes b on b.i = a.i % (select count(*) from nodes) + 1),
 edges as (
   insert into gnomon.edge (tenant_id, scope, id, kind, source_id, target_id)
@@ -138,7 +144,7 @@ versions as (
   insert into gnomon.version (tenant_id, scope, id, edge_id, props, valid_from,
                               valid_from_precision, valid_to, valid_to_precision,
                               recorded_from, merge_rule)
-  select '{{tenant}}', '{{scope}}', gnomon.uuid_v7(), x.id, '{}', '-infinity', 'unknown',
+  select '{{tenant}}', '{{scope}}', md5('edge version ' || x.id)::uuid, x.id, '{}', '-infinity', 'unknown',
          'infinity', 'unknown', '2024-01-01', 'recency'
   from edges x returning id)
 insert into gnomon.citation (tenant_id, scope, version_id, episode_id, property,

@@ -19,11 +19,12 @@ images="${PERF_IMAGES:-pgvector supabase}"
 uncapped_args="-c shared_buffers=8GB -c work_mem=64MB -c maintenance_work_mem=512MB -c max_parallel_workers_per_gather=0 -c fsync=off -c autovacuum=off -c max_wal_size=16GB"
 capped_args="-c shared_buffers=1GB -c effective_cache_size=3GB -c work_mem=16MB -c maintenance_work_mem=512MB -c max_parallel_workers_per_gather=0 -c fsync=off -c autovacuum=off -c max_wal_size=8GB"
 
-# The patch case builds small databases and runs on Postgres's own settings
-# (autovacuum on, fsync on) unless PERF_PATCH_ARGS says otherwise, such as
-# "-c fsync=off" to take durable commit cost out as prototype 4 did. Its
-# tables must not run with autovacuum off: they would never be analyzed.
-patch_args="${PERF_PATCH_ARGS-}"
+# The patch case builds a small Store and a large one, and runs on Postgres's
+# own settings with fsync off, so it measures the merge and not the disk's
+# flush time (#84), as prototype 4 did. PERF_PATCH_ARGS="" runs it with
+# durable commits instead. Its tables must not run with autovacuum off: they
+# would never be analyzed.
+patch_args="${PERF_PATCH_ARGS--c fsync=off}"
 
 teardown() { # <container name>: remove it and its anonymous volumes, nothing else
   local name="$1" volumes
@@ -63,7 +64,7 @@ for image in $images; do
     search|search200k|all) stage "$image" gnomon-t21 "" "$uncapped_args" "$stage_limit_200k" 200000_visible || status=1 ;;
   esac
   case "$what" in
-    patch|all) stage "$image" gnomon-t21 "" "$patch_args" "$stage_limit_patch" bounded_patch || status=1 ;;
+    patch|all) stage "$image" gnomon-t21 "" "$patch_args" "$stage_limit_patch" each_patch_write || status=1 ;;
   esac
   case "$what" in
     capped|all) stage "$image" gnomon-t21-4g 4g "$capped_args" "$stage_limit_200k" 200000_visible || status=1 ;;
