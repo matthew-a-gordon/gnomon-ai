@@ -23,10 +23,11 @@ use support::install::{Extensions, assert_installed, prepare};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_postgres::{Client, NoTls};
 
-/// The Supabase CLI version of the `n`th file: one second apart, after a
-/// consumer's own migration of 2024.
-fn supabase_version(n: usize) -> String {
-    format!("2025010100000{n}_gnomon_")
+/// The file name prefix of the `n`th file, counting from 0: a Supabase CLI
+/// version one second after the last, after a consumer's own migration of
+/// 2024, then `gnomon_`, as the README names them.
+fn supabase_file_prefix(n: usize) -> String {
+    format!("20250101{:06}_gnomon_", n + 1)
 }
 
 async fn the_cli_applies_the_files(placement: Extensions) {
@@ -40,7 +41,7 @@ async fn the_cli_applies_the_files(placement: Extensions) {
         "create table public.consumer_table (id bigint primary key);\n",
     )
     .unwrap();
-    support::copy_migration_files(&migrations, supabase_version);
+    support::copy_migration_files(&migrations, supabase_file_prefix);
     let applied = support::supabase_migration_up(workdir.path(), &db.migration_url("postgresql"))
         .unwrap_or_else(|e| panic!("supabase migration up failed: {e}"));
     assert_eq!(

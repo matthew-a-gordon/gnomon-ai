@@ -1490,8 +1490,7 @@ create trigger statement_check_insert before insert on gnomon.statement
   for each row when (not gnomon.running_as_definer())
   execute function gnomon.statement_check_insert();
 
--- Writes a patch of property values for a Node or an Edge, as migration
--- 0008's `write_patch` does, and records it as a Correction when `p_kind` is
+-- Writes a patch of property values for a Node or an Edge, and records it as a Correction when `p_kind` is
 -- 'correction': a statement row, and the Contributions name it. A Correction
 -- needs a current Version over the Valid time it states, because it
 -- replaces what that Version said. `write_patch` is now this function with no
