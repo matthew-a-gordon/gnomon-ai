@@ -1,12 +1,530 @@
 -- gnomon 0004: Search. The full-text and vector branches, Resolution, the
 -- neighbourhood and fusion, Sentences, and the gap listing (ADR-0010,
 -- ADR-0013).
+--
+-- The full-text branch. A consumer searches with query text at a valid-at and a known-at instant.
+-- Search returns the Versions whose searchable text matches, ranked by BM25
+-- and filtered by Tenant, Scope and the As-of instants (ADR-0010).
+--
+-- GIN on `tsvector` cannot serve this under RLS. Its operator `@@` is not
+-- leakproof, so it can never be an index condition, and every visible row
+-- would be scanned (prototype 5: 253 ms at 200,000 visible rows). Instead a
+-- token table holds one row per word of each Version's searchable text. A
+-- lookup is an equality on the word, `texteq`, which is leakproof. It runs
+-- through a B-tree that leads with the Tenant and the Scope, so the policy's
+-- conditions are index conditions too (ADR-0004, ADR-0005). Prototype 5
+-- measured 4.7 ms at 200,000 visible rows.
+--
+-- What is searched. A Version's searchable text is what its Kind marks as
+-- searchable (ADR-0002): the properties the Kind or an ancestor names, a
+-- Node's `name` and `aliases`, and an Edge Version's Sentence once the
+-- Pipeline has stored one (ADR-0013). No other property is indexed. String
+-- and number values are indexed, inside arrays and objects too, and keys are
+-- not. The `simple` text search configuration splits and lower-cases the
+-- words, with no stemming and no stop words, so every image splits a text
+-- the same way. Postgres keeps at most 256 positions of one word in a text,
+-- so a word's count in one Version stops at 256.
+--
+-- The counts. Each Version's text is scored as a whole. Its token rows hold
+-- each word, how often the word occurs in the text (`tf`), and the text's
+-- length in words (`dl`). Closed Versions keep their rows, so a past As-of
+-- read finds them. The BM25 counts are kept per Scope: how many Versions'
+-- texts hold each word, and how many Versions and words the Scope holds.
+-- Search sums them over the caller's allowed Scopes, which RLS selects, so
+-- the ranking reveals nothing about a Scope the caller cannot read
+-- (ADR-0010). The counts cover every Version of those Scopes whatever its
+-- time. The As-of instants decide only which Versions are returned.
+--
+-- Who writes. One trigger function, `gnomon.maintain_search_index`, writes
+-- the token rows and the counts. It is the fourth kind of definer ADR-0009
+-- allows, owned by the NOLOGIN `gnomon_definer`, and it is granted to no
+-- role. No caller can execute it or attach it to a table of its own, because
+-- both need EXECUTE. Callers hold SELECT on the search tables and no write
+-- privilege, so no caller's statement, nor a trigger of a caller's own, can
+-- write them. The function runs under the caller's claims and the definer's
+-- policies, and writes only what its triggering rows give:
+--
+--   A Version inserted     its token rows, from its text, in its Tenant and
+--                          Scope. One statement indexes a whole batch.
+--   A Sentence stored      its Version's token rows again, from its text with
+--                          the Sentence.
+--   An Erasure reopening   the Version's token rows again (see Erasure).
+--   a Version
+--   Token rows written     the count changes of their Scopes, kept for the
+--   or deleted             transaction in `gnomon.search_count_delta`.
+--   Commit                 the transaction's count changes, applied to the
+--                          counts in key order, and a count that reaches zero
+--                          is deleted, so an erased Scope leaves no count row.
+--
+-- A deleted Version's token rows go by the foreign key, which only the
+-- transaction that wrote the Version, or an Erasure, can set off. Every row is
+-- written in the write's own transaction, so a Version is findable when the
+-- write commits, before its embedding exists (ADR-0010). Within the
+-- transaction, Search adds the transaction's own count changes to the counts.
+--
+-- Why the counts change at commit. Every write in a Scope changes the
+-- Scope's row, and most change some word's row. A row changed statement by
+-- statement stays locked until commit. Two transactions that each write
+-- several Nodes of a Scope would then wait on each other's rows, a deadlock.
+-- Each transaction instead records its changes in rows of its own, which no
+-- other transaction touches. A deferred trigger applies them once at commit,
+-- every word's row in key order and then every Scope's row, so two committing
+-- transactions take the rows in one order and wait at most for each other's
+-- commit.
+--
+-- Erasure (ADR-0003). `gnomon.erase_version_text` deletes the token rows of
+-- every Version an Erasure deletes or recomputes, besides its Sentence.
+-- The counts go down at commit. Erase Episode inserts the Versions it
+-- replays, so they are indexed from their recomputed text. A Version it
+-- reopens is the one that stood just before the Episode first touched its
+-- Node or Edge, so its text owes nothing to the erased Episode. It is indexed
+-- again from its text as it stands, with no Sentence, and so is a Version
+-- that was current then and that the Episode never closed. The definer may read
+-- and delete the token rows of an Edge the running Erasure reaches in a
+-- Scope the caller cannot see (see 0005). It may change the counts
+-- only of a Scope whose changes its own transaction recorded.
+--
+-- The vector branch. The Pipeline stores an embedding of a Version's search text after the
+-- write commits. A consumer searches with a query embedding at a valid-at
+-- and a known-at instant, and gets the nearest Versions at full precision,
+-- exactly over the rows the caller can see, for every Tenant and Scope size
+-- (ADR-0010).
+--
+-- No vector index is used. A vector index scan applies Tenant, Scope and
+-- As-of only to the rows it returns, so a small Scope inside a large Tenant
+-- loses its own rows: prototype 1 measured HNSW recall@10 of 0.13 for a
+-- 100-row Tenant in a 1M-row table. Instead, as prototype 5 measured
+-- (`prototype/exact-search`, FINDINGS.md):
+--
+--   `gnomon.embedding`      the full vector, once per distinct text, keyed by
+--                           Tenant, Scope and the text's hash, with PLAIN
+--                           storage so a re-rank probe reads one heap page.
+--   `gnomon.embedding_bit`  one row per Version: the bits that
+--                           `binary_quantize` gives, the text's hash and the
+--                           Version's four time columns, behind a covering
+--                           B-tree on (tenant_id, scope). The policy's
+--                           conditions are its index conditions (ADR-0005),
+--                           and the As-of conditions are checked on the index
+--                           tuples, which are leakproof `timestamptz`
+--                           comparisons (ADR-0004).
+--
+-- Search scans the bit distance over the covering index, keeps the 400
+-- nearest, and re-ranks them at full precision. Prototype 5 found recall@10
+-- of 0.99 at 200,000 visible rows with 400, against 0.83 with 200. Under RLS
+-- the planner estimates one row for every scan, so it would join the
+-- candidates to the full vectors by scanning every visible full vector (660
+-- ms against 96 ms). The re-rank is pinned: each candidate's full vector is
+-- read by one primary-key probe in a lateral subquery with `limit 1`, which
+-- the planner cannot pull up into an ordinary join. There is no `halfvec`,
+-- no HNSW and no partitioning. pgvector 0.7.0 has everything this uses.
+--
+-- Where pgvector lives. pgvector is in `public` on most hosts and in
+-- `extensions` on Supabase. The functions that use it name its types,
+-- operators and functions without a schema, under the path this file sets
+-- (see pgvector's names below), which each keeps. The functions run as the
+-- caller, so 0001 grants the caller roles USAGE on that schema when they
+-- lack it, and fails when the role that applies it cannot grant that.
+--
+-- The dimension. The vector columns are of type `vector` and the bit
+-- columns `bit varying`, untyped by width, and a check holds each to
+-- `gnomon.embedding_dimension()`, the one place that states it (see 0001).
+-- A vector index such as HNSW needs a typed width, so a future index will
+-- be an expression index with a cast.
+--
+-- Text hashes. A Version's embedding is of its search text: its properties,
+-- whose hash is `version.text_hash`, or, for an Edge Version, its Sentence,
+-- whose hash is `gnomon.sentence_text_hash(sentence)` (ADR-0013). Versions
+-- with the same text share one full vector, so a Refinement, which changes
+-- no text, costs no new embedding. A Sentence is stored after its Version
+-- commits and is not carried to a Refinement Version, so the Pipeline stores
+-- the Refinement's Sentence and then calls `gnomon.store_embedding` with the
+-- Sentence's hash, which finds the full vector already stored.
+--
+-- Who writes. The Pipeline calls `gnomon.store_embedding`, an invoker, as
+-- any caller would (ADR-0009). Callers may insert into both tables and
+-- change a quantized row's text hash, and nothing else: no update of a full
+-- vector, no delete. Every row a caller writes, by the function or by its
+-- own statement, passes the same checks:
+--
+--   RLS          the row is in the caller's Tenant and one of its Scopes.
+--   The trigger  a quantized row names a Version the caller can see in that
+--                Scope, and a hash of that Version's text or Sentence. Its
+--                bits come from the full vector stored for that hash in the
+--                same Scope, and its time columns from the Version, whatever
+--                the caller supplied. No full vector of another Scope can be
+--                attached: the foreign key to the full vector carries the
+--                Scope.
+--   Commit       a full vector inserted in the transaction is the vector of
+--                a quantized row by then, so none is stored for a hash no
+--                Version has.
+--
+-- The write path gains no trigger function of gnomon's. The triggers above
+-- run only when an embedding is stored. A Version is closed by an update of
+-- its Recorded-time end, which reaches its quantized row through the foreign
+-- key `(tenant_id, scope, version_id, recorded_to)` with ON UPDATE CASCADE.
+-- That key costs the write path Postgres's own referential triggers on
+-- `gnomon.version`, which look up a closed or deleted Version's quantized row
+-- by its primary key, and the unique index on those columns of
+-- `gnomon.version` the key needs. A Version deleted by the transaction that
+-- wrote it, or by an Erasure, takes its quantized row with it.
+--
+-- Erasure (ADR-0003). `gnomon.erase_version_text` deletes the quantized
+-- rows of every Version an Erasure deletes or recomputes, then the full
+-- vector of each text those Versions had, their properties' and their
+-- Sentences', unless a quantized row of another Version still uses it. A
+-- Version uses a full vector through its quantized row, so a full vector
+-- shared with a surviving Version stays, and one a recomputed Version alone
+-- used goes with its row. The Pipeline embeds the recomputed text afterwards.
+-- A full vector is kept while a quantized row uses it, not while some
+-- Version merely has its text: a surviving Version with no quantized row yet
+-- gets its vector again when the Pipeline embeds it, and checking every
+-- Version of a Scope by text would cost an Erasure a scan of the Scope or the
+-- write path an index on the text hash. No embedding row names an Episode,
+-- and an embedding reaches its Episodes through its Version's Citations, so
+-- `gnomon.erase_episode_rows` needs nothing more. The definer may read and
+-- delete the embeddings of an Edge the running Erasure reaches in a Scope the
+-- caller cannot see, and read the quantized rows of that Scope that share their texts, so that
+-- it keeps a full vector another Version there still uses.
+--
+-- Resolution. The Pipeline or a consumer matches a mention against the Nodes the graph
+-- already has (GLOSSARY: Resolution). The call searches the current names
+-- and Aliases of the Nodes the caller can see, by full text and by vector,
+-- and returns candidate Nodes, ranked, each with the name or Alias it
+-- matched. It returns candidates only. It merges nothing and writes no
+-- `same_as` or `different_from` Edge (ADR-0012).
+--
+-- The name table. `gnomon.node_name` holds one row per distinct name and
+-- Alias of each Node Version: the text, whether it is an Alias, its hash,
+-- and the Version's Valid time and Recorded-time end. A Version's name and an
+-- Alias with the same text are one row, the name's. The rows are written in
+-- the write's own transaction, so a Node is found by a new name as soon as
+-- the write commits, before the Pipeline embeds it (ADR-0010). Closed
+-- Versions keep their rows, which the Recorded-time end marks. Resolution
+-- reads only the current ones, `recorded_to = 'infinity'`, through partial
+-- indexes. "Current" is the Store's current belief: a name a Node had over
+-- an earlier Valid time stays current until a Correction, a Retraction or an
+-- Erasure replaces it, because a mention in an Episode may use it. A call may
+-- also name a valid-at instant, and then matches only the names that held
+-- then.
+--
+-- Who writes. The name rows are Search's rows, derived from a Version's
+-- text, so the search index trigger, `gnomon.maintain_search_index`, writes
+-- them, as it writes the token rows (ADR-0009). It calls
+-- `gnomon.index_search_text`, which writes a Version's name rows with its
+-- token rows. Callers hold SELECT
+-- on the table and no insert or delete. A Version is closed by an update of
+-- its Recorded-time end, which reaches its name rows through the foreign key
+-- `(tenant_id, scope, version_id, recorded_to)` with ON UPDATE CASCADE, as it
+-- reaches its quantized row. A Version deleted by the
+-- transaction that wrote it, or by an Erasure, takes its name rows with it.
+--
+-- The full-text half reuses the full-text branch's token table, with no
+-- token table of its own. Every Node Kind marks its name and Aliases as
+-- searchable (see 0002), so the Versions whose token rows hold a word
+-- of the mention include every Node whose name or Alias does. Each such
+-- Version's current name rows are then read by key, and each name or Alias
+-- is scored on its own, by BM25 with k1 = 1.2 and b = 0.75. A word's
+-- frequency, the number of texts and their mean length are the counts of
+-- the caller's allowed Scopes and the transaction's own changes to them, as
+-- `gnomon.search_full_text` reads them. Those counts are of whole Version
+-- texts, closed ones and Sentences among them, so the scores rank names
+-- against each other and are not BM25 over the names alone. The length is
+-- that of the name or Alias in words. The token lookup reaches closed
+-- Versions and Edge Versions too, and the probe of their name rows drops
+-- them, so its cost grows with a word's history in the Scope. That is the
+-- price of one token table, against a second one written on every write. A
+-- word that only another searchable property holds matches no name, so it
+-- finds nothing.
+-- A Node's best-scoring name is its match.
+--
+-- The vector half has its own quantized copy, as prototype 5 measured it
+-- (`prototype/exact-search`, FINDINGS.md: 54 ms and recall@10 of 0.95 at
+-- 200,000 visible rows). Each name row carries the bits that
+-- `binary_quantize` gives for the full vector of its text, once one is
+-- stored, behind a covering partial index on (tenant_id, scope) of the
+-- current rows that have one. The search scans the bit distance over that
+-- index, keeps the 400 nearest, and re-ranks them at full precision through
+-- one pinned primary-key probe per candidate, as `gnomon.search_vector` does.
+-- A Node's nearest name is its match.
+--
+-- Full vectors. A name's text is hashed as a Sentence's is,
+-- `gnomon.sentence_text_hash`, and its full vector is the row of
+-- `gnomon.embedding` for that hash in the name's Scope.
+-- There is no second full-vector table. A Version, a Sentence or another
+-- name of the Scope may already have an embedding of the same text. The name
+-- then uses that full vector, and the Pipeline stores none. The Pipeline calls
+-- `gnomon.store_name_embedding` with a Node, one of its current names or
+-- Aliases and the embedding of that text. The full vector is stored once
+-- per text in the Scope, and every current name row of the Scope with that
+-- text gets its bits. A name row written later, for a new Version or another
+-- Node with the same text, gets its bits from the stored full vector when
+-- the row is written, so a Version that keeps its name needs no new
+-- embedding.
+--
+-- What callers may write. Callers update the bits of a name row in their
+-- own Scopes, and nothing else, and a trigger sets the bits from the stored
+-- full vector of the row's text whatever the caller supplied, refusing a
+-- text with none. A foreign key from the rows with bits to the full vector
+-- of their text, carrying the Scope, keeps any full vector from going while
+-- a name row uses it, and the deferred check at commit accepts a full vector
+-- that a name row uses.
+--
+-- Erasure (ADR-0003). `gnomon.erase_version_text` deletes the name rows
+-- of every Version an Erasure deletes or recomputes, and the full vector of
+-- each of their texts unless a quantized row or a name row with bits still
+-- uses it. A Version an Erasure reopens gets its name rows again from its
+-- text, through the search index trigger, as it gets its token rows. No name
+-- row names an Episode, so `gnomon.erase_episode_rows` needs nothing more.
+-- The definer may read the name rows of a Scope the caller cannot see that
+-- share a text with an Edge the running Erasure reaches there, so that it
+-- keeps a full vector a name there still uses.
+--
+-- Neighbourhood search and fusion. A consumer runs one Search call, `gnomon.search`, and gets one fused,
+-- ranked list of the Versions, Summaries and Communities that match its
+-- query at a valid-at and a known-at instant (ADR-0010, GLOSSARY: Search).
+-- Every part is an invoker function under RLS (ADR-0009), so everything it counts is a row the caller can see.
+--
+-- Three branches find candidates:
+--
+--   vector          the Versions nearest the query embedding
+--                   (`gnomon.search_vector`), and the
+--                   Summaries and Communities nearest it (below);
+--   full text       the Versions whose searchable text matches the query
+--                   by BM25 (`gnomon.search_full_text`),
+--                   and the Summaries and Communities whose text does;
+--   neighbourhood   the Edges that join the seed Nodes, and the Nodes at
+--                   their other ends, at depth 1 by default and at most 2.
+--
+-- Each branch hands fusion its best 100, or the call's limit when that is
+-- more, as prototype 5 fused 100 from each branch and as Resolution fuses
+-- its halves. Reciprocal rank fusion with k = 60 adds
+-- `weight / (60 + rank)` for each branch that found a candidate. The fused
+-- best 100, or the limit when that is more, then get two more ranked lists,
+-- the graph signals:
+--
+--   mentions        how many Episodes cite the candidate: the Citations of
+--                   every Version of a Node or an Edge, or a Summary's or a
+--                   Community's own Citations;
+--   connectedness   how many Edges join a Node the candidate is about: the
+--                   Node of a Node Version or a Summary, either end of an
+--                   Edge Version (the Edge itself left out), or any Node a
+--                   Community holds.
+--
+-- A signal ranks the candidates whose count is above zero, most first, and
+-- equal counts share a rank. Its weight adds as a branch's does. Both
+-- signals are counted at search time over the rows the caller can see at
+-- the As-of instants (ADR-0010): stored counters would leak across Scopes
+-- and be wrong for a past read. They rank only candidates the branches
+-- found, so a hub never enters on popularity alone. Every weight is set per
+-- query: the branches' default to 1 and the signals' to 0.5, a lower weight
+-- that leaves them on. A branch weighted 0 adds no candidate.
+--
+-- What is visible at the As-of instants `(v, k)`, where a null `k` reads the
+-- current belief:
+--
+--   A Version       its Valid time contains `v` and its Recorded time `k`.
+--   A Summary or    its Recorded time contains `k` and `v >= as_of_valid`
+--   a Community     (ADR-0015), so a Search at a past valid-at finds none.
+--   An Edge         it holds a Version visible at `(v, k)`, and the caller
+--                   sees both of its Nodes.
+--   A mention       an Episode the caller sees, recorded at or before `k`,
+--                   cited by a Citation recorded at or before `k`, of a
+--                   Version whose Valid time contains `v`, or of the
+--                   Summary or Community itself. A
+--                   retracted Episode counts until its Retraction is
+--                   recorded: at a known-at before that it is a mention, and
+--                   at or after it, or in a read of the current belief, it
+--                   is not. A retracted Episode was found to state what was
+--                   never true, so it no longer makes a Node look mentioned.
+--                   A past read still sees what was believed then. Erasure
+--                   still counts a retracted Episode as another Episode.
+--
+-- The neighbourhood. The caller names its seed Nodes, or names none and the
+-- branch takes the ten Nodes the vector and full-text branches rank best,
+-- by reciprocal rank fusion of their Node Versions. From each seed it
+-- follows the visible Edges that join it, in either direction, keeping at
+-- most 50 per Node: the most-mentioned at the As-of instants, Edge ID
+-- breaking a tie, so the same call follows the same Edges. At depth 2 it
+-- does the same from each Node it reached that is not a seed, and adds the
+-- Edges depth 1 did not follow. Each Edge followed is a candidate through
+-- its Version at `(v, k)`, and so is each Node it reached, apart from the
+-- seeds, through its Version then. They rank by depth, then by how many
+-- seeds or followed Edges reached them, most first, then by ID. A `same_as` or
+-- `different_from` Edge is followed as any other Edge (ADR-0012): Search
+-- collapses no two Nodes. A seed the caller cannot see expands to nothing.
+--
+-- Summaries and Communities searched alongside Versions (ADR-0014). Their
+-- text is indexed as a Version's is, in tables of their own:
+--
+--   `gnomon.derived_search_token`  one row per word of each Summary's or
+--                                  Community's text, with `tf` and `dl`, as
+--                                  `gnomon.search_token` holds a Version's.
+--                                  The search index trigger writes the rows
+--                                  when the row is inserted, in the write's
+--                                  transaction, and they go with the row.
+--                                  Their words join the Scope's BM25 counts,
+--                                  which count every text Search scores,
+--                                  so a Version's score and a Summary's are
+--                                  on one scale. The counts' `versions`
+--                                  columns count those texts.
+--   `gnomon.derived_embedding`     the full vector of each Summary's or
+--                                  Community's text, stored by the Pipeline
+--                                  with `gnomon.store_summary_embedding` or
+--                                  `gnomon.store_community_embedding`, with
+--                                  the bits `binary_quantize` gives and the
+--                                  row's `as_of_valid` and Recorded time
+--                                  behind a covering B-tree on
+--                                  (tenant_id, scope). Search scans the bit
+--                                  distance over that index, keeps the 400
+--                                  nearest and re-ranks them at full
+--                                  precision through one pinned primary-key
+--                                  probe each, as the vector branch does. A
+--                                  Summary's text is its own, so its vector
+--                                  is not shared with any other row.
+--
+-- Who writes them (ADR-0009). The search index trigger,
+-- `gnomon.maintain_search_index`, also fires when a Summary or a Community is inserted and when its token rows are written or
+-- deleted, and writes those rows and their count changes as it writes a
+-- Version's. Callers hold SELECT on the token rows and no write privilege.
+-- The embedding functions are invokers that check the call's Tenant and
+-- Scope. Callers may insert an embedding row and nothing more, and a trigger
+-- sets its bits and time columns from the stored row, whatever the caller
+-- supplied. Closing a Summary or Community reaches its embedding row's
+-- Recorded-time end through the foreign key
+-- `(tenant_id, scope, ..., recorded_to)` with ON UPDATE CASCADE.
+--
+-- Erasure (ADR-0003). `gnomon.erase_summaries_and_communities`, which every
+-- Erasure that removes a Summary or Community calls, deletes their token
+-- rows and embedding rows first, and the counts go down at commit. The
+-- definer reads and deletes the token and embedding rows of a Summary in a
+-- Scope the caller cannot see when the running Erasure reaches that Summary.
+-- A row the transaction that wrote it deletes takes them
+-- with it through the foreign keys.
+--
+-- Storing a Sentence, and the gaps `maintain` repairs. Storing a Sentence (ADR-0013). The Pipeline writes the Sentence of an Edge
+-- Version in its own stage, from the Version as the Store committed it, and
+-- stores it with `gnomon.store_sentence`, an invoker under RLS (ADR-0009).
+-- It inserts the row into `gnomon.sentence`, keyed by the Edge Version, or replaces the text of the one stored
+-- already. It writes no Version and changes no Recorded time: the Sentence is
+-- held outside the Version's values, so a Version stays immutable. A Sentence
+-- is stored for any Edge Version the caller sees, closed ones too, since a
+-- Search at a past known-at instant reads them.
+--
+-- Callers may insert a Sentence and change its text, and nothing else:
+-- no delete, and no change to its Tenant, Scope or Version. Every row a
+-- caller writes, through the function or by its own statement, passes the
+-- same checks. RLS keeps it in the caller's Tenant and Scopes, the insert
+-- trigger refuses a Version that is not an Edge Version
+-- the caller can see, and a check refuses a text with no word.
+--
+-- Its words. The search index trigger writes the Version's
+-- token rows again on the insert or the update, with the Sentence's words, in
+-- the store's own transaction, and its BM25 count changes are applied at
+-- commit. So full-text Search finds the Edge Version by its Sentence when the
+-- store commits, before any embedding exists (ADR-0010).
+--
+-- Its embedding. The Pipeline then calls `gnomon.store_embedding` with
+-- `gnomon.sentence_text_hash(sentence)`, a separate call. A
+-- replaced Sentence's old embedding must not stay: vector Search would find
+-- the Version by a text it no longer has, and once the Version was embedded
+-- again no row would use the old full vector, so no Erasure would ever find
+-- it (ADR-0003). Callers hold no DELETE on the embedding tables, so the
+-- search index trigger, the fourth definer (ADR-0009), also deletes them
+-- when a Sentence is stored. That is the Version's quantized row of a text it
+-- no longer has, and that text's full vector unless a quantized row or a name
+-- row of the Scope still uses it. It touches only rows of the stored
+-- Sentence's own Tenant and Scope.
+--
+-- A Sentence row is not carried to a new Version: it is keyed by the Edge
+-- Version, and an Erasure deletes the Sentence of every Edge Version it
+-- recomputes. So a Refinement, a Correction, or an
+-- Erasure that reopens or replays an Edge Version leaves that Version with
+-- no Sentence, and the gap listing below names it. A Refinement changes no
+-- Valid time a Sentence states, so the Pipeline stores the same text again,
+-- and its full vector is reused (ADR-0013).
+--
+-- The gaps (`gnomon.list_gaps`). `maintain` finds what is missing in one
+-- Scope and repairs it. The listing is an invoker under RLS, so it reads only
+-- the rows the caller sees, and names one Scope of the caller's. Each gap has
+-- a kind, an ID and, for an embedding of a text, the text's hash. The kinds,
+-- in the order they are listed:
+--
+--   sentence             An Edge Version, open or closed, with no Sentence.
+--                        A Search at a past known-at instant reaches closed
+--                        Versions, so they are repaired too.
+--   sentence_embedding   An Edge Version with a Sentence, and no quantized
+--                        row of the Sentence's hash. An embedding of its
+--                        values does not count: once the Sentence exists the
+--                        Version is searched by it. An Edge Version with no
+--                        Sentence is listed for the Sentence only, since its
+--                        embedding follows the Sentence.
+--   node_embedding       A Node Version, open or closed, with no quantized
+--                        row of its text's hash.
+--   name_embedding       A current name or Alias of a Node, one per Node and
+--                        text, whose name rows have no bits.
+--                        Resolution reads only current names, so a replaced
+--                        name is not a gap.
+--   summary_embedding    A Summary, open or closed, with no embedding.
+--   community_embedding  A Community, open or closed, with no embedding.
+--   summary              A Node of the Scope that has a current Version and
+--                        no current Summary in the Scope. "Current" means an
+--                        open Recorded time (ADR-0015). A Node with no
+--                        current Version, bare or retracted, has nothing to
+--                        summarise.
+--   community            A closed Community of the Scope that lost its
+--                        replacement: no Community of the Scope opened at the
+--                        instant it closed, and no current Community of the
+--                        Scope holds any of its Nodes.
+--
+-- Why a Community that lost its replacement is a gap. A Community's text is
+-- its Summary. `gnomon.write_community` closes the Communities it replaces
+-- and adds the new one in one transaction, at one instant,
+-- so a closed Community always has a Community that opened when it closed,
+-- unless an Erasure deleted every Community that transaction wrote for
+-- citing an erased Episode (ADR-0003). The closed row's Nodes then have no
+-- current Community, and the Pipeline regenerates one from the Episodes that
+-- remain. A row whose replacement stands, closed or open, is ordinary
+-- history, whatever Nodes the replacement holds, so a write that regroups
+-- Nodes leaves no gap. Nor is a row listed whose Nodes a current Community
+-- holds again. Two limits follow. An Erasure that removed every row of a
+-- Community leaves nothing to list. And where one transaction replaced
+-- several Communities and an Erasure deleted only some of the new ones, the
+-- old rows still have a replacement that stands and are not listed.
+--
+-- Paging. The order is fixed: by kind as above, then by ID, then by hash in
+-- byte order. A page holds at most the limit, and the next page starts after
+-- the last gap's key, the page token: its kind, ID and hash. The key of a
+-- gap never changes while it is listed, so a gap that is there on every call
+-- is listed exactly once however the set changes between pages, and a gap
+-- added behind the token is listed on the next pass. The same set lists the
+-- same way on every call.
+
+-- pgvector's names. The SQL in this file names pgvector's types, functions
+-- and operators without a schema, so the file sets `search_path` to
+-- `pg_catalog, <pgvector's schema>, pg_temp` for its own statements, and
+-- each function that uses pgvector keeps that path with `set search_path
+-- from current`. No caller's path can then change what a name means, as
+-- long as no untrusted role may CREATE in pgvector's schema. Moving the
+-- extension to another schema later breaks those functions. The runner's
+-- own path is saved first and restored at the end of the file, because a
+-- runner may apply several files in one session or one transaction.
+do $$
+begin
+  perform pg_catalog.set_config('gnomon.saved_search_path',
+                                pg_catalog.current_setting('search_path'), false);
+  perform pg_catalog.set_config('search_path', (
+    select pg_catalog.format('pg_catalog, %I, pg_temp', n.nspname)
+    from pg_catalog.pg_extension e
+    join pg_catalog.pg_namespace n on n.oid = e.extnamespace
+    where e.extname = 'vector'), false);
+end
+$$;
 
 -- The Kind marks of `p_kind` in a Tenant: a root Kind's, a reserved Kind's,
 -- or a registered Kind's, flattened with its ancestors'.
 create function gnomon.kind_search(p_tenant_id uuid, p_kind text)
   returns text[]
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select coalesce(
       (select r.search from gnomon.root_kinds() r where r.name = p_kind),
@@ -26,7 +544,7 @@ create function gnomon.search_text_tokens(p_tenant_id uuid, p_versions uuid[])
     tf integer,
     dl integer
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select d.tenant_id, d.scope, t.lexeme, d.id, pg_catalog.cardinality(t.positions),
            (pg_catalog.sum(pg_catalog.cardinality(t.positions)) over (partition by d.id))::integer
@@ -54,17 +572,16 @@ create function gnomon.search_text_tokens(p_tenant_id uuid, p_versions uuid[])
     cross join lateral pg_catalog.unnest(d.words) t
   $$;
 
--- Migration 0016's function, which the search index trigger calls for a
--- Version inserted, a Sentence stored or a Version an Erasure reopened, now
--- writing the Versions' name rows too. Everything else is as migration 0016
--- wrote it.
-create or replace function gnomon.index_search_text(
+-- The token rows and name rows of `p_versions`, which the search index
+-- trigger writes for a Version inserted, a Sentence stored or a Version an
+-- Erasure reopened.
+create function gnomon.index_search_text(
   p_tenant_id uuid,
   p_versions uuid[],
   p_replace boolean
 )
   returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     perform gnomon.index_node_names(p_tenant_id, p_versions);
@@ -86,8 +603,8 @@ create or replace function gnomon.index_search_text(
   end
   $$;
 
-create or replace function gnomon.maintain_search_index() returns trigger
-  language plpgsql security definer set search_path = ''
+create function gnomon.maintain_search_index() returns trigger
+  language plpgsql security definer set search_path = pg_catalog, pg_temp
   as $$
   declare
     t uuid;
@@ -312,7 +829,7 @@ create function gnomon.search_full_text(
     score double precision,
     rank bigint
   )
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if p_limit is null or p_limit < 1 then
@@ -382,28 +899,17 @@ create function gnomon.search_full_text(
 
 -- The hash of a Sentence's text, as a quantized row of its Version names it.
 create function gnomon.sentence_text_hash(p_sentence text) returns text
-  language sql immutable parallel safe security invoker set search_path = ''
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
     select pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(p_sentence, 'UTF8')), 'hex')
   $$;
 
-do $migration$
-declare
-  ext text := (
-    select n.nspname
-    from pg_catalog.pg_extension e
-    join pg_catalog.pg_namespace n on n.oid = e.extnamespace
-    where e.extname = 'vector');
-  run text;
-begin
-  foreach run in array array[
-$sql$
 -- A query or stored embedding as a vector of the exported dimension. It
 -- refuses one of another length, one with a null, NaN or infinite element,
 -- and one of length zero, which has no cosine distance.
 create function gnomon.embedding_vector(p_embedding real[])
-  returns @extschema@.vector
-  language plpgsql immutable security invoker set search_path = ''
+  returns vector
+  language plpgsql immutable security invoker set search_path from current
   as $fn$
   begin
     if p_embedding is null or pg_catalog.array_ndims(p_embedding) is distinct from 1
@@ -422,15 +928,14 @@ create function gnomon.embedding_vector(p_embedding real[])
       raise exception using errcode = 'invalid_parameter_value',
         message = 'an embedding of length zero has no direction';
     end if;
-    return p_embedding::@extschema@.vector({{embedding_dimension}});
+    return p_embedding::vector;
   end
-  $fn$
-$sql$,
-$sql$
+  $fn$;
+
 -- A quantized row as the Store derives it (see the header). It runs as the
 -- caller, under RLS.
 create function gnomon.embedding_bit_derive() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path from current
   as $fn$
   declare
     v record;
@@ -453,7 +958,7 @@ create function gnomon.embedding_bit_derive() returns trigger
           'an embedding of Version %s is of its text or its Sentence, and %s is the hash of neither',
           new.version_id, new.text_hash);
     end if;
-    select @extschema@.binary_quantize(e.embedding)::bit({{embedding_dimension}}) into new.q
+    select binary_quantize(e.embedding) into new.q
       from gnomon.embedding e
       where e.tenant_id = new.tenant_id and e.scope = new.scope and e.text_hash = new.text_hash;
     if not found then
@@ -467,9 +972,8 @@ create function gnomon.embedding_bit_derive() returns trigger
     new.recorded_to := v.recorded_to;
     return new;
   end
-  $fn$
-$sql$,
-$sql$
+  $fn$;
+
 -- Stores the embedding of Version `p_version_id`'s text, whose hash is
 -- `p_text_hash`: the Version's `text_hash`, or, for an Edge Version, its
 -- Sentence's `gnomon.sentence_text_hash`. The full vector is stored once
@@ -483,10 +987,10 @@ create function gnomon.store_embedding(
   p_embedding real[]
 )
   returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path from current
   as $fn$
   declare
-    v_vector @extschema@.vector := gnomon.embedding_vector(p_embedding);
+    v_vector vector := gnomon.embedding_vector(p_embedding);
     v_scope text;
   begin
     select x.scope into v_scope
@@ -504,9 +1008,8 @@ create function gnomon.store_embedding(
         do update set text_hash = excluded.text_hash
         where b.text_hash <> excluded.text_hash;
   end
-  $fn$
-$sql$,
-$sql$
+  $fn$;
+
 -- The vector branch of Search: the Versions nearest `p_query` by cosine
 -- distance at full precision, As-of the valid-at and known-at instants (a
 -- null known-at reads the current belief), nearest first, at most `p_limit`.
@@ -526,11 +1029,11 @@ create function gnomon.search_vector(
     distance double precision,
     rank bigint
   )
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path from current
   as $fn$
   declare
-    v_query @extschema@.vector;
-    v_bits bit({{embedding_dimension}});
+    v_query vector;
+    v_bits bit varying;
   begin
     if p_limit is null or p_limit < 1 then
       raise exception using errcode = 'invalid_parameter_value',
@@ -541,7 +1044,7 @@ create function gnomon.search_vector(
         message = 'a Search needs a valid-at instant';
     end if;
     v_query := gnomon.embedding_vector(p_query);
-    v_bits := @extschema@.binary_quantize(v_query)::bit({{embedding_dimension}});
+    v_bits := binary_quantize(v_query);
     return query
       with candidates as materialized (
         select b.version_id as vid, b.scope as vscope, b.text_hash as vhash
@@ -552,12 +1055,12 @@ create function gnomon.search_vector(
                 when p_known_at is null then b.recorded_to = 'infinity'
                 else b.recorded_from <= p_known_at and p_known_at < b.recorded_to
               end
-        order by b.q operator(@extschema@.<~>) v_bits, b.version_id
+        order by b.q <~> v_bits, b.version_id
         limit greatest(400, p_limit)
       ),
       reranked as materialized (
         select c.vid, c.vscope,
-               (f.embedding operator(@extschema@.<=>) v_query)::double precision as dist
+               (f.embedding <=> v_query)::double precision as dist
         from candidates c
         -- The pin: one primary-key probe per candidate (see the header).
         cross join lateral (
@@ -578,21 +1081,15 @@ create function gnomon.search_vector(
       ) x
       order by r.dist, r.vid;
   end
-  $fn$
-$sql$
-  ] loop
-    execute replace(run, '@extschema@', quote_ident(ext));
-  end loop;
-end
-$migration$;
+  $fn$;
 create trigger embedding_bit_derive before insert or update of text_hash, q, valid_from,
   valid_to, recorded_from on gnomon.embedding_bit
   for each row execute function gnomon.embedding_bit_derive();
 
--- Migration 0017's check at commit that every full vector the transaction
--- stored is used, now by a quantized row or by a name row with bits.
-create or replace function gnomon.embedding_check_used() returns trigger
-  language plpgsql security invoker set search_path = ''
+-- The check at commit that every full vector the transaction stored is
+-- used, by a quantized row or by a name row with bits.
+create function gnomon.embedding_check_used() returns trigger
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if exists (select from gnomon.embedding e
@@ -633,7 +1130,7 @@ create function gnomon.node_names(p_tenant_id uuid, p_versions uuid[])
     valid_to timestamptz,
     recorded_to timestamptz
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select distinct on (v.id, h.text_hash)
            v.tenant_id, v.scope, v.id, v.node_id, h.text_hash, x.name, x.alias,
@@ -657,7 +1154,7 @@ create function gnomon.node_names(p_tenant_id uuid, p_versions uuid[])
 -- Writes the name rows of these Versions that have none.
 create function gnomon.index_node_names(p_tenant_id uuid, p_versions uuid[])
   returns void
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     insert into gnomon.node_name (tenant_id, scope, version_id, node_id, text_hash, name, alias,
                                   valid_from, valid_to, recorded_to)
@@ -684,7 +1181,7 @@ create function gnomon.resolve_full_text(
     score double precision,
     rank bigint
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     with query as materialized (
       select distinct w.lexeme as token
@@ -768,25 +1265,14 @@ create function gnomon.resolve_full_text(
     limit p_limit
   $$;
 
-do $migration$
-declare
-  ext text := (
-    select n.nspname
-    from pg_catalog.pg_extension e
-    join pg_catalog.pg_namespace n on n.oid = e.extnamespace
-    where e.extname = 'vector');
-  run text;
-begin
-  foreach run in array array[
-$sql$
 -- A name row's bits, from the stored full vector of its text in its Scope.
 -- A row written with no full vector stored has none, and an update of its
 -- bits with none stored is refused. It runs as whoever writes the row.
 create function gnomon.node_name_derive() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path from current
   as $fn$
   begin
-    new.q := (select @extschema@.binary_quantize(e.embedding)::bit({{embedding_dimension}})
+    new.q := (select binary_quantize(e.embedding)
               from gnomon.embedding e
               where e.tenant_id = new.tenant_id and e.scope = new.scope
                 and e.text_hash = new.text_hash);
@@ -797,9 +1283,8 @@ create function gnomon.node_name_derive() returns trigger
     end if;
     return new;
   end
-  $fn$
-$sql$,
-$sql$
+  $fn$;
+
 -- Stores the embedding of `p_name`, a current name or Alias of Node
 -- `p_node_id`, in the Node's Scope (see the header). When a full vector of
 -- that text is stored already, it stays and `p_embedding` is not used.
@@ -811,10 +1296,10 @@ create function gnomon.store_name_embedding(
   p_embedding real[]
 )
   returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path from current
   as $fn$
   declare
-    v_vector @extschema@.vector := gnomon.embedding_vector(p_embedding);
+    v_vector vector := gnomon.embedding_vector(p_embedding);
     v_hash text := gnomon.sentence_text_hash(p_name);
     v_scope text;
   begin
@@ -840,9 +1325,8 @@ create function gnomon.store_name_embedding(
       where n.tenant_id = p_tenant_id and n.scope = v_scope and n.text_hash = v_hash
         and n.recorded_to = 'infinity' and n.q is null;
   end
-  $fn$
-$sql$,
-$sql$
+  $fn$;
+
 -- The vector half of Resolution: the Nodes whose current names and Aliases
 -- have stored embeddings nearest `p_embedding` by cosine distance at full
 -- precision, each with its nearest one, nearest first, at most `p_limit`. A
@@ -864,31 +1348,31 @@ create function gnomon.resolve_vector(
     distance double precision,
     rank bigint
   )
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path from current
   as $fn$
   declare
-    v_query @extschema@.vector;
-    v_bits bit({{embedding_dimension}});
+    v_query vector;
+    v_bits bit varying;
   begin
     if p_embedding is null then
       return;
     end if;
     v_query := gnomon.embedding_vector(p_embedding);
-    v_bits := @extschema@.binary_quantize(v_query)::bit({{embedding_dimension}});
+    v_bits := binary_quantize(v_query);
     return query
       with candidates as materialized (
         select n.scope as nscope, n.version_id as nversion, n.text_hash as nhash
         from gnomon.node_name n
         where n.tenant_id = p_tenant_id and n.recorded_to = 'infinity' and n.q is not null
           and (p_valid_at is null or (n.valid_from <= p_valid_at and p_valid_at < n.valid_to))
-        order by n.q operator(@extschema@.<~>) v_bits, n.version_id, n.text_hash
+        order by n.q <~> v_bits, n.version_id, n.text_hash
         limit greatest(400, p_limit)
       ),
       reranked as materialized (
         select c.nscope, c.nversion, c.nhash,
-               (f.embedding operator(@extschema@.<=>) v_query)::double precision as dist
+               (f.embedding <=> v_query)::double precision as dist
         from candidates c
-        -- The pin: one primary-key probe per candidate (migration 0017).
+        -- The pin: one primary-key probe per candidate (see the header).
         cross join lateral (
           select e.embedding from gnomon.embedding e
           where e.tenant_id = p_tenant_id and e.scope = c.nscope and e.text_hash = c.nhash
@@ -917,13 +1401,7 @@ create function gnomon.resolve_vector(
       order by b.dist, b.nnode
       limit p_limit;
   end
-  $fn$
-$sql$
-  ] loop
-    execute replace(run, '@extschema@', quote_ident(ext));
-  end loop;
-end
-$migration$;
+  $fn$;
 create trigger node_name_derive before insert or update of q on gnomon.node_name
   for each row execute function gnomon.node_name_derive();
 
@@ -962,7 +1440,7 @@ create function gnomon.resolve(
     vector_distance double precision,
     vector_rank bigint
   )
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if p_limit is null or p_limit < 1 then
@@ -1015,7 +1493,7 @@ create function gnomon.derived_text_tokens(p_tenant_id uuid, p_table text, p_ids
     tf integer,
     dl integer
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select d.tenant_id, d.scope, t.lexeme, d.summary_id, d.community_id,
            pg_catalog.cardinality(t.positions),
@@ -1053,10 +1531,10 @@ create trigger derived_search_token_count_deleted after delete on gnomon.derived
 -- The words of `p_query`, each with its BM25 inverse document frequency,
 -- and the mean length of a text, from the counts of the caller's allowed
 -- Scopes and the changes the caller's own transaction recorded, as
--- `gnomon.search_full_text` computes them (migration 0016).
+-- `gnomon.search_full_text` computes them.
 create function gnomon.search_query_words(p_tenant_id uuid, p_query text)
   returns table (token text, idf double precision, mean_length double precision)
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     with query as materialized (
       select distinct w.lexeme as token
@@ -1111,7 +1589,7 @@ create function gnomon.search_full_text_derived(
     scope text,
     score double precision
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     with words as materialized (
       select * from gnomon.search_query_words(p_tenant_id, p_query)
@@ -1168,7 +1646,7 @@ create function gnomon.search_full_text_branch(
     score double precision,
     rank bigint
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select x.kind, x.id, x.node_id, x.edge_id, x.scope, x.score,
            pg_catalog.row_number() over (order by x.score desc, x.id)
@@ -1185,22 +1663,11 @@ create function gnomon.search_full_text_branch(
     limit p_limit
   $$;
 
-do $migration$
-declare
-  ext text := (
-    select n.nspname
-    from pg_catalog.pg_extension e
-    join pg_catalog.pg_namespace n on n.oid = e.extnamespace
-    where e.extname = 'vector');
-  run text;
-begin
-  foreach run in array array[
-$sql$
 -- An embedding row as the Store derives it: of a Summary or Community the
 -- caller can see in that Scope, with its bits and the row's time columns,
 -- whatever the caller supplied. It runs as the caller, under RLS.
 create function gnomon.derived_embedding_derive() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path from current
   as $fn$
   declare
     r record;
@@ -1221,15 +1688,14 @@ create function gnomon.derived_embedding_derive() returns trigger
                                          else 'Community' end,
                                     coalesce(new.summary_id, new.community_id), new.scope);
     end if;
-    new.q := @extschema@.binary_quantize(new.embedding)::bit({{embedding_dimension}});
+    new.q := binary_quantize(new.embedding);
     new.as_of_valid := r.as_of_valid;
     new.recorded_from := r.recorded_from;
     new.recorded_to := r.recorded_to;
     return new;
   end
-  $fn$
-$sql$,
-$sql$
+  $fn$;
+
 -- Stores the embedding of a Summary's or a Community's text, after the write
 -- that made it committed. `p_table` is 'summary' or 'community'. The call's
 -- Tenant and the row's Scope are the caller's. A row's text never changes,
@@ -1242,10 +1708,10 @@ create function gnomon.store_derived_embedding(
   p_embedding real[]
 )
   returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path from current
   as $fn$
   declare
-    v_vector @extschema@.vector := gnomon.embedding_vector(p_embedding);
+    v_vector vector := gnomon.embedding_vector(p_embedding);
     v_scope text;
   begin
     if p_table = 'summary' then
@@ -1272,24 +1738,18 @@ create function gnomon.store_derived_embedding(
               case when p_table = 'community' then p_id end,
               v_vector,
               -- The trigger sets these four from the stored row.
-              @extschema@.binary_quantize(v_vector)::bit({{embedding_dimension}}),
+              binary_quantize(v_vector),
               '-infinity', '-infinity', 'infinity')
       on conflict (tenant_id, scope, derived_id) do nothing;
   end
-  $fn$
-$sql$
-  ] loop
-    execute replace(run, '@extschema@', quote_ident(ext));
-  end loop;
-end
-$migration$;
+  $fn$;
 create function gnomon.store_summary_embedding(
   p_tenant_id uuid,
   p_summary_id uuid,
   p_embedding real[]
 )
   returns void
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $fn$
     select gnomon.store_derived_embedding(p_tenant_id, 'summary', p_summary_id, p_embedding)
   $fn$;
@@ -1300,26 +1760,15 @@ create function gnomon.store_community_embedding(
   p_embedding real[]
 )
   returns void
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $fn$
     select gnomon.store_derived_embedding(p_tenant_id, 'community', p_community_id, p_embedding)
   $fn$;
 
-do $migration$
-declare
-  ext text := (
-    select n.nspname
-    from pg_catalog.pg_extension e
-    join pg_catalog.pg_namespace n on n.oid = e.extnamespace
-    where e.extname = 'vector');
-  run text;
-begin
-  foreach run in array array[
-$sql$
 -- The vector branch over Summaries and Communities: those nearest `p_query`
 -- by cosine distance at full precision, visible at the As-of instants,
 -- nearest first, at most `p_limit`. Ties go to the lower ID. The plan is
--- migration 0017's: the 400 nearest by bits over the covering index, then
+-- the vector branch's: the 400 nearest by bits over the covering index, then
 -- one pinned primary-key probe per candidate.
 create function gnomon.search_vector_derived(
   p_tenant_id uuid,
@@ -1335,12 +1784,12 @@ create function gnomon.search_vector_derived(
     scope text,
     distance double precision
   )
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path from current
   as $fn$
   declare
-    v_query @extschema@.vector := gnomon.embedding_vector(p_query);
-    v_bits bit({{embedding_dimension}}) :=
-      @extschema@.binary_quantize(v_query)::bit({{embedding_dimension}});
+    v_query vector := gnomon.embedding_vector(p_query);
+    v_bits bit varying :=
+      binary_quantize(v_query);
   begin
     return query
       with candidates as materialized (
@@ -1352,14 +1801,14 @@ create function gnomon.search_vector_derived(
                 when p_known_at is null then b.recorded_to = 'infinity'
                 else b.recorded_from <= p_known_at and p_known_at < b.recorded_to
               end
-        order by b.q operator(@extschema@.<~>) v_bits, b.derived_id
+        order by b.q <~> v_bits, b.derived_id
         limit greatest(400, p_limit)
       ),
       reranked as materialized (
         select c.cscope, c.cid, c.csummary, c.ccommunity,
-               (f.embedding operator(@extschema@.<=>) v_query)::double precision as dist
+               (f.embedding <=> v_query)::double precision as dist
         from candidates c
-        -- The pin: one primary-key probe per candidate (migration 0017).
+        -- The pin: one primary-key probe per candidate (see the header).
         cross join lateral (
           select e.embedding from gnomon.derived_embedding e
           where e.tenant_id = p_tenant_id and e.scope = c.cscope and e.derived_id = c.cid
@@ -1377,13 +1826,7 @@ create function gnomon.search_vector_derived(
       ) s on true
       order by r.dist, r.cid;
   end
-  $fn$
-$sql$
-  ] loop
-    execute replace(run, '@extschema@', quote_ident(ext));
-  end loop;
-end
-$migration$;
+  $fn$;
 create trigger derived_embedding_derive before insert on gnomon.derived_embedding
   for each row execute function gnomon.derived_embedding_derive();
 
@@ -1406,7 +1849,7 @@ create function gnomon.search_vector_branch(
     distance double precision,
     rank bigint
   )
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if p_embedding is null then
@@ -1448,7 +1891,7 @@ create function gnomon.search_mentions(
   p_known_at timestamptz
 )
   returns table (key uuid, mentions bigint)
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     with things as materialized (
       select t.key, t.kind, t.id, t.scope
@@ -1513,7 +1956,7 @@ create function gnomon.search_connectedness(
   p_known_at timestamptz
 )
   returns table (key uuid, connectedness bigint)
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     with about as materialized (
       select distinct a.key, a.node, a.skip
@@ -1573,7 +2016,7 @@ create function gnomon.neighbourhood_edges(
     neighbour_id uuid,
     mentions bigint
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     with joining as materialized (
       select n.id as from_node, x.id, x.scope, x.target_id as neighbour
@@ -1647,7 +2090,7 @@ create function gnomon.search_neighbourhood(
     depth integer,
     rank bigint
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     with seeds as materialized (
       select distinct n.id
@@ -1759,7 +2202,7 @@ create function gnomon.search(
     connectedness bigint,
     connectedness_rank bigint
   )
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     n integer;
@@ -1925,7 +2368,7 @@ create function gnomon.store_sentence(
   p_sentence text
 )
   returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_scope text;
@@ -1976,7 +2419,7 @@ create function gnomon.list_gaps(
     edge_id uuid,
     search_text text
   )
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   #variable_conflict use_column
   declare
@@ -2116,5 +2559,14 @@ create function gnomon.list_gaps(
       limit p_limit;
   end
   $$;
+
+-- The runner's own search path again (see pgvector's names above).
+do $$
+begin
+  perform pg_catalog.set_config('search_path',
+                                pg_catalog.current_setting('gnomon.saved_search_path'), false);
+  perform pg_catalog.set_config('gnomon.saved_search_path', '', false);
+end
+$$;
 
 insert into gnomon.schema_version (version, name) values (4, '0004_search');

@@ -47,7 +47,7 @@ We chose this because, under RLS, only a leakproof condition can be an index con
 - Embeddings arrive after the write commits. The Pipeline adds them, and the token table covers the gap because it is written in the write's own transaction.
 - Resolution searches a current-only partial index of Node names and Aliases.
 - Edge Versions are searched through their Sentence. Summaries and Communities are searched. Episodes are not searched; they are reached through Citations.
-- The embedding dimension is fixed when the migrations are exported. Changing the model means a migration adds a column, the Pipeline back-fills it, and a later migration drops the old column.
+- The embedding dimension is stated once, in `gnomon.embedding_dimension()`, which a consumer edits before applying the files. See the amendment below.
 - There is no adjacency table. The neighbourhood branch reads `gnomon.edge` and `gnomon.version` under RLS, through the `edge_source` and `edge_target` indexes on `(tenant_id, source_id, scope)` and `(tenant_id, target_id, scope)`, and the fused Search meets the budgets above with it. An adjacency table with one row per Edge Version and direction was planned and not built. Issue #72 tracks the measurement of the branch on hub Nodes.
 - Neighbourhood expansion defaults to depth 1, with a maximum of 2. It keeps at most 50 Edges per Node, choosing the most-mentioned at the As-of instants, with Edge ID as the tie-break.
 - Mentions and connectedness are two more fused lists. Mentions counts the Episodes citing a candidate. Connectedness counts its Edges.
@@ -56,3 +56,15 @@ We chose this because, under RLS, only a leakproof condition can be an index con
   - Their weights are set per query.
 - Under RLS the planner estimates one row for every scan, so join shapes flip on small differences. The re-rank is pinned to primary-key probes. Unpinned, it scanned every full vector in the visible set: 660 ms against 96 ms.
 - Summing BM25 counts over the allowed Scopes costs more for a caller who holds many Scopes.
+
+## Amendment: the vector columns and a change of model (#80)
+
+The vector columns are of type `vector` and the quantized columns `bit varying`, with no width in the type. A check on each holds it to `gnomon.embedding_dimension()`: `vector_dims(...)` for a vector, `length(...)` for its bits. That function is the one place that states the dimension, 1536 by default, and a consumer whose model has another width edits that line before applying the files. Bit variables in the functions are `bit varying`, and the functions cast to no width, because a bare `::bit` means `bit(1)`. A future HNSW index needs a typed width, so it will be an expression index with a cast.
+
+A change of embedding model is a migration the consumer writes by hand: add a column, back-fill it with the new model's embeddings, then drop the old column. gnomon ships no files for it. A consumer copies gnomon's files into its own chain, which holds the data, so a model change belongs in that chain. When the dimension changes, the migration needs more than those three steps:
+
+- The new column needs its own dimension check. The checks on the existing columns all call `gnomon.embedding_dimension()`, so they cannot hold two widths at once.
+- The functions that read and write the vectors, such as `gnomon.embedding_vector`, `gnomon.store_embedding` and `gnomon.search_vector`, need replacements that use the new column and its width.
+
+These two points come from reading the schema. Nobody has tried them yet. #86 moves the vectors and rewrites this part of the ADR.
+

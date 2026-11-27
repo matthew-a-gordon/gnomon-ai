@@ -3,13 +3,339 @@
 -- Retraction, Retract Episode, stage records, Summaries and Communities, and
 -- the triggers that guard them (ADR-0003, ADR-0007, ADR-0008, ADR-0011,
 -- ADR-0014, ADR-0015).
+--
+-- Episodes. An Episode is an immutable source of its own, not a Node
+-- (ADR-0003). Callers may insert and select Episodes and nothing else: no
+-- UPDATE and no DELETE. Only Erasure, a definer function in 0005, removes
+-- one.
+--
+-- Nodes, Contributions, Versions and Citations. A write states, for one Node and citing one Episode, a value for each of
+-- some properties over one Valid time. Each value is stored as a
+-- Contribution, and the Node's Versions are computed from its Contributions
+-- (ADR-0007), under the merge rule of its Kind (see 0002).
+--
+-- Every Version is bi-temporal. Valid time and Recorded time are four scalar
+-- timestamptz columns with B-tree indexes (ADR-0004), both half-open,
+-- `[from, to)`, with `infinity` for an open bound. Each Valid-time bound
+-- carries a precision (ADR-0008). An exclusion constraint keeps a Node's or
+-- an Edge's Versions from overlapping in both times at once, with
+-- btree_gist's GiST equality on the Tenant and the Node or Edge.
+--
+-- Callers write these tables as the invoker, under RLS (ADR-0009). They get
+-- SELECT and INSERT, with INSERT limited to the columns a caller may choose.
+-- On Versions they also get UPDATE of the Recorded-time end column alone, and
+-- on Versions and Citations a DELETE that a guard trigger refuses for every
+-- row the current transaction did not write. Each Version and Citation
+-- records the transaction that wrote it in `written_in`, which an insert
+-- default sets and no caller may supply or change. Only Erasure deletes
+-- committed history.
+--
+-- A caller may also insert rows directly, as any SQL client could, so the
+-- checks a write depends on run in triggers, not only in the write
+-- function: every Contribution value and every Version value is checked
+-- against the Node Kind's compiled rules (ADR-0002), every new Version holds
+-- the Kind's required properties, and a Citation may be added only to a
+-- current Version.
+--
+-- Bound precision, Refinement and the `uncertain` marker. Each Valid-time
+-- bound carries a precision of `unknown`, `year`, `month`,
+-- `day` or `instant`, and is stored as the start of that period in UTC
+-- (ADR-0008). A write may name any instant inside the period, and the Store
+-- truncates it, so the stored bound never depends on the session's time zone.
+-- An unknown start is stored as -infinity and reads as open.
+--
+-- An As-of read marks a result `uncertain` when its valid-at instant falls
+-- inside the period of one of the result's imprecise bounds. The stored end
+-- of a half-open Valid time is the start of its period, so a result's valid-at
+-- instant always lies before its end bound's period, and only the start bound
+-- can mark a result.
+--
+-- A bound statement is an Episode's statement of one Valid-time bound of one
+-- Contribution (ADR-0007). It states a bound that was unknown or coarse, or
+-- one that contradicts the earlier bound. It moves no row: a Contribution's
+-- effective bound is the latest statement made about it, and every
+-- recompute reads the effective bounds, so a later write to the Node cannot
+-- undo it, and Erasing the statement's Episode brings the earlier bound
+-- back. The trigger on bound statements decides, from the earlier bound,
+-- whether a statement is a Refinement or a Correction, so no caller can
+-- label one as the other:
+--
+--   Refinement  the earlier bound was unknown, or the statement narrows its
+--               precision inside the same period. The earlier Version was
+--               incomplete, not wrong.
+--   Correction  any other change. A bound outside the earlier period, or a
+--               coarser one, contradicts the earlier Version.
+--
+-- Either way the earlier Version is closed in Recorded time and stays
+-- readable As-of before the statement. Callers get no new UPDATE or DELETE:
+-- bound statements are select and insert only, like Contributions.
+--
+-- Every Version also carries the hash of its text, the property values that
+-- Search and embeddings are derived from. Versions with equal text share the
+-- hash, so a Refinement, which states no new text, shares the earlier
+-- Version's and needs no new embedding. The column is generated, so no
+-- caller can set it.
+--
+-- Edges, their Sentences, traversal and the batch As-of read. An Edge is a stable identity for a directed relationship between two
+-- Nodes, of an Edge Kind, in one Scope. It joins the Nodes themselves, not
+-- their Versions. What is known about it is held in its Versions, which are
+-- computed from its Contributions exactly as a Node's are (ADR-0007): the
+-- Contribution, Version, Citation and bound statement tables hold the rows
+-- of Edges beside those of Nodes. Each such row names its Node in
+-- `node_id` or its Edge in `edge_id`, never both, and `versioned_id` is
+-- whichever it names. The merge, the guard triggers, bound precision and
+-- ranked merge read `versioned_id`, so they cover Edge Versions with no
+-- second copy of their rules. Callers may insert `edge_id` beside `node_id`.
+--
+-- An Edge holds over a Valid time. Every write to an Edge records, besides
+-- the property values it states, a Contribution of the built-in property
+-- `holds` with the value true over the write's Valid time. An Edge Version
+-- exists only where `holds` wins, and its values are the Edge Kind's
+-- properties there: `holds` never appears among them, but the Citations name
+-- it, so a write that states no property value still cites its Episode. A
+-- write to an Edge may state no property value at all. An End of validity of
+-- an Edge is a Contribution of `holds` with a JSON null.
+--
+-- The Store checks only that both endpoints exist in the Tenant and that the
+-- Edge Kind allows their Kinds (ADR-0008). Temporal referential integrity is
+-- not enforced: a Node's Valid time belongs to each Version, so there is no
+-- lifespan to check an Edge against. An Edge lives in one Scope, and each
+-- endpoint may be in any Scope of the Tenant that the caller can see. A
+-- foreign key on the Tenant and the Node refuses an endpoint in another
+-- Tenant whatever RLS allows, and the insert trigger, which runs as the
+-- caller under RLS, refuses a Node the caller cannot see. A Node with no
+-- Versions stays as a bare identity while any Edge joins it: the foreign keys
+-- keep it.
+--
+-- A Sentence states in plain language what one Edge Version says. The
+-- Pipeline writes it after the Version commits, from the Version as
+-- committed (ADR-0013), so it is held outside the Version's values, in a
+-- table keyed by the Edge Version, and a write to an Edge takes none. Reads
+-- and traversal return each Edge Version's Sentence, or none until one is
+-- stored with `gnomon.store_sentence` (see 0004).
+--
+-- Correction, End of validity and Retraction. A Correction, an End of validity and a Retraction are statements of the
+-- Episode that makes them, held like Contributions (ADR-0007). Each has a row
+-- in `gnomon.statement` that records its kind, its Episode, its Valid time
+-- and, for an End of validity or a Retraction, the Version it ended or
+-- retracted. The merge reads no statement row: a statement takes effect
+-- through Contributions that name it in `contribution.statement_id`, so
+-- `gnomon.recompute_versions`, ranked merge, Citations and the guard triggers
+-- cover statements with no second copy of their rules, and Erasure
+-- recomputes through the same merge.
+--
+--   Correction        Contributions of the values it states, over the Valid
+--                     time it states them for. The values replace the earlier
+--                     Version's where the merge lets them win: the earlier
+--                     Version is closed in Recorded time and a new one opens,
+--                     so the earlier Version stays readable As-of before the
+--                     Correction.
+--   End of validity   Contributions of JSON null, from the stated instant to
+--                     the end of the Version that held across it, for each
+--                     property of that Version. For an Edge it is one
+--                     Contribution of the built-in `holds`, so the Edge holds
+--                     no Version from that instant whatever property values
+--                     remain.
+--   Retraction        Contributions of JSON null over the whole Valid time of
+--                     a current Version, for each property of that Version
+--                     and, for an Edge, `holds`. The Version is closed in
+--                     Recorded time and stays readable As-of before the
+--                     Retraction.
+--
+-- Because a statement is a set of Contributions, ranked merge applies to it
+-- as it does to values: a statement from a lower-Authority Episode loses to
+-- the values a higher-Authority Episode supplied where their Valid times
+-- overlap, stays held, and takes effect when that Episode is erased
+-- (ADR-0007). Without ranked merge a statement wins only when its Episode's
+-- Reference time is not before the values it ends, as any Contribution does.
+--
+-- `bound_statement` is the other statement table. It names one Contribution
+-- and one bound, and the merge reads it. `statement` names a Node or an
+-- Edge, and the merge reads the Contributions that carry its
+-- `statement_id`. Erasure deletes, for an Episode: its `contribution` rows,
+-- which include those of its statements, then its `statement` rows, then
+-- its `bound_statement` rows. A statement's Contributions are deleted with
+-- it, by the foreign key. Callers get no UPDATE or DELETE right on either
+-- table, and the statement functions run as the invoker (ADR-0009).
+--
+-- Retract Episode. It records a Retraction for every current Version cited only
+-- by the Episode, and keeps history readable (ADR-0003). It is not Erasure:
+-- it deletes no Contribution, no Citation, no statement and no Episode, so an
+-- As-of read at a known-at instant before it returns what it returned then,
+-- and Erasure is still the only route that deletes.
+--
+-- A Retraction is a statement (`gnomon.statement`, kind 'retraction'), held
+-- like a Contribution, so Retract Episode adds no way to end a Version. It is written by the retracted Episode, at its Authority and
+-- Reference time, and for an Edge it is a null for the built-in `holds`. A
+-- Version that another Episode also cites is not touched, and ranked merge
+-- applies to the Retractions as it does to any statement: a Retraction from
+-- a lower-Authority Episode does not end values a higher-Authority Episode
+-- supplied where their Valid times overlap (ADR-0007).
+--
+-- The Episode's own statements are held too (a Correction, an End of
+-- validity or a Retraction of the Episode that lost, or that took effect).
+-- Retract Episode retracts the Episode, so none of them counts any more, and
+-- none takes effect if a higher-Authority Episode is erased later.
+-- `gnomon.episode_retraction` records that the Episode is retracted, and
+-- the merge leaves out the
+-- Contributions of an Episode's statements and its bound statements once the
+-- row exists, apart from the Retractions Retract Episode itself made
+-- (`statement.retracts_episode`). The statements stay in their tables, so
+-- history stays readable; only the merge stops reading them. Contributions of
+-- values, not of statements, still count: they are what the Versions cite, and
+-- the Retractions above are what ends the Versions that only the Episode
+-- cited.
+--
+-- Erasure of a retracted Episode deletes its `episode_retraction` row with
+-- the rest: the row cascades from the Episode. `retract_episode` runs as the
+-- invoker (ADR-0009), and callers get no UPDATE or DELETE right.
+--
+-- Stage records. The Pipeline's `add_episode` is one resumable call (ADR-0011). Each stage
+-- commits its output to the Store together with its own stage record, so a
+-- retry resumes at the first unfinished stage. The optional server queue is
+-- the same table: a worker claims a pending or retry-due record with a lease,
+-- runs the stage, and finishes the record in the stage's own transaction.
+--
+-- A stage record holds the Episode, the stage name, a status, an attempt
+-- count, the last error, a retry time and a lease time. Its usage counts,
+-- one row per model, hold the model name, the call count, the input and
+-- output tokens and the provider's reported cost when given. Neither table
+-- has a column for model output or any other text (ADR-0011): anything
+-- derived from an Episode must be reachable by Erasure (ADR-0003), and model
+-- output would be one more copy of the Episode to delete. So every text
+-- column but the Scope is an identifier, refused by a check constraint unless
+-- it matches a fixed pattern with no spaces and a fixed maximum length. The
+-- Scope is the Episode's own, which the foreign key to the Episode checks.
+-- The last error is a code, such as `rate_limited` or `output.invalid_json`,
+-- and an optional number, such as the provider's HTTP status. It has no
+-- message, because a provider's message, or a parser's, often quotes its
+-- input or the model's output.
+--
+-- Status. A record is
+--
+--   pending    written, not yet claimed;
+--   running    claimed, with a lease until `lease_until`;
+--   retry      failed, and due again at `retry_at`;
+--   succeeded  finished, in the transaction that committed the stage's output;
+--   failed     failed for the last time. It stays visible as failed.
+--
+-- A claim (`gnomon.claim_stage`) takes one record that is pending, retry-due
+-- or running with an expired lease, sets it running with a lease, counts the
+-- attempt and returns it. The Store commits the claim as its own call. The
+-- claim locks the record with FOR UPDATE SKIP LOCKED, so two concurrent
+-- claimers never get the same record: the second skips the record the first
+-- holds and takes another, or none. Every time is the database's clock,
+-- `now()`, so workers on hosts whose clocks differ agree on when a lease
+-- expires and when a retry is due. A lease of zero expires at once.
+--
+-- A finish (`gnomon.finish_stage`) names the attempt its claim returned. It
+-- finishes the record only while the record is still running at that
+-- attempt, and otherwise fails with SQLSTATE GNS01. A worker whose lease
+-- expired and whose record another worker claimed since cannot finish it, and
+-- the stage output in the same transaction rolls back with it. A worker whose
+-- lease expired but whom no one replaced still finishes.
+--
+-- Isolation. Both tables carry the Tenant and the Episode's Scope, and RLS
+-- checks both for every caller (ADR-0005). The functions are invokers under
+-- RLS (ADR-0009). Callers
+-- may insert and select, and update only the columns a claim or a finish
+-- changes. They may not delete. Only Erasure deletes a stage record.
+--
+-- Erasure. `gnomon.erase_episode_rows` deletes the Episode's usage counts
+-- and stage records. Erase Scope calls it for each of its Episodes, so a
+-- Scope's Erasure removes them too. Erase
+-- Node and Erase Edge leave Episodes, and their stage records, alone. The
+-- definer role gets the Tenant and Scope policies and SELECT and DELETE on
+-- both tables. Retract Episode changes neither table.
+--
+-- Summaries and Communities. The Pipeline writes a Summary of a Node, generated prose describing it,
+-- and a Community of Nodes, a group of closely connected Nodes with a
+-- generated Summary of the group (GLOSSARY.md). The Store writes and reads
+-- them with their Citations under the same Tenant and Scope rules as every
+-- other row. It makes no model calls: the text is the Pipeline's.
+--
+-- One Scope (ADR-0014). A Summary or Community belongs to one Scope and
+-- cites only Episodes of that Scope. The foreign key from a Citation to its
+-- Episode carries the Scope of the Summary or Community, so a Citation of an
+-- Episode in another Scope is refused whoever writes it. A Summary describes
+-- one Node the writer can see, in any of the writer's Scopes: a Node in Scope
+-- A that Edges in Scope B join may have a Summary in Scope B too, built from
+-- Scope B's Episodes, which is how a Node cited from two Scopes has one
+-- Summary per Scope. A Community is detected over the Nodes and Edges of one
+-- Scope, so every Node it holds is in its own Scope. The foreign key from a
+-- member to its Node carries the Community's Scope, so a Node of another
+-- Scope is refused, even one the writer can see.
+--
+-- Versioned by Recorded time (ADR-0015). Each row carries a Recorded time,
+-- which only gnomon assigns, and `as_of_valid`, the valid-at instant the
+-- Pipeline wrote it for. A read at `(v, k)` finds a row only when its
+-- Recorded time contains `k` and `v >= as_of_valid`. Regenerating one closes
+-- the old row at the start of the current transaction and adds a new one, so
+-- nothing is deleted and a read at an earlier known-at instant still finds
+-- the old row. A Node has at most one current Summary in each Scope. A new
+-- Community names the current Communities it replaces, which it closes.
+-- Replacing a row the current transaction wrote deletes it instead, as for
+-- Versions (ADR-0015): closing a row at the instant it opened would leave it
+-- an empty Recorded time, so a second write in one transaction replaces the
+-- first (ADR-0008, ADR-0009). No committed row is deleted.
+--
+-- Who writes (ADR-0009). Callers write through `gnomon.write_summary` and
+-- `gnomon.write_community`, invokers under RLS. A caller may also insert rows directly, as any SQL client
+-- could, so the checks a write depends on are the tables' own: RLS, foreign
+-- keys that carry the Scope, insert grants on the columns a caller may
+-- choose, so that the ID, the Recorded time and the transaction mark always
+-- take their defaults, and triggers that
+--
+--   * refuse a Summary of a Node the caller cannot see, and a Summary whose
+--     Recorded time would overlap another of the same Node and Scope;
+--   * refuse a Citation or a member added to a row an earlier transaction
+--     wrote, so a row's Citations and members are fixed when it commits;
+--   * refuse, at commit, a Summary with no Citation and a Community with no
+--     Citation or no member;
+--   * let a row's Recorded-time end change only by closing an open row at
+--     the start of the current transaction;
+--   * let a row be deleted only by the transaction that wrote it.
+--
+-- Both write functions take the advisory lock of every Node they describe or
+-- hold (`gnomon.lock_for_write`), in order of ID, as an Erasure does, so a
+-- write and an Erasure of the same Node serialise. A Citation's foreign key
+-- takes a share lock on its Episode's row, which Erase Episode locks FOR
+-- UPDATE, so a write citing an Episode and its Erasure serialise too.
+--
+-- Erasure (ADR-0003). Every Summary and Community that cites an erased
+-- Episode goes, closed or open, with its Citations and members:
+-- `gnomon.erase_episode_rows` deletes them before the Episode. Erasing a
+-- Node removes every Summary of the Node, whatever its Scope, and every
+-- Community that holds it: `gnomon.erase_versioned_rows` deletes them.
+-- Erasing a Scope removes every Summary and Community in it, because each
+-- cites at least one of the Scope's Episodes, and every Summary of one of its
+-- Nodes in another Scope. Both go through
+-- `gnomon.erase_summaries_and_communities`, which also deletes the rows
+-- Search derives from a Summary's or Community's text. A Retraction changes
+-- neither table: a Citation of a retracted Episode still counts.
+--
+-- Reaching Summaries the caller cannot see. A Summary of a Node in Scope B
+-- may describe a Node in Scope A. Erasing the Node, or Scope A, must remove
+-- it, even when the caller cannot see Scope B, because the foreign key on the
+-- Node would refuse the Node's delete while it stood. So the definer gets the
+-- reach it has over Edges (ADR-0009, see 0005): it may read and delete
+-- a Summary, in any Scope of the Tenant, of a Node its own Erasure listed in
+-- `gnomon.erasure_reach`, and that Summary's Citations. No caller role holds
+-- these policies, and a listed Node is visible only to the transaction that
+-- listed it. Communities need no reach, because their Nodes are in their own
+-- Scope, which the caller of the Erasure sees.
+--
+-- A Node that an Erasure would leave bare and delete stays as a bare identity
+-- while a Summary of it, or a Community holding it, still names it, as it
+-- does while an Edge still joins it. Only a Summary that cites no erased
+-- Episode can name it then.
 
 -- Whether the current user is the NOLOGIN definer role, which is true only
 -- inside a function that role owns. Erasure is the one such function that
 -- writes the tables whose guards this lets past. Kind registration and the
 -- merge-rule setter run as the role too, and write only the Ontology.
 create function gnomon.running_as_definer() returns boolean
-  language sql stable parallel safe security invoker set search_path = ''
+  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$ select current_user = 'gnomon_definer'::name $$;
 
 -- Store functions run as the invoker with an empty search path, so RLS
@@ -22,7 +348,7 @@ create function gnomon.record_episode(
   p_reference_time timestamptz,
   p_authority integer
 ) returns uuid
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     insert into gnomon.episode (tenant_id, scope, id, content, reference_time, authority)
     values (p_tenant_id, p_scope, gnomon.uuid_v7(), p_content, p_reference_time, p_authority)
@@ -39,7 +365,7 @@ create function gnomon.read_episode(p_tenant_id uuid, p_episode_id uuid)
     authority integer,
     recorded_at timestamptz
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select e.tenant_id, e.scope, e.id, e.content, e.reference_time, e.authority, e.recorded_at
     from gnomon.episode e
@@ -51,7 +377,7 @@ create function gnomon.read_episode(p_tenant_id uuid, p_episode_id uuid)
 -- the Kind must still have the property.
 create function gnomon.check_node_value(p_tenant_id uuid, p_kind text, p_property text, p_value jsonb)
   returns void
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     rule jsonpath := coalesce(
@@ -72,11 +398,11 @@ create function gnomon.check_node_value(p_tenant_id uuid, p_kind text, p_propert
   end
   $$;
 
--- The precision of a bound this migration writes: an instant, or unknown
--- for an open bound.
+-- The precision of a bound a write names without one: an instant, or
+-- unknown for an open bound.
 create function gnomon.instant_or_unknown(p_bound timestamptz)
   returns gnomon.time_precision
-  language sql immutable parallel safe security invoker set search_path = ''
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
     select case when p_bound in ('-infinity', 'infinity') then 'unknown' else 'instant' end
       ::gnomon.time_precision
@@ -85,7 +411,7 @@ create function gnomon.instant_or_unknown(p_bound timestamptz)
 -- Checks a new Node's Kind: the root Kind `node`, or a Node Kind the Tenant
 -- registered.
 create function gnomon.node_check_kind() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if new.kind = 'node' then
@@ -105,11 +431,11 @@ create function gnomon.node_check_kind() returns trigger
 create trigger node_check_kind before insert on gnomon.node
   for each row execute function gnomon.node_check_kind();
 
--- A Contribution is checked as in migration 0008. One that names a statement
+-- A Contribution's value is checked against its Kind's rules. One that names a statement
 -- must be the statement's own: the same Node or Edge, Episode, Valid time and
 -- Recorded time, and a JSON null unless the statement is a Correction.
-create or replace function gnomon.contribution_check_insert() returns trigger
-  language plpgsql security invoker set search_path = ''
+create function gnomon.contribution_check_insert() returns trigger
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_kind text;
@@ -166,9 +492,9 @@ create trigger contribution_check_insert before insert on gnomon.contribution
 -- written by that transaction, records the rule of its Node's or Edge's
 -- Kind, holds only values that Kind's rules accept and holds every property
 -- the Kind requires. An Edge Version's values never hold the built-in
--- `holds`. This is migration 0007's check, with Edges.
-create or replace function gnomon.version_check_insert() returns trigger
-  language plpgsql security invoker set search_path = ''
+-- `holds`.
+create function gnomon.version_check_insert() returns trigger
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_kind text;
@@ -242,10 +568,10 @@ create trigger version_check_insert before insert on gnomon.version
   for each row when (not gnomon.running_as_definer())
   execute function gnomon.version_check_insert();
 
--- The guard on Versions (ADR-0009), as in migration 0004, with the Edge
--- column among those that never change. Edge Versions get the same guard.
-create or replace function gnomon.version_guard_update() returns trigger
-  language plpgsql security invoker set search_path = ''
+-- The guard on Versions (ADR-0009). The Node and Edge columns are among
+-- those that never change, and Edge Versions get the same guard.
+create function gnomon.version_guard_update() returns trigger
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if (new.tenant_id, new.scope, new.id, new.node_id, new.edge_id, new.props, new.valid_from,
@@ -285,7 +611,7 @@ create trigger version_guard_update before update on gnomon.version
 -- the first in place (ADR-0008). Committed history is deleted only by
 -- Erasure.
 create function gnomon.guard_delete() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if old.written_in is distinct from pg_current_xact_id() then
@@ -309,7 +635,7 @@ create trigger citation_guard_delete before delete on gnomon.citation
 -- the Citations it had, and it is recorded when its write's transaction
 -- started.
 create function gnomon.citation_check_insert() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if new.recorded_at is distinct from transaction_timestamp()
@@ -338,39 +664,14 @@ create trigger citation_check_insert before insert on gnomon.citation
 -- for the rest of the transaction, so they serialise on each Node (ADR-0007).
 create function gnomon.node_lock_key(p_tenant_id uuid, p_node_id uuid)
   returns bigint
-  language sql immutable parallel safe security invoker set search_path = ''
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$ select pg_catalog.hashtextextended(p_tenant_id::text || '/' || p_node_id::text, 0) $$;
-
--- Opens a write to a Node: checks the Tenant against the caller's, takes
--- the Node's lock, and returns the Node's Scope and Kind.
-create function gnomon.lock_node_for_write(
-  p_tenant_id uuid,
-  p_node_id uuid,
-  out node_scope text,
-  out node_kind text
-)
-  language plpgsql volatile security invoker set search_path = ''
-  as $$
-  begin
-    if p_tenant_id is null or p_tenant_id is distinct from gnomon.tenant_id() then
-      raise exception using errcode = 'insufficient_privilege',
-        message = 'a write may write only in the caller''s own Tenant';
-    end if;
-    perform pg_catalog.pg_advisory_xact_lock(gnomon.node_lock_key(p_tenant_id, p_node_id));
-    select n.scope, n.kind into node_scope, node_kind
-      from gnomon.node n where n.tenant_id = p_tenant_id and n.id = p_node_id;
-    if not found then
-      raise exception using errcode = 'GNW01',
-        message = format('Node %s is not visible to the caller', p_node_id);
-    end if;
-  end
-  $$;
 
 -- Creates a Node of a Kind in a Scope and returns its ID, a UUID v7. The Node
 -- holds no Version until a write states a value for it.
 create function gnomon.create_node(p_tenant_id uuid, p_scope text, p_kind text)
   returns uuid
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     insert into gnomon.node (tenant_id, scope, kind) values (p_tenant_id, p_scope, p_kind)
     returning id
@@ -386,7 +687,7 @@ create function gnomon.list_citations(p_tenant_id uuid, p_version_id uuid)
     recorded_at timestamptz,
     episode_recorded_at timestamptz
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select c.episode_id, c.property, c.place, c.recorded_at, c.episode_recorded_at
     from gnomon.citation c
@@ -397,7 +698,7 @@ create function gnomon.list_citations(p_tenant_id uuid, p_version_id uuid)
 -- The start of the period of `p_at` at a precision, in UTC.
 create function gnomon.period_start(p_at timestamptz, p_precision gnomon.time_precision)
   returns timestamptz
-  language sql immutable parallel safe security invoker set search_path = ''
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
     select case p_precision
       when 'year' then date_trunc('year', p_at at time zone 'UTC') at time zone 'UTC'
@@ -411,7 +712,7 @@ create function gnomon.period_start(p_at timestamptz, p_precision gnomon.time_pr
 -- period. An instant has no extent, so its period ends where it starts.
 create function gnomon.period_end(p_start timestamptz, p_precision gnomon.time_precision)
   returns timestamptz
-  language sql immutable parallel safe security invoker set search_path = ''
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
     select case p_precision
       when 'year' then (p_start at time zone 'UTC' + interval '1 year') at time zone 'UTC'
@@ -442,7 +743,7 @@ create function gnomon.read_node(
     uncertain boolean,
     text_hash text
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select v.id, v.node_id, v.scope, n.kind, v.props,
            v.valid_from, v.valid_from_precision, v.valid_to, v.valid_to_precision,
@@ -467,7 +768,7 @@ create function gnomon.classify_bound(
   p_new_at timestamptz,
   p_new_precision gnomon.time_precision
 ) returns text
-  language sql immutable parallel safe security invoker set search_path = ''
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
     select case
       when p_old_at = p_new_at and p_old_precision = p_new_precision then 'unchanged'
@@ -479,11 +780,11 @@ create function gnomon.classify_bound(
     end
   $$;
 
--- A bound statement is checked as in migration 0006, for a Contribution of
--- a Node or of an Edge. The statement names the Node or Edge of its
+-- A bound statement's insert check, for a Contribution of a Node or of an
+-- Edge. The statement names the Node or Edge of its
 -- Contribution, and a direct insert takes that one's lock.
-create or replace function gnomon.bound_statement_check_insert() returns trigger
-  language plpgsql security invoker set search_path = ''
+create function gnomon.bound_statement_check_insert() returns trigger
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     earlier record;
@@ -548,7 +849,7 @@ create trigger bound_statement_check_insert before insert on gnomon.bound_statem
 -- `gnomon.check_node_value` does for a Node. The built-in comes first.
 create function gnomon.check_edge_value(p_tenant_id uuid, p_kind text, p_property text, p_value jsonb)
   returns void
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     rule jsonpath := coalesce(
@@ -569,13 +870,13 @@ create function gnomon.check_edge_value(p_tenant_id uuid, p_kind text, p_propert
   end
   $$;
 
--- The insert check of migration 0008, with the reserved Kinds among the
--- Edge Kinds of every Tenant. An Edge of a symmetric Kind joins two
+-- The insert check on Edges, with the reserved Kinds among the Edge Kinds
+-- of every Tenant. An Edge of a symmetric Kind joins two
 -- different Nodes, and once both are checked its endpoints are stored in
 -- the canonical order, the lower ID as the source, whatever order the caller
 -- gave, so the unique index below sees one Edge per pair.
-create or replace function gnomon.edge_check_insert() returns trigger
-  language plpgsql security invoker set search_path = ''
+create function gnomon.edge_check_insert() returns trigger
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     allowed record;
@@ -633,7 +934,7 @@ create trigger edge_check_insert before insert on gnomon.edge
 
 -- A Sentence belongs to an Edge Version.
 create function gnomon.sentence_check_insert() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if not exists (
@@ -662,7 +963,7 @@ create function gnomon.lock_for_write(
   out scope text,
   out kind text
 )
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if p_tenant_id is null or p_tenant_id is distinct from gnomon.tenant_id() then
@@ -688,7 +989,7 @@ create function gnomon.lock_for_write(
 -- The Kind of the Node or Edge a Contribution is of.
 create function gnomon.contribution_kind(p_tenant_id uuid, p_node_id uuid, p_edge_id uuid)
   returns text
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select coalesce(
       (select n.kind from gnomon.node n where n.tenant_id = p_tenant_id and n.id = p_node_id),
@@ -696,16 +997,16 @@ create function gnomon.contribution_kind(p_tenant_id uuid, p_node_id uuid, p_edg
     )
   $$;
 
--- The bound a Contribution has now, as in migration 0007, for the
--- Contribution of a Node or of an Edge.
-create or replace function gnomon.contribution_bound(
+-- The bound a Contribution has now, for the Contribution of a Node or of
+-- an Edge.
+create function gnomon.contribution_bound(
   p_tenant_id uuid,
   p_contribution_id bigint,
   p_side text,
   out bound_at timestamptz,
   out bound_precision gnomon.time_precision
 )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select coalesce(s.bound_at, case p_side when 'from' then c.valid_from else c.valid_to end),
            coalesce(s.bound_precision,
@@ -731,11 +1032,11 @@ create or replace function gnomon.contribution_bound(
     where c.tenant_id = p_tenant_id and c.id = p_contribution_id
   $$;
 
--- The write path's recompute, as migration 0010 left it: it merges at the
+-- The write path's recompute: it merges at the
 -- start of its transaction under the rule the Kind has now, and the merge
 -- locks the Node or Edge and refuses a write that a later transaction
 -- overtook.
-create or replace function gnomon.recompute_versions(
+create function gnomon.recompute_versions(
   p_tenant_id uuid,
   p_id uuid,
   p_is_edge boolean,
@@ -744,7 +1045,7 @@ create or replace function gnomon.recompute_versions(
   out changed boolean,
   out opened uuid[]
 )
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_scope text;
@@ -761,34 +1062,19 @@ create or replace function gnomon.recompute_versions(
   end
   $$;
 
--- A Node's recompute is the shared one.
-create or replace function gnomon.recompute_node(
-  p_tenant_id uuid,
-  p_node_id uuid,
-  p_from timestamptz,
-  p_to timestamptz,
-  out changed boolean,
-  out opened uuid[]
-)
-  language sql volatile security invoker set search_path = ''
-  as $$
-    select r.changed, r.opened
-    from gnomon.recompute_versions(p_tenant_id, p_node_id, false, p_from, p_to) r
-  $$;
-
--- Creates an Edge as migration 0008 does and returns its ID. For a
+-- Creates an Edge and returns its ID. For a
 -- symmetric Kind it returns the Scope's Edge of that Kind between the two
 -- Nodes when one exists, in either order, so creating the Edge from B to A
 -- after the one from A to B addresses the same Edge. The insert trigger
 -- checks the Kind and the endpoints first, in both cases.
-create or replace function gnomon.create_edge(
+create function gnomon.create_edge(
   p_tenant_id uuid,
   p_scope text,
   p_kind text,
   p_source_id uuid,
   p_target_id uuid
 ) returns uuid
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_id uuid;
@@ -811,8 +1097,8 @@ create or replace function gnomon.create_edge(
   $$;
 
 -- States a bound of a current Version's Valid time, citing one Episode, for
--- a Node or an Edge. This is migration 0006's `state_bound`, which now calls
--- it. For an Edge the statement is about the Contributions of `holds` too,
+-- a Node or an Edge. `state_bound` and `state_edge_bound` call it. For an
+-- Edge the statement is about the Contributions of `holds` too,
 -- so the Edge holds over the stated bound.
 create function gnomon.state_bound_of(
   p_tenant_id uuid,
@@ -824,7 +1110,7 @@ create function gnomon.state_bound_of(
   p_bound_at timestamptz,
   p_precision text
 ) returns table (change text, recorded_at timestamptz, versions uuid[])
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     t constant timestamptz := transaction_timestamp();
@@ -923,8 +1209,8 @@ create function gnomon.state_bound_of(
   end
   $$;
 
--- States a bound of a Node's current Version, as migration 0006 does.
-create or replace function gnomon.state_bound(
+-- States a bound of a Node's current Version.
+create function gnomon.state_bound(
   p_tenant_id uuid,
   p_node_id uuid,
   p_episode_id uuid,
@@ -933,7 +1219,7 @@ create or replace function gnomon.state_bound(
   p_bound_at timestamptz,
   p_precision text
 ) returns table (change text, recorded_at timestamptz, versions uuid[])
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     select s.change, s.recorded_at, s.versions
     from gnomon.state_bound_of(
@@ -950,7 +1236,7 @@ create function gnomon.state_edge_bound(
   p_bound_at timestamptz,
   p_precision text
 ) returns table (change text, recorded_at timestamptz, versions uuid[])
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     select s.change, s.recorded_at, s.versions
     from gnomon.state_bound_of(
@@ -964,7 +1250,7 @@ create function gnomon.uncertain_at(
   p_valid_from timestamptz,
   p_valid_from_precision gnomon.time_precision
 ) returns boolean
-  language sql immutable parallel safe security invoker set search_path = ''
+  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$
     select p_valid_from_precision in ('year', 'month', 'day')
       and p_valid_at < gnomon.period_end(p_valid_from, p_valid_from_precision)
@@ -1000,7 +1286,7 @@ create function gnomon.read_edge(
     text_hash text,
     sentence text
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select v.id, v.edge_id, v.scope, e.kind, e.source_id, e.target_id, v.props,
            v.valid_from, v.valid_from_precision, v.valid_to, v.valid_to_precision,
@@ -1046,7 +1332,7 @@ create function gnomon.read_nodes(
     uncertain boolean,
     text_hash text
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select v.id, v.node_id, v.scope, n.kind, v.props,
            v.valid_from, v.valid_from_precision, v.valid_to, v.valid_to_precision,
@@ -1068,13 +1354,13 @@ create function gnomon.read_nodes(
     order by w.ord
   $$;
 
--- Traverses the Edges of a Node As-of a valid-at and a known-at instant, as
--- migration 0008's `traverse` does, following an Edge of a symmetric Kind
+-- Traverses the Edges of a Node As-of a valid-at and a known-at instant,
+-- following an Edge of a symmetric Kind
 -- from either of its Nodes: `out` and `in` each find it from both ends, and
 -- `both` finds it once, as `out`. Its source and target are the canonical
 -- order, and the neighbour is the Node at the other end. Every other Edge is
--- followed as before.
-create or replace function gnomon.traverse(
+-- followed in its own direction.
+create function gnomon.traverse(
   p_tenant_id uuid,
   p_node_id uuid,
   p_valid_at timestamptz,
@@ -1115,7 +1401,7 @@ create or replace function gnomon.traverse(
     neighbour_uncertain boolean,
     neighbour_text_hash text
   )
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if p_direction is null or p_direction not in ('out', 'in', 'both') then
@@ -1185,7 +1471,7 @@ create or replace function gnomon.traverse(
 -- A statement is recorded when its transaction started, and serialises with
 -- writes and Erasure on its Node or Edge (ADR-0007).
 create function gnomon.statement_check_insert() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if new.recorded_at is distinct from transaction_timestamp() then
@@ -1223,7 +1509,7 @@ create function gnomon.write_patch_as(
   p_places jsonb,
   p_kind text
 ) returns table (status text, recorded_at timestamptz, versions uuid[])
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_of constant text := case when p_is_edge then 'Edge' else 'Node' end;
@@ -1354,7 +1640,7 @@ create function gnomon.write_patch_as(
   end
   $$;
 
-create or replace function gnomon.write_patch(
+create function gnomon.write_patch(
   p_tenant_id uuid,
   p_id uuid,
   p_is_edge boolean,
@@ -1366,7 +1652,7 @@ create or replace function gnomon.write_patch(
   p_values jsonb,
   p_places jsonb
 ) returns table (status text, recorded_at timestamptz, versions uuid[])
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     select w.status, w.recorded_at, w.versions
     from gnomon.write_patch_as(
@@ -1388,7 +1674,7 @@ create function gnomon.write_edge(
   p_values jsonb,
   p_places jsonb
 ) returns table (status text, recorded_at timestamptz, versions uuid[])
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     select w.status, w.recorded_at, w.versions
     from gnomon.write_patch(
@@ -1396,8 +1682,8 @@ create function gnomon.write_edge(
       p_valid_to, p_valid_to_precision, p_values, p_places) w
   $$;
 
--- Writes a patch of property values for a Node, as migration 0006 does.
-create or replace function gnomon.write_node(
+-- Writes a patch of property values for a Node.
+create function gnomon.write_node(
   p_tenant_id uuid,
   p_node_id uuid,
   p_episode_id uuid,
@@ -1408,7 +1694,7 @@ create or replace function gnomon.write_node(
   p_values jsonb,
   p_places jsonb
 ) returns table (status text, recorded_at timestamptz, versions uuid[])
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     select w.status, w.recorded_at, w.versions
     from gnomon.write_patch(
@@ -1429,7 +1715,7 @@ create function gnomon.correct_node(
   p_values jsonb,
   p_places jsonb
 ) returns table (status text, recorded_at timestamptz, versions uuid[])
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     select w.status, w.recorded_at, w.versions
     from gnomon.write_patch_as(
@@ -1449,7 +1735,7 @@ create function gnomon.correct_edge(
   p_values jsonb,
   p_places jsonb
 ) returns table (status text, recorded_at timestamptz, versions uuid[])
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     select w.status, w.recorded_at, w.versions
     from gnomon.write_patch_as(
@@ -1471,7 +1757,7 @@ create function gnomon.list_statements(p_tenant_id uuid, p_id uuid)
     valid_to_precision gnomon.time_precision,
     recorded_at timestamptz
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select s.kind, s.episode_id, s.version_id, s.valid_from, s.valid_from_precision,
            s.valid_to, s.valid_to_precision, s.recorded_at
@@ -1483,7 +1769,7 @@ create function gnomon.list_statements(p_tenant_id uuid, p_id uuid)
 -- The marker's Scope is its Episode's, and the caller names only the Episode.
 -- The Episode must be visible to the caller.
 create function gnomon.episode_retraction_check_insert() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if new.recorded_at is distinct from transaction_timestamp() then
@@ -1508,7 +1794,7 @@ create trigger episode_retraction_check_insert before insert on gnomon.episode_r
 -- the same transaction. A row inserted directly, without Retract Episode's
 -- Retractions, fails here.
 create function gnomon.episode_retraction_check_complete() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if tg_table_name = 'episode_retraction' then
@@ -1549,8 +1835,8 @@ create constraint trigger statement_retracts_episode
   for each row when (new.retracts_episode)
   execute function gnomon.episode_retraction_check_complete();
 
--- Migration 0009's `write_ending`, with the flag that marks a Retraction made
--- by Retract Episode. `write_ending` is now this function with no flag.
+-- An End of validity or a Retraction, with the flag that marks a Retraction
+-- made by Retract Episode. `write_ending` is this function with no flag.
 create function gnomon.write_ending_as(
   p_tenant_id uuid,
   p_id uuid,
@@ -1562,7 +1848,7 @@ create function gnomon.write_ending_as(
   p_precision text,
   p_retracts_episode boolean
 ) returns table (status text, recorded_at timestamptz, versions uuid[])
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_of constant text := case when p_is_edge then 'Edge' else 'Node' end;
@@ -1665,7 +1951,7 @@ create function gnomon.write_ending_as(
   end
   $$;
 
-create or replace function gnomon.write_ending(
+create function gnomon.write_ending(
   p_tenant_id uuid,
   p_id uuid,
   p_is_edge boolean,
@@ -1675,7 +1961,7 @@ create or replace function gnomon.write_ending(
   p_at timestamptz,
   p_precision text
 ) returns table (status text, recorded_at timestamptz, versions uuid[])
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     select w.status, w.recorded_at, w.versions
     from gnomon.write_ending_as(
@@ -1689,7 +1975,7 @@ create function gnomon.retract_version(
   p_episode_id uuid,
   p_version_id uuid
 ) returns table (status text, recorded_at timestamptz, versions uuid[])
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     select w.status, w.recorded_at, w.versions
     from gnomon.write_ending(
@@ -1704,7 +1990,7 @@ create function gnomon.end_validity(
   p_at timestamptz,
   p_precision text
 ) returns table (status text, recorded_at timestamptz, versions uuid[])
-  language sql volatile security invoker set search_path = ''
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
     select w.status, w.recorded_at, w.versions
     from gnomon.write_ending(
@@ -1721,7 +2007,7 @@ create function gnomon.end_validity(
 -- (ADR-0007).
 create function gnomon.retract_episode(p_tenant_id uuid, p_episode_id uuid)
   returns table (recorded_at timestamptz, versions uuid[])
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_scope text;
@@ -1835,7 +2121,7 @@ create function gnomon.retract_episode(p_tenant_id uuid, p_episode_id uuid)
 -- insert, so a Version Erasure writes as the definer is never queued, and
 -- Erasure may delete Citations as its replay requires.
 create function gnomon.version_check_cited() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if exists (select from gnomon.citation c
@@ -1860,11 +2146,11 @@ create constraint trigger version_check_cited after insert on gnomon.version
   execute function gnomon.version_check_cited();
 
 -- Creating an Edge takes the locks of both its endpoints, in order of their
--- IDs, as an Erasure does (see the header). The trigger's name sorts before
+-- IDs, as an Erasure does (see 0005). The trigger's name sorts before
 -- `edge_check_insert`, so the check runs after the lock and sees an endpoint
 -- an Erasure erased as gone.
 create function gnomon.edge_await_endpoints() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     x uuid;
@@ -1881,11 +2167,11 @@ create function gnomon.edge_await_endpoints() returns trigger
 create trigger edge_await_endpoints before insert on gnomon.edge
   for each row execute function gnomon.edge_await_endpoints();
 
--- The merge of migration 0010, at a chosen Recorded time and under a chosen
+-- The merge, at a chosen Recorded time and under a chosen
 -- rule, so that the write path and Erasure share it (ADR-0007). It reads only
 -- the Contributions, bound statements and Episode Retractions recorded by
 -- `p_at`, and recomputes the open Versions of a Node or an Edge over a
--- Valid-time window as migration 0010's `recompute_versions` did:
+-- Valid-time window:
 --
 --   p_at      the step's Recorded time. The write path passes the start of
 --             its transaction; an Erasure passes the step it replays.
@@ -1915,7 +2201,7 @@ create function gnomon.merge_versions(
   out changed boolean,
   out opened uuid[]
 )
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     t constant timestamptz := p_at;
@@ -2237,7 +2523,7 @@ create function gnomon.merge_versions(
 -- record of that stage exists already, which it leaves as it is.
 create function gnomon.stage_pending(p_tenant_id uuid, p_episode_id uuid, p_stage text)
   returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_scope text;
@@ -2260,7 +2546,7 @@ create function gnomon.stage_pending(p_tenant_id uuid, p_episode_id uuid, p_stag
 -- lease, the one due longest first. It returns the claimed record, or no row.
 create function gnomon.claim_stage(p_tenant_id uuid, p_episode_id uuid, p_lease interval)
   returns setof gnomon.stage_record
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if p_lease is null or p_lease < interval '0' then
@@ -2306,7 +2592,7 @@ create function gnomon.finish_stage(
   p_error_status integer,
   p_retry_after interval
 ) returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if p_status is null or p_status not in ('succeeded', 'retry', 'failed') then
@@ -2352,7 +2638,7 @@ create function gnomon.add_stage_usage(
   p_output_tokens bigint,
   p_cost_usd numeric
 ) returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     insert into gnomon.stage_usage as u
@@ -2392,7 +2678,7 @@ create function gnomon.read_stage_records(p_tenant_id uuid, p_episode_id uuid)
     created_at timestamptz,
     updated_at timestamptz
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select r.tenant_id, r.scope, r.episode_id, r.stage, r.status, r.attempts,
            r.last_error_code, r.last_error_status,
@@ -2412,7 +2698,7 @@ create function gnomon.read_stage_usage(p_tenant_id uuid, p_episode_id uuid)
     output_tokens bigint,
     cost_usd numeric
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select u.stage, u.model, u.calls, u.input_tokens, u.output_tokens, u.cost_usd
     from gnomon.stage_usage u
@@ -2427,7 +2713,7 @@ create function gnomon.read_stage_usage(p_tenant_id uuid, p_episode_id uuid)
 -- overlaps no other Summary of that Node in its Scope: none is current, and
 -- none was closed after the current transaction started.
 create function gnomon.summary_check_insert() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if not exists (select from gnomon.node n
@@ -2456,7 +2742,7 @@ create trigger summary_check_insert before insert on gnomon.summary
 -- transaction wrote, so what a row cites and holds is fixed when it commits.
 -- `tg_argv[0]` names the parent table and `tg_argv[1]` the column naming it.
 create function gnomon.derived_check_insert() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_parent uuid := (pg_catalog.to_jsonb(new) ->> tg_argv[1])::uuid;
@@ -2495,7 +2781,7 @@ create trigger community_citation_check_insert before insert on gnomon.community
 -- cites an Episode and holds a Node. Erasure deletes a Summary or Community
 -- with its Citations, so none is left uncited.
 create function gnomon.derived_check_complete() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if tg_table_name = 'summary' then
@@ -2537,7 +2823,7 @@ create constraint trigger community_check_complete after insert on gnomon.commun
 -- A Summary or Community changes only by closing: its Recorded-time end goes
 -- from open to the start of the current transaction, after its start.
 create function gnomon.derived_guard_update() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if (pg_catalog.to_jsonb(new) - 'recorded_to') is distinct from
@@ -2605,7 +2891,7 @@ create function gnomon.derived_citations(
     episode_reference_time timestamptz,
     episode_recorded_at timestamptz
   )
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     n integer := coalesce(pg_catalog.cardinality(p_episodes), 0);
@@ -2650,7 +2936,7 @@ create function gnomon.derived_citations(
 
 -- The Tenant and Scope of a write, checked before anything is read.
 create function gnomon.check_write_scope(p_tenant_id uuid, p_scope text) returns void
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if p_tenant_id is null or p_tenant_id is distinct from gnomon.tenant_id() then
@@ -2679,7 +2965,7 @@ create function gnomon.write_summary(
   p_properties text[],
   p_places text[]
 ) returns uuid
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     t constant timestamptz := transaction_timestamp();
@@ -2735,7 +3021,7 @@ create function gnomon.write_community(
   p_properties text[],
   p_places text[]
 ) returns uuid
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     t constant timestamptz := transaction_timestamp();
@@ -2830,7 +3116,7 @@ create function gnomon.read_summaries(
     cited_properties text[],
     cited_places text[]
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select s.id, s.scope, s.node_id, s.content, s.as_of_valid, s.recorded_from,
            nullif(s.recorded_to, 'infinity'),
@@ -2871,7 +3157,7 @@ create function gnomon.read_communities(
     cited_properties text[],
     cited_places text[]
   )
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select k.id, k.scope,
            array(select m.node_id from gnomon.community_member m

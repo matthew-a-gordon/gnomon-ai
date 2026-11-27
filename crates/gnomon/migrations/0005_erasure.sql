@@ -1,12 +1,255 @@
 -- gnomon 0005: Erasure. Erase Episode and the Erasure of a Node, an Edge or
 -- a Scope, and the policies through which an Erasure reaches rows in Scopes
 -- the caller cannot see (ADR-0003, ADR-0009).
+--
+-- Erase Episode. Erasure physically deletes an Episode and leaves no tombstone (ADR-0003).
+-- In one transaction it deletes the Episode, its Contributions, its
+-- statements, its Citations and every Version derived from it alone. It then
+-- recomputes every surviving Version the Episode touched, current and
+-- closed, from the Contributions that remain (ADR-0007). It is the only route
+-- that deletes or rewrites committed history.
+--
+-- Erasure is one of the four SECURITY DEFINER groups ADR-0009 allows,
+-- beside Kind registration, the merge-rule setter and the search index
+-- trigger. Like them it is owned by the NOLOGIN `gnomon_definer` and checks
+-- the Tenant against `gnomon.tenant_id()`. The files grant it to no caller
+-- role: each deployment grants it to the roles it chooses.
+--
+-- Recompute is replay, from prototype 4 (`prototype/recompute-cost`,
+-- FINDINGS.md). For each Node and Edge the Episode touched:
+--
+--   1. T0 is the earliest Recorded time at which the Episode touched it.
+--      History before T0 owes nothing to the Episode and stays as it is.
+--   2. The Episode's rows are deleted (`gnomon.erase_episode_rows`).
+--   3. Every Version recorded from T0 on is deleted, with its Citations.
+--      Every Version current at T0 is reopened and loses the Citations added
+--      from T0 on. The Node or Edge now stands as it stood just before T0.
+--   4. Every Recorded time from T0 on at which something that remains was
+--      written to the Node or Edge is a step. Each step runs the write
+--      path's merge, `gnomon.merge_versions`, at that Recorded time. It
+--      merges over the Valid time that step's write named, reads only the
+--      rows recorded by then, and uses the merge rule that step's Versions
+--      recorded (ADR-0007). A rule change applies to later writes only, so a
+--      history can mix rules, and each step keeps the rule it had. A step
+--      that opened no Version takes the rule the Kind had at that Recorded
+--      time.
+--
+-- The result is the history as if the Episode had never existed. A statement
+-- that lost to a value the erased Episode alone supplied, such as a
+-- lower-Authority End of validity, takes effect at the step that recorded
+-- it, because the merge no longer finds the value it lost to. Erasing the
+-- Episode behind a Retraction makes the retracted Version current again,
+-- because the Retraction's null Contributions are gone. As-of reads at a
+-- past known-at instant are stable except across an Erasure, which rewrites
+-- Recorded-time history (ADR-0007).
+--
+-- Another Episode's Retraction of a Version that only the erased Episode
+-- cites is deleted with it. Its Valid time is that Version's, so it would
+-- keep a value of the erased Episode's and blank other values over it. As if
+-- the Episode never existed, the Version it retracts was never there. A bound
+-- statement of another Episode about the erased Episode's Contributions goes
+-- too. Another Episode's End of validity stays, because the instant it states
+-- is its own, and it takes effect once the values it lost to are gone.
+--
+-- A Citation of a retracted Episode counts as a Citation of another Episode.
+-- Its value Contributions still count in the merge, as Retract Episode left
+-- them. But Retract Episode retracted only the Versions that
+-- the Episode alone cited, and a Version that the erased Episode also cited
+-- was not one of them. So the replay makes Retract Episode's choice again at
+-- the step where the Episode was retracted. Each current Version there that
+-- only the retracted Episode cites gets the Retraction Retract Episode would
+-- have made. A retracted Episode's value is never left current because
+-- Erasure removed the Episode that corroborated it.
+--
+-- Erasure also deletes what was derived from the text of every Version it
+-- deletes or recomputes, which is every Version of an affected Node or Edge
+-- held at or after T0: its token rows and name rows, its quantized row and
+-- the full vectors no other row uses, and the Sentence of each such Edge
+-- Version (ADR-0013). The Pipeline writes new ones afterwards.
+--
+-- A Node or Edge the Episode touched that is left with no Contribution, and
+-- so with no Version, is erased with it. A Node left so stays as a bare
+-- identity while any Edge joins it, and is erased with its last Edge
+-- (ADR-0007). An endpoint of an Edge the Erasure erases goes too when nothing
+-- is left of it and no other Edge joins it. A Node no Edge joins and the
+-- Episode never touched is left alone, bare or not.
+--
+-- Erasure acts in the caller's Tenant and Scopes only. The definer role is
+-- under RLS, with the same Tenant and Scope policies as the callers. An endpoint Node in a Scope the caller cannot see is never
+-- erased and stays bare. A Node joined by an Edge in a Scope the caller
+-- cannot see stays too, because the Edge still joins it.
+--
+-- Locks (ADR-0007). An Erasure takes these, for the rest of its transaction:
+--
+--   1. the advisory lock of the Episode's ID, which Retract Episode also
+--      takes;
+--   2. the advisory lock (`gnomon.node_lock_key`) of every Node and Edge the
+--      Episode touched and of both endpoints of every such Edge, in order of
+--      their IDs, so two Erasures, or an Erasure and a Retract Episode,
+--      cannot deadlock;
+--   3. the Episode's row FOR UPDATE. A write takes its Node's or Edge's lock
+--      and then, through a Contribution's foreign key, a share lock on the
+--      Episode's row, so this is the same order. Taking the row waits for
+--      every write citing the Episode that is still running. The Erasure
+--      then locks whatever those writes touched, and from then on a write
+--      that cites the Episode waits for the Erasure and fails its foreign key.
+--
+-- Every write to a Node or Edge takes that Node's or Edge's lock, and
+-- creating an Edge takes the locks of both its endpoints, in order of their
+-- IDs. A write to an affected Node therefore waits until the
+-- Erasure commits, and a write to an unaffected one does not. An Edge cannot
+-- join a Node while an Erasure decides whether to erase it. Reads never wait.
+-- A transaction that writes several Nodes takes their locks in the order it
+-- writes them, so it can still deadlock with an Erasure. Postgres detects
+-- the deadlock and fails one of them, and the Store retries it.
+--
+-- Each advisory lock is an entry in the server's shared lock table, which
+-- holds `max_locks_per_transaction * (max_connections +
+-- max_prepared_transactions)` entries for every session together. One
+-- transaction may hold more than `max_locks_per_transaction` while the table
+-- has room. An Erasure holds one advisory lock for the Episode, one for each
+-- Node and Edge it touched and one for each endpoint of those Edges, beside
+-- its ordinary table locks. An Erasure that needs more than the table has
+-- free fails with SQLSTATE 53200 (out of shared memory). It rolls back and
+-- erases nothing. The locks are not batched, because a batch would have to
+-- commit, and an Erasure is one transaction. A deployment that erases
+-- Episodes cited across many thousands of Nodes raises
+-- `max_locks_per_transaction` first. Prototype 4 needed 1024 for 500 Nodes
+-- on a server with few connections.
+--
+-- The guard triggers (ADR-0009) refuse every caller's delete or rewrite of
+-- committed history. Erasure passes them because it runs as `gnomon_definer`.
+-- `gnomon.running_as_definer()` is true only when the current user is that
+-- role. No caller role can become it, because it has no members and never
+-- logs in, and no setting a caller can change affects the check. The
+-- Versions, Citations, statements and Contributions the replay writes carry
+-- the Recorded times of the steps they replay. Their transaction mark,
+-- `written_in`, and the `closed_in` of each Version the replay closes are
+-- '0', which no transaction ever has. So no transaction, not even the
+-- Erasure's own, may delete or reopen them afterwards.
+--
+-- An Erasure runs in a transaction of its own. It refuses to erase when its
+-- transaction already wrote to a Node or Edge the Episode touched. It fails
+-- with a serialization failure, which the caller retries, when a transaction
+-- that started later wrote one first.
+--
+-- Erasure reaches the tables beyond the graph's own in two places, and only
+-- there:
+--
+--   `gnomon.erase_episode_rows`  every row that names the Episode: stage
+--                                records and usage counts, and Summaries and
+--                                Communities with their Citations.
+--   `gnomon.erase_version_text`  every row derived from a Version's text:
+--                                token rows and BM25 counts, name rows, full
+--                                and quantized embeddings, and Sentences.
+--
+-- Erase a Node, an Edge or a Scope. Erasure physically deletes what it names
+-- and leaves no tombstone (ADR-0003, GLOSSARY.md: Erasure). Beside Erase
+-- Episode there are three more:
+--
+--   gnomon.erase_node(tenant, node)    the Node, its Versions, Contributions,
+--                                      statements and Citations, and every
+--                                      Edge that joins it.
+--   gnomon.erase_edge(tenant, edge)    the Edge, its Versions, Contributions,
+--                                      statements, Citations and Sentences.
+--   gnomon.erase_scope(tenant, scope)  every row in the Scope, its Episodes
+--                                      among them, and every Edge of another
+--                                      Scope that joins one of its Nodes.
+--
+-- Each erased Edge goes as in Erase Episode: its rows, the Sentence of each of
+-- its Versions (ADR-0013), and then each endpoint it leaves with nothing. Such
+-- an endpoint is erased when no row names it and no other Edge joins it, and
+-- only when it is in a Scope the caller can see. One in a Scope the caller
+-- cannot see stays as a bare identity, as it does after Erase Episode.
+--
+-- None of them recomputes anything, because no Version that survives was
+-- derived from what they erase. A Contribution, statement or Citation names an
+-- Episode of its own Node's or Edge's Scope. So an Episode that a Scope's
+-- Erasure deletes touched only that Scope's Nodes and Edges. A Node's Versions
+-- owe nothing to its Edges. The Episodes that wrote an erased Node or Edge
+-- stay, apart from a Scope's own. A statement of another Episode about an
+-- erased Node or Edge is that Node's or Edge's, so it goes with it.
+--
+-- An Edge lives in one Scope and may join a Node in any Scope of the Tenant
+-- that its writer could see. Erasing a Node, or the Nodes of
+-- a Scope, erases every Edge that joins them, whatever the Edge's Scope, even
+-- one the caller cannot see, because the foreign key on the Node would refuse
+-- the Node's delete while it stood. Erasing a Scope removes nothing else
+-- outside it but those Edges' rows and the endpoints they leave bare.
+--
+-- These three are Erasure, the first of the definers ADR-0009 names. Like
+-- Erase Episode they are SECURITY DEFINER, owned by the NOLOGIN
+-- `gnomon_definer`, check the Tenant against `gnomon.tenant_id()` and are
+-- granted to no caller role. The Node, Edge or Scope must be one the caller
+-- can see, and the definer reads under the caller's Tenant and Scope
+-- policies.
+--
+-- Reaching Edges the caller cannot see. The definer gets one more policy on
+-- each table that holds an Edge's rows: it may read and delete a row of an
+-- Edge, in any Scope of the Tenant, that joins a Node its own Erasure is
+-- erasing, and that Edge's rows. Its Erasure lists those Nodes, and then those
+-- Edges, in `gnomon.erasure_reach`, marked with its own transaction, and
+-- deletes the list before it returns. No caller role may read or write that
+-- table, so no caller can widen what the definer reaches, and a row is visible
+-- only to the transaction that wrote it. Nodes get no such policy, so a bare
+-- endpoint in a Scope the caller cannot see is never erased.
+--
+-- Locks (ADR-0007), in the order Erase Episode takes them:
+--
+--   1. for a Scope, the advisory lock of each of its Episodes' IDs, in order
+--      of ID, which Retract Episode and Erase Episode take too;
+--   2. the advisory lock (`gnomon.node_lock_key`) of every Node and Edge it
+--      erases and of both endpoints of every such Edge, in order of their
+--      IDs. A write to one of them, and an Edge that would join one, waits
+--      until the Erasure commits;
+--   3. for a Scope, its Episodes' rows FOR UPDATE, so a write citing one of
+--      them waits, and fails its foreign key once the Erasure commits.
+--
+-- Each lock step re-reads what it erases, since a write that held a lock
+-- first may have added an Edge or a Node, and locks what is new until nothing
+-- is. An Episode recorded in the Scope after step 1 fails the Erasure with a
+-- serialization failure, which the caller retries, because its lock would
+-- come after the Nodes' locks. Each advisory lock is an entry in the shared
+-- lock table, as Erase Episode's locks are: an Erasure that needs more
+-- than the table has free fails with SQLSTATE 53200 and erases nothing.
+--
+-- An Erasure tells the caller only of what it can see. Its result names the
+-- Edges it erased in the caller's Scopes, and not those of other Scopes, so a
+-- caller learns no ID from a Scope it cannot see. Every Node it names is in
+-- the caller's Scopes already.
+--
+-- Unlike Erase Episode, these Erasures run in any transaction and need no
+-- check that a later transaction wrote first. They replay nothing and keep no
+-- history of what they erase: every row of it goes, whoever wrote it and
+-- whenever. A write that still holds a lock commits first, and the Erasure
+-- then erases what it wrote too.
+--
+-- Copies of the erased bytes stay in dead tuples and index pages until
+-- Postgres vacuums the tables (ADR-0003), and so do the dead rows of
+-- `gnomon.erasure_reach`, which hold the IDs of what was erased.
+--
+-- These Erasures reach the tables beyond the graph's own in three places,
+-- and only there:
+--
+--   `gnomon.erase_versioned_rows`  every row of a Node or an Edge: name and
+--                                  Alias rows, and the Summaries and
+--                                  Communities that drew on a Node. There
+--                                  is no adjacency table: Search's
+--                                  neighbourhood reads the Edges and their
+--                                  Versions (ADR-0010).
+--   `gnomon.erase_version_text`    every row derived from a Version's text.
+--   `gnomon.erase_episode_rows`    every row that names an Episode, which a
+--                                  Scope's Erasure calls for each of its
+--                                  Episodes.
+--
+-- Every table of Edge rows has the `*_erasure_reach` policies below, so an
+-- Erasure reaches it in every Scope. A table added later needs them too.
 
 -- During an Erasure a Version still changes only in its Recorded-time end.
 -- One the replay closes is marked closed by no transaction, and one it
 -- reopens is open again.
 create function gnomon.version_erasure_update() returns trigger
-  language plpgsql security invoker set search_path = ''
+  language plpgsql security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if (new.tenant_id, new.scope, new.id, new.node_id, new.edge_id, new.props, new.valid_from,
@@ -32,13 +275,12 @@ create trigger version_erasure_update before update on gnomon.version
 -- Erasure (ADR-0003). Every row derived from the text of a Version an
 -- Erasure deletes or recomputes goes: its name rows, its quantized row, the
 -- full vector of each of its texts that no other quantized row or name row
--- with bits uses, its Sentence and its token rows. Everything else is as
--- migration 0017 wrote it. The texts' hashes are read first, while the name
+-- with bits uses, its Sentence and its token rows. The texts' hashes are read first, while the name
 -- rows and the Sentences still give them. Then the name rows and quantized
 -- rows go, and then the full vectors that nothing uses any more.
-create or replace function gnomon.erase_version_text(p_tenant_id uuid, p_versions uuid[])
+create function gnomon.erase_version_text(p_tenant_id uuid, p_versions uuid[])
   returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_scopes text[];
@@ -93,11 +335,14 @@ create or replace function gnomon.erase_version_text(p_tenant_id uuid, p_version
   end
   $$;
 
--- Migration 0014's function with the Summaries and Communities that cite the
--- Episode deleted before it. Everything else is as migration 0014 wrote it.
-create or replace function gnomon.erase_episode_rows(p_tenant_id uuid, p_episode_id uuid)
+-- Deletes the Episode and every row that names it: another Episode's
+-- Retraction of a Version only it cites, the bound statements about its
+-- Contributions, its Contributions, statements, Citations and retraction
+-- mark, its stage records and usage counts, and the Summaries and
+-- Communities that cite it.
+create function gnomon.erase_episode_rows(p_tenant_id uuid, p_episode_id uuid)
   returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     delete from gnomon.statement s
@@ -150,7 +395,7 @@ create function gnomon.replay_versions(
   p_t0 timestamptz,
   p_rules jsonb
 ) returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     s record;
@@ -224,7 +469,7 @@ create function gnomon.replay_versions(
 
       -- Retract Episode's choice, made again for each Episode retracted at
       -- this step: each current Version that only it cites gets the
-      -- Retraction Retract Episode makes (migration 0010), recorded at the
+      -- Retraction Retract Episode makes, recorded at the
       -- step. One that Retract Episode already made and that lost under
       -- ranked merge is not made twice.
       for r in
@@ -305,7 +550,7 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
     erased_nodes uuid[],
     erased_edges uuid[]
   )
-  language plpgsql volatile security definer set search_path = ''
+  language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
   as $$
   declare
     t constant timestamptz := transaction_timestamp();
@@ -498,7 +743,7 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
     -- A Version current at T0 that was never closed lost its text-derived
     -- rows above, and the replay neither inserts nor reopens it, so nothing
     -- indexes it again. An update that changes nothing sends it through the
-    -- search index trigger (migration 0016), which writes its token and name
+    -- search index trigger, which writes its token and name
     -- rows from its text as it stands, as for a Version the reset reopened.
     -- One the replay closed was indexed then, and the trigger writes nothing
     -- for it twice.
@@ -572,7 +817,7 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
 
 -- Whether the running Erasure listed one of `p_ids`.
 create function gnomon.erasure_reaches(p_tenant_id uuid, p_ids uuid[]) returns boolean
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select exists (
       select from gnomon.erasure_reach r
@@ -584,7 +829,7 @@ create function gnomon.erasure_reaches(p_tenant_id uuid, p_ids uuid[]) returns b
 -- Whether a Version belongs to an Edge the running Erasure listed.
 create function gnomon.erasure_reaches_version(p_tenant_id uuid, p_version_id uuid)
   returns boolean
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select exists (
       select from gnomon.version v
@@ -630,12 +875,13 @@ create policy edge_erasure_reach_read on gnomon.edge for select to gnomon_define
 create policy edge_erasure_reach_delete on gnomon.edge for delete to gnomon_definer
   using (tenant_id = gnomon.tenant_id() and gnomon.erasure_reaches(tenant_id, array[id]));
 
--- Migration 0012's function with the Summaries of these Nodes, in every Scope
--- the Erasure reaches, and the Communities that hold them, deleted first.
--- Everything else is as migration 0012 wrote it.
-create or replace function gnomon.erase_versioned_rows(p_tenant_id uuid, p_ids uuid[])
+-- Deletes every row of the Nodes and Edges `p_ids`: first the Summaries of
+-- these Nodes, in every Scope the Erasure reaches, and the Communities that
+-- hold them, then what derives from their Versions' text, then their own
+-- rows.
+create function gnomon.erase_versioned_rows(p_tenant_id uuid, p_ids uuid[])
   returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     perform gnomon.erase_summaries_and_communities(
@@ -677,7 +923,7 @@ create function gnomon.erase_graph(
     erased_nodes uuid[],
     erased_edges uuid[]
   )
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_episodes uuid[] := '{}';
@@ -798,8 +1044,7 @@ create function gnomon.erase_graph(
     delete from gnomon.node n where n.tenant_id = p_tenant_id and n.id = any(v_nodes);
 
     -- Each endpoint left with nothing, one at a time, as Erase Episode erases
-    -- one. This repeats migration 0011's loop, which a released migration
-    -- cannot share: a Node in a Scope the caller cannot see is not visible to the
+    -- one, as Erase Episode's loop does: a Node in a Scope the caller cannot see is not visible to the
     -- delete and stays, and one that an Edge in such a Scope still joins
     -- fails the foreign key and stays.
     foreach v_id in array v_candidates loop
@@ -838,7 +1083,7 @@ create function gnomon.erase_graph(
 
 -- The Tenant check every Erasure makes first.
 create function gnomon.erasure_check_tenant(p_tenant_id uuid) returns void
-  language plpgsql stable security invoker set search_path = ''
+  language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     if p_tenant_id is null or p_tenant_id is distinct from gnomon.tenant_id() then
@@ -858,7 +1103,7 @@ create function gnomon.erase_node(p_tenant_id uuid, p_node_id uuid)
     erased_nodes uuid[],
     erased_edges uuid[]
   )
-  language plpgsql volatile security definer set search_path = ''
+  language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
   as $$
   begin
     perform gnomon.erasure_check_tenant(p_tenant_id);
@@ -879,7 +1124,7 @@ create function gnomon.erase_edge(p_tenant_id uuid, p_edge_id uuid)
     erased_nodes uuid[],
     erased_edges uuid[]
   )
-  language plpgsql volatile security definer set search_path = ''
+  language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
   as $$
   begin
     perform gnomon.erasure_check_tenant(p_tenant_id);
@@ -903,7 +1148,7 @@ create function gnomon.erase_scope(p_tenant_id uuid, p_scope text)
     erased_nodes uuid[],
     erased_edges uuid[]
   )
-  language plpgsql volatile security definer set search_path = ''
+  language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
   as $$
   begin
     perform gnomon.erasure_check_tenant(p_tenant_id);
@@ -915,8 +1160,8 @@ create function gnomon.erase_scope(p_tenant_id uuid, p_scope text)
   end
   $$;
 
--- The definer's reach into Scopes the caller cannot see, as migration 0012
--- gives it on the other tables of an Edge: it reads and deletes the token
+-- The definer's reach into Scopes the caller cannot see, as on the other
+-- tables of an Edge: it reads and deletes the token
 -- rows of a listed Edge's Versions.
 create policy search_token_erasure_reach_read on gnomon.search_token
   for select to gnomon_definer
@@ -932,7 +1177,7 @@ create policy search_token_erasure_reach_delete on gnomon.search_token
 -- properties' or its Sentence's, has hash `p_text_hash` in Scope `p_scope`.
 create function gnomon.erasure_reaches_text(p_tenant_id uuid, p_scope text, p_text_hash text)
   returns boolean
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select exists (
       select from gnomon.erasure_reach r
@@ -945,8 +1190,8 @@ create function gnomon.erasure_reaches_text(p_tenant_id uuid, p_scope text, p_te
     )
   $$;
 
--- The definer's reach into Scopes the caller cannot see, as migration 0012
--- gives it on the other tables of an Edge: it reads and deletes the
+-- The definer's reach into Scopes the caller cannot see, as on the other
+-- tables of an Edge: it reads and deletes the
 -- quantized rows of a listed Edge's Versions and the full vectors of their
 -- texts, and reads the quantized rows that share those texts.
 create policy embedding_bit_erasure_reach_read on gnomon.embedding_bit
@@ -973,7 +1218,7 @@ create policy embedding_erasure_reach_delete on gnomon.embedding
 -- Whether a Summary is of a Node the running Erasure listed.
 create function gnomon.erasure_reaches_summary(p_tenant_id uuid, p_summary_id uuid)
   returns boolean
-  language sql stable security invoker set search_path = ''
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
     select exists (
       select from gnomon.summary s
@@ -1001,16 +1246,15 @@ create policy summary_citation_erasure_reach_delete on gnomon.summary_citation
   using (tenant_id = gnomon.tenant_id()
          and gnomon.erasure_reaches_summary(tenant_id, summary_id));
 
--- Migration 0018's function with the token rows and embedding rows of these
--- Summaries and Communities deleted first, while the Erasure's reach still
--- finds a Summary of another Scope. Everything else is as migration 0018
--- wrote it.
-create or replace function gnomon.erase_summaries_and_communities(
+-- Deletes the Summaries `p_summaries` and the Communities `p_communities`
+-- with their Citations and members, their token rows and embedding rows
+-- first, while the Erasure's reach still finds a Summary of another Scope.
+create function gnomon.erase_summaries_and_communities(
   p_tenant_id uuid,
   p_summaries uuid[],
   p_communities uuid[]
 ) returns void
-  language plpgsql volatile security invoker set search_path = ''
+  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
     delete from gnomon.derived_search_token t
@@ -1040,7 +1284,7 @@ create policy node_name_erasure_reach_read on gnomon.node_name
   using (tenant_id = gnomon.tenant_id()
          and gnomon.erasure_reaches_text(tenant_id, scope, text_hash));
 
--- The definer's reach (migration 0018): the token rows of a Summary of a
+-- The definer's reach: the token rows of a Summary of a
 -- Node the running Erasure listed, in any Scope of the Tenant.
 create policy derived_search_token_erasure_reach_read on gnomon.derived_search_token
   for select to gnomon_definer

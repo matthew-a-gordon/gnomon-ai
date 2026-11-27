@@ -493,7 +493,8 @@ const DEFINERS: &[&str] = &[
 ];
 
 #[tokio::test]
-async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but_the_definers() {
+async fn every_gnomon_function_runs_as_the_invoker_with_a_search_path_ending_in_pg_temp_but_the_definers()
+ {
     let w = world().await;
     let client = w.db.login().await;
     let functions = client
@@ -501,17 +502,7 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
             "select p.oid::regprocedure::text, p.prosecdef, coalesce(p.proconfig, '{}'),
                     p.proowner::regrole::text
              from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-             where n.nspname = 'gnomon'
-               -- The constructors Postgres creates with gnomon.uuid_range
-               -- and its multirange are internal functions, which take no
-               -- search path and run no SQL.
-               and not (
-                 p.prolang = (select oid from pg_language where lanname = 'internal')
-                 and exists (
-                   select from pg_range r
-                   where r.rngtypid = p.prorettype or r.rngmultitypid = p.prorettype
-                 )
-               )",
+             where n.nspname = 'gnomon'",
             &[],
         )
         .await
@@ -560,11 +551,25 @@ async fn every_gnomon_function_runs_as_the_invoker_with_an_empty_search_path_but
         if definer {
             assert_eq!(owner, "gnomon_definer", "{name} is owned by {owner}");
         }
-        assert!(
-            config
-                .iter()
-                .any(|c| c == "search_path=\"\"" || c == "search_path="),
-            "{name} does not pin search_path to '': {config:?}"
+        // With an empty path, Postgres still searches the temporary schema
+        // first for tables and types, so every path lists it, last.
+        let path = config
+            .iter()
+            .find_map(|c| c.strip_prefix("search_path="))
+            .unwrap_or_else(|| panic!("{name} does not pin search_path: {config:?}"));
+        let schemas: Vec<&str> = path
+            .split(',')
+            .map(|p| p.trim().trim_matches('"'))
+            .collect();
+        assert_eq!(
+            schemas.first(),
+            Some(&"pg_catalog"),
+            "{name}: search_path {path:?} does not start with pg_catalog"
+        );
+        assert_eq!(
+            schemas.last(),
+            Some(&"pg_temp"),
+            "{name}: search_path {path:?} does not end with pg_temp"
         );
     }
 }
@@ -847,6 +852,130 @@ async fn a_caller_cannot_redirect_kind_registration_through_its_search_path() {
         real.len(),
         1,
         "registration wrote somewhere other than gnomon.kind"
+    );
+}
+
+/// The roles the type-shadowing test's domain check ran as, in order.
+async fn roles(tx: &Transaction<'_>) -> String {
+    let r: Option<String> = tx
+        .query_typed(
+            "select pg_catalog.current_setting('gnomon_test.roles', true)",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    r.unwrap_or_default()
+}
+
+/// Built-in types a function body names without a schema. The temporary
+/// schema holds a domain of each name in the type-shadowing test.
+const SHADOWED_TYPES: &[&str] = &[
+    "text",
+    "jsonb",
+    "uuid",
+    "timestamptz",
+    "int4",
+    "int8",
+    "bool",
+    "float8",
+    "varbit",
+    "tsvector",
+    "xid8",
+    "name",
+    "regclass",
+    "oid",
+];
+
+#[tokio::test]
+async fn temporary_types_named_like_built_in_types_run_nothing_of_the_callers_as_the_definer() {
+    // With `search_path = ''`, Postgres still searches the temporary schema
+    // first for tables and types. A caller creates a domain named like each
+    // built-in type, whose check records the role it runs as, then calls
+    // every group of definer functions: Kind registration, the merge-rule
+    // setter, a write that fires the search index trigger, and an Erasure.
+    // A function that resolved one of those names to the caller's domain
+    // would run the caller's check as `gnomon_definer`.
+    let w = world().await;
+    w.db.grant_kind_registration(USER).await;
+    w.db.grant_erasure(USER).await;
+    let mut client = w.db.login().await;
+    let tx = as_caller(&mut client, USER, &claims(w.t1, &["support", "billing"])).await;
+    let mut setup = String::from(
+        "create function pg_temp.record_role() returns pg_catalog.bool
+           language plpgsql set search_path = pg_catalog
+           as $$ begin
+             perform set_config('gnomon_test.roles',
+               coalesce(current_setting('gnomon_test.roles', true), '') || ' ' || current_user,
+               false);
+             return true;
+           end $$;",
+    );
+    for t in SHADOWED_TYPES {
+        setup.push_str(&format!(
+            "create domain pg_temp.{t} as pg_catalog.{t} check (pg_temp.record_role());"
+        ));
+    }
+    tx.batch_execute(&setup).await.unwrap();
+    // The caller's own statements resolve the names to its domains, so the
+    // check runs, as the caller.
+    tx.batch_execute("select 'armed'::text").await.unwrap();
+    assert!(
+        roles(&tx).await.contains(USER),
+        "the domains did not shadow the built-in types: {:?}",
+        roles(&tx).await
+    );
+
+    tx.query_typed(REGISTER_PERSON, &[(&w.t1, Type::UUID)])
+        .await
+        .expect("Kind registration");
+    tx.query_typed(
+        "select gnomon.set_merge_rule($1, 'person', 'ranked')",
+        &[(&w.t1, Type::UUID)],
+    )
+    .await
+    .expect("the merge-rule setter");
+    let node: Uuid = tx
+        .query_typed(
+            "select gnomon.create_node($1, 'support', 'person')",
+            &[(&w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    write_node(
+        &tx,
+        w.t1,
+        node,
+        Some(w.t1_support),
+        json!({ "name": "Ada Lovelace", "role": "engineer" }),
+    )
+    .await
+    .expect("a write that fires the search index trigger");
+    let indexed: i64 = tx
+        .query_typed(
+            "select count(*) from gnomon.search_token where tenant_id = $1",
+            &[(&w.t1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert!(indexed > 0, "the write wrote no token rows");
+    tx.query_typed(
+        ERASE_EPISODE,
+        &[(&w.t1, Type::UUID), (&w.t1_billing, Type::UUID)],
+    )
+    .await
+    .expect("an Erasure");
+
+    let ran_as = roles(&tx).await;
+    let as_definer = ran_as
+        .split_whitespace()
+        .filter(|r| *r == "gnomon_definer")
+        .count();
+    assert_eq!(
+        as_definer, 0,
+        "the caller's domain check ran {as_definer} times as gnomon_definer"
     );
 }
 
@@ -1973,7 +2102,7 @@ async fn a_caller_cannot_recompute_another_tenants_node() {
         let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
         let err = tx
             .query_typed(
-                "select * from gnomon.recompute_node($1, $2, '-infinity', 'infinity')",
+                "select * from gnomon.recompute_versions($1, $2, false, '-infinity', 'infinity')",
                 &[(&tenant, Type::UUID), (&n.n2, Type::UUID)],
             )
             .await
@@ -3230,13 +3359,13 @@ async fn gnomon_grants(client: &Client) -> Vec<String> {
 #[tokio::test]
 async fn global_default_privileges_give_callers_no_right_the_migrations_do_not() {
     // The role that applies the migrations grants callers everything on
-    // every table, function and schema it creates, in any schema,
-    // before the first migration runs. Each migration revokes what that
-    // grants on its own objects, so the chain ends with the grants a chain
-    // without default privileges has, and an Episode stays immutable.
+    // every table, sequence, function and schema it creates, in any
+    // schema, before the first migration runs. The last file revokes what
+    // that grants on gnomon's objects, so the chain ends with the grants a
+    // chain without default privileges has, and an Episode stays immutable.
     let db = TestDb::empty_with_login().await;
     let operator = db.operator().await;
-    for objects in ["tables", "functions", "schemas"] {
+    for objects in ["tables", "sequences", "functions", "schemas"] {
         operator
             .batch_execute(&format!(
                 "alter default privileges grant all on {objects} to authenticated, gnomon_worker"
@@ -4295,7 +4424,7 @@ async fn a_statement_row_alone_changes_no_version() {
     .unwrap();
     let rows = tx
         .query_typed(
-            "select changed from gnomon.recompute_node($1, $2, '-infinity', 'infinity')",
+            "select changed from gnomon.recompute_versions($1, $2, false, '-infinity', 'infinity')",
             &[(&t1, Type::UUID), (&n.n1, Type::UUID)],
         )
         .await
@@ -9004,7 +9133,7 @@ async fn callers_insert_a_sentence_and_change_only_its_text_and_both_functions_a
         let (name, definer, config, grantees): (String, bool, Vec<String>, Vec<String>) =
             (f.get(0), f.get(1), f.get(2), f.get(3));
         assert!(!definer, "{name} is a definer");
-        assert_eq!(config, ["search_path=\"\""], "{name}");
+        assert_eq!(config, ["search_path=pg_catalog, pg_temp"], "{name}");
         assert_eq!(grantees, ["authenticated", "gnomon_worker"], "{name}");
     }
 }
