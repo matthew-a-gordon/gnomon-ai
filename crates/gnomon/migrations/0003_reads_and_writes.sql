@@ -359,9 +359,9 @@ create function gnomon.running_as_definer() returns boolean
   as $$ select current_user = 'gnomon_definer'::name $$;
 
 -- Refuses a write to a Scope the caller may read and may not write (#81).
--- A Scope the caller cannot read is refused where the write looks it up,
--- as one it cannot see.
-create function gnomon.check_scope_writable(p_scope text) returns void
+-- A Scope the caller cannot read is left to the write: one that looks a row
+-- up finds none it can see, and an insert fails the writer's policy.
+create function gnomon.refuse_read_only_scope(p_scope text) returns void
   language plpgsql stable security invoker set search_path = pg_catalog, pg_temp
   as $$
   begin
@@ -387,7 +387,7 @@ create function gnomon.record_episode(
   declare
     v_id uuid;
   begin
-    perform gnomon.check_scope_writable(p_scope);
+    perform gnomon.refuse_read_only_scope(p_scope);
     insert into gnomon.episode (tenant_id, scope, id, content, reference_time, authority)
       values (p_tenant_id, p_scope, gnomon.uuid_v7(), p_content, p_reference_time, p_authority)
       returning id into v_id;
@@ -658,7 +658,7 @@ create function gnomon.create_node(p_tenant_id uuid, p_scope text, p_kind text)
   declare
     v_id uuid;
   begin
-    perform gnomon.check_scope_writable(p_scope);
+    perform gnomon.refuse_read_only_scope(p_scope);
     insert into gnomon.node (tenant_id, scope, kind) values (p_tenant_id, p_scope, p_kind)
       returning id into v_id;
     return v_id;
@@ -1067,7 +1067,7 @@ create function gnomon.create_edge(
   declare
     v_id uuid;
   begin
-    perform gnomon.check_scope_writable(p_scope);
+    perform gnomon.refuse_read_only_scope(p_scope);
     insert into gnomon.edge (tenant_id, scope, kind, source_id, target_id)
     values (p_tenant_id, p_scope, p_kind, p_source_id, p_target_id)
     on conflict (tenant_id, scope, kind, source_id, target_id)
@@ -1132,7 +1132,7 @@ create function gnomon.state_bound_of(
     v_at := gnomon.period_start(p_bound_at, v_precision);
 
     select l.scope into v_scope from gnomon.lock_for_write(p_tenant_id, p_id, p_is_edge) l;
-    perform gnomon.check_scope_writable(v_scope);
+    perform gnomon.refuse_read_only_scope(v_scope);
     select e.reference_time, e.recorded_at into v_reference_time, v_recorded_at
       from gnomon.episode e
       where e.tenant_id = p_tenant_id and e.scope = v_scope and e.id = p_episode_id;
@@ -1571,7 +1571,7 @@ create function gnomon.write_patch_as(
     end if;
 
     select l.scope into v_scope from gnomon.lock_for_write(p_tenant_id, p_id, p_is_edge) l;
-    perform gnomon.check_scope_writable(v_scope);
+    perform gnomon.refuse_read_only_scope(v_scope);
     select e.reference_time, e.recorded_at into v_reference_time, v_recorded_at
       from gnomon.episode e
       where e.tenant_id = p_tenant_id and e.scope = v_scope and e.id = p_episode_id;
@@ -1864,7 +1864,7 @@ create function gnomon.write_ending_as(
     end if;
 
     select l.scope into v_scope from gnomon.lock_for_write(p_tenant_id, p_id, p_is_edge) l;
-    perform gnomon.check_scope_writable(v_scope);
+    perform gnomon.refuse_read_only_scope(v_scope);
     select e.reference_time, e.recorded_at into v_reference_time, v_recorded_at
       from gnomon.episode e
       where e.tenant_id = p_tenant_id and e.scope = v_scope and e.id = p_episode_id;
@@ -2008,7 +2008,7 @@ create function gnomon.retract_episode(p_tenant_id uuid, p_episode_id uuid)
       raise exception using errcode = 'GNW01',
         message = format('Episode %s is not visible to the caller', p_episode_id);
     end if;
-    perform gnomon.check_scope_writable(v_scope);
+    perform gnomon.refuse_read_only_scope(v_scope);
     perform pg_catalog.pg_advisory_xact_lock(gnomon.node_lock_key(p_tenant_id, p_episode_id));
     recorded_at := transaction_timestamp();
     if exists (select from gnomon.episode_retraction r
@@ -2498,7 +2498,7 @@ create function gnomon.stage_pending(p_tenant_id uuid, p_episode_id uuid, p_stag
       raise exception using errcode = 'GNW01',
         message = pg_catalog.format('Episode %s is not visible to the caller', p_episode_id);
     end if;
-    perform gnomon.check_scope_writable(v_scope);
+    perform gnomon.refuse_read_only_scope(v_scope);
     insert into gnomon.stage_record (tenant_id, scope, episode_id, stage)
       values (p_tenant_id, v_scope, p_episode_id, p_stage)
       on conflict (tenant_id, episode_id, stage) do nothing;
@@ -2519,7 +2519,7 @@ create function gnomon.claim_stage(p_tenant_id uuid, p_episode_id uuid, p_lease 
       raise exception using errcode = 'GNW01', message = 'a lease is zero or longer';
     end if;
     if p_episode_id is not null then
-      perform gnomon.check_scope_writable(e.scope)
+      perform gnomon.refuse_read_only_scope(e.scope)
         from gnomon.episode e where e.tenant_id = p_tenant_id and e.id = p_episode_id;
     end if;
     return query
@@ -2579,7 +2579,7 @@ create function gnomon.finish_stage(
       raise exception using errcode = 'GNW01',
         message = 'a retry, and only a retry, is due after an interval of zero or longer';
     end if;
-    perform gnomon.check_scope_writable(e.scope)
+    perform gnomon.refuse_read_only_scope(e.scope)
       from gnomon.episode e where e.tenant_id = p_tenant_id and e.id = p_episode_id;
     update gnomon.stage_record r
       set status = p_status,
@@ -2614,7 +2614,7 @@ create function gnomon.add_stage_usage(
   language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
   as $$
   begin
-    perform gnomon.check_scope_writable(e.scope)
+    perform gnomon.refuse_read_only_scope(e.scope)
       from gnomon.episode e where e.tenant_id = p_tenant_id and e.id = p_episode_id;
     insert into gnomon.stage_usage as u
         (tenant_id, scope, episode_id, stage, model, calls, input_tokens, output_tokens, cost_usd)
@@ -2827,7 +2827,7 @@ create function gnomon.check_write_scope(p_tenant_id uuid, p_scope text) returns
       raise exception using errcode = 'GNW01',
         message = pg_catalog.format('Scope %s is not visible to the caller', p_scope);
     end if;
-    perform gnomon.check_scope_writable(p_scope);
+    perform gnomon.refuse_read_only_scope(p_scope);
   end
   $$;
 

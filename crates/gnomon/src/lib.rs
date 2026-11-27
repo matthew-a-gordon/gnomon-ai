@@ -160,6 +160,7 @@ pub struct Episode {
 /// The Retraction of an Episode: when Retract Episode recorded it, and who.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpisodeRetracted {
+    /// When Retract Episode ran: when its transaction started.
     pub recorded_at: DateTime<Utc>,
     /// As the Episode's own `recorded_by`.
     pub recorded_by: Option<String>,
