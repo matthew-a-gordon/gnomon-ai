@@ -4,7 +4,8 @@
 #
 # The workflow does not run on pushes to main, because the ruleset requires an
 # up-to-date branch and so the pull request run tests what lands there. It caches
-# nothing, so each run builds from nothing.
+# no build, so each run builds from nothing. The one cache is the Bun runtime that
+# Supabase's action saves for itself.
 #
 # This repository is public. The token only reads, the workflow uses no secret,
 # the trigger is pull_request and never pull_request_target, and every
@@ -20,9 +21,6 @@ permissions:
 
 env:
   CARGO_PROFILE_DEV_DEBUG: "0" # the test profile inherits it
-  NEXTEST_VERSION: "0.9.152"
-  NEXTEST_SHA256: d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a
-  UV_VERSION: "0.13.7"
 
 jobs:
   test-pg17:
@@ -36,15 +34,16 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install
 
-      - name: Install cargo-nextest
-        run: |
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/nextest.tar.gz" \
-            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-x86_64-unknown-linux-gnu.tar.gz"
-          echo "$NEXTEST_SHA256  $RUNNER_TEMP/nextest.tar.gz" | sha256sum --check
-          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin"
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: nextest@0.9.152
+          fallback: none
 
-      - name: Install uv, for uvx
-        run: pipx install "uv==$UV_VERSION"
+      # For uvx. The action caches on GitHub's runners unless told not to.
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.13.7"
+          enable-cache: false
 
       # The test harness holds the one pin of the CLI's version. Without a
       # version the action would install the latest release.

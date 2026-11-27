@@ -27,7 +27,9 @@ GitHub Actions runs `.github/workflows/ci.yml` on each pull request and on deman
 | `test-supabase` | The same with `GNOMON_TEST_IMAGE=supabase`, which is lane 2 |
 | `lint` | `cargo fmt --all --check`, and `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
 
-A ruleset on `main` requires the three checks, accepted only from GitHub Actions, and requires the branch to be up to date, so the pull request run tests what lands on `main`. The repository admin role can bypass it, so the owner can still commit documents directly. No run caches anything. We accept that each new pull request builds from nothing, and that a direct commit to `main` runs no tests. The builds leave out debug information.
+A ruleset on `main` requires the three checks, accepted only from GitHub Actions, and requires the branch to be up to date, so the pull request run tests what lands on `main`. The repository admin role can bypass it, so the owner can still commit documents directly. No run caches the build or its dependencies. We accept that each new pull request builds from nothing, and that a direct commit to `main` runs no tests. The builds leave out debug information.
+
+The workflow installs each tool with the action its maker publishes or its documentation names. The Rust toolchain has no such action: rustup is on the runner already and reads `rust-toolchain.toml`, so the workflow runs it. Supabase's `setup-cli` action caches the Bun runtime it runs on, and has no input to turn that off.
 
 The repository is public, so the workflow token only reads the repository, the workflow uses no secret, it is triggered by `pull_request` and never `pull_request_target`, and every third-party action is pinned to a full commit SHA. Lanes 3 and 4 run on demand.
 

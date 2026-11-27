@@ -4,7 +4,7 @@ The suite runs with plain `cargo test` or with `cargo nextest run`, and every te
 
 ## What CI runs
 
-`.github/workflows/ci.yml` runs on each pull request, and on demand through `workflow_dispatch`. It does not run on pushes to `main`, and it caches nothing. ADR-0020 records why.
+`.github/workflows/ci.yml` runs on each pull request, and on demand through `workflow_dispatch`. It does not run on pushes to `main`, and it caches no build. ADR-0020 records why.
 
 | Job | Runs |
 |---|---|
@@ -16,7 +16,7 @@ The three names are the required status checks of the ruleset on `main`. A chang
 
 Both test jobs install the pinned Supabase CLI with Supabase's `setup-cli` action and pull their database image before the tests start, so neither download counts against a test's time limit. They set `GNOMON_TEST_SUPABASE_CLI=supabase`, so the suite runs the installed CLI. The workflow names each image itself, so a new image tag in `tests/support/server.rs` goes into `ci.yml` too. Builds leave out debug information (`CARGO_PROFILE_DEV_DEBUG=0`).
 
-`rust-toolchain.toml` pins the Rust version, and rustup installs it on your machine as it does in CI. It is also the minimum supported Rust version: change `rust-version` in `Cargo.toml` with it. The versions of cargo-nextest and uv are set at the top of `ci.yml`.
+`rust-toolchain.toml` pins the Rust version, and rustup installs it on your machine as it does in CI. It is also the minimum supported Rust version: change `rust-version` in `Cargo.toml` with it. `ci.yml` sets the versions of cargo-nextest and uv on the steps that install them.
 
 Lanes 3 and 4 and the performance suite run on demand. Only the performance suite asserts a time budget.
 
