@@ -7,9 +7,9 @@ use community_warm_start_proto::graph::{NODES, scenario};
 use community_warm_start_proto::{Strategy, run};
 use leiden_rs::{GraphDataBuilder, Leiden, LeidenConfig, Partition};
 
-/// `leiden-rs` stops a warm start as soon as no single Node wants to move, and
-/// a Node only moves to a neighbour's community. So two halves that no Edge
-/// joins stay one community, which a cold run splits.
+/// A Node only moves to a neighbour's community. So a warm start keeps these
+/// two halves, which no Edge joins, as one community, and a cold run splits
+/// them.
 #[test]
 fn a_warm_start_keeps_two_unjoined_triangles_in_one_community() {
     let mut builder = GraphDataBuilder::new(6);
