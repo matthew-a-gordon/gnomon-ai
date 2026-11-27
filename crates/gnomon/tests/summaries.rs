@@ -787,7 +787,7 @@ async fn a_node_an_erasure_would_leave_bare_stays_while_a_summary_that_cites_ano
 }
 
 #[tokio::test]
-async fn a_summary_write_commits_the_recorded_stage_records_with_it() {
+async fn a_summary_commits_with_the_stage_records_of_its_transaction() {
     let w = World::new().await;
     let f = w.episode(at(2024, 1, 1), None).await;
     let a = w
@@ -798,13 +798,15 @@ async fn a_summary_write_commits_the_recorded_stage_records_with_it() {
             json!({ "plan": "pro" }),
         )
         .await;
-    let recording = w
-        .caller()
-        .recording(vec![gnomon::StageWrite::pending(f, "summaries")]);
-    recording
-        .write_summary(w.tenant, &summary(SCOPE, a, "with its stage", &[f]))
+    let caller = w.caller();
+    let mut tx = caller.transaction(w.tenant).await.unwrap();
+    tx.write_summary(&summary(SCOPE, a, "with its stage", &[f]))
         .await
         .unwrap();
+    tx.write_stages(&[gnomon::StageWrite::pending(f, "summaries")])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let stages: Vec<String> = w
         .stage_records_of(SCOPE, f)
         .await

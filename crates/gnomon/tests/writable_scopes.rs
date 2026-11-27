@@ -40,7 +40,7 @@ create or replace function gnomon.writable_scopes() returns text[]
 
 fn assert_read_only<T: std::fmt::Debug>(result: Result<T, Error>, what: &str) {
     match result {
-        Err(Error::Database(e)) => {
+        Err(Error::Forbidden(e)) => {
             assert_eq!(
                 e.code(),
                 Some(&SqlState::INSUFFICIENT_PRIVILEGE),

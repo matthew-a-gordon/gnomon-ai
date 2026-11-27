@@ -12,9 +12,10 @@ use support::TestDb;
 #[tokio::test]
 async fn the_store_accepts_a_freshly_migrated_database() {
     let db = TestDb::migrated().await;
-    Store::connect(&db.login_url(), &support::connect_options())
+    let store = Store::connect(&db.login_url(), &support::connect_options())
         .await
         .expect("the Store connects");
+    store.check().await.expect("the Store accepts the schema");
 }
 
 #[tokio::test]
@@ -23,14 +24,93 @@ async fn the_store_reports_the_embedding_dimension_the_files_state() {
     let store = Store::connect(&db.login_url(), &support::connect_options())
         .await
         .unwrap();
-    assert_eq!(store.embedding_dimension().get(), 768);
+    assert_eq!(store.embedding_dimension().await.unwrap().get(), 768);
+}
+
+#[tokio::test]
+async fn connecting_opens_no_connection_until_a_call_needs_one() {
+    let db = TestDb::migrated().await;
+    let (proxy, log) = wire::record(db.server_addr().await).await;
+    let store = Store::connect(&db.login_url_through(proxy), &support::connect_options())
+        .await
+        .expect("connect opens no connection, so it cannot fail on one");
+    // Nothing else holds the proxy's address, so no connection to it means
+    // the Store opened none.
+    tokio::task::yield_now().await;
+    assert_eq!(log.connections(), 0, "Store::connect opened a connection");
+
+    let t = tenant();
+    store
+        .as_user(user(t, &["support"]))
+        .read_episode(t, EpisodeId(uuid::Uuid::new_v4()))
+        .await
+        .unwrap();
+    assert_eq!(log.connections(), 1, "the first call opens one connection");
+}
+
+#[tokio::test]
+async fn a_store_whose_server_cannot_be_reached_connects_and_its_first_call_is_unavailable() {
+    // A port no one listens on: the listener is dropped before the Store
+    // connects.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let url = format!("host=127.0.0.1 port={port} user=nobody dbname=nothing");
+    let store = Store::connect(&url, &support::connect_options())
+        .await
+        .expect("connect opens no connection");
+    let t = tenant();
+    match store
+        .as_user(user(t, &["support"]))
+        .read_episode(t, EpisodeId(uuid::Uuid::new_v4()))
+        .await
+    {
+        Err(Error::Unavailable {
+            reason: gnomon::UnavailableReason::Connect,
+            ..
+        }) => {}
+        other => panic!("expected the call to be unavailable, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_failed_schema_check_is_not_remembered_and_the_next_call_checks_again() {
+    let db = TestDb::migrated().await;
+    let next = gnomon::migrations::SCHEMA_VERSION + 1;
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "insert into gnomon.schema_version (version, name) values ({next}, 'from_a_later_release')"
+        ))
+        .await
+        .unwrap();
+    let store = store(&db).await;
+    let t = tenant();
+    let alice = store.as_user(user(t, &["support"]));
+    let id = EpisodeId(uuid::Uuid::new_v4());
+
+    match alice.read_episode(t, id).await {
+        Err(Error::SchemaVersion { found, .. }) => assert_eq!(found, Some(next)),
+        other => panic!("expected the first call to fail the schema check, got {other:?}"),
+    }
+    // The database is put back to the version this build expects.
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "delete from gnomon.schema_version where version = {next}"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(alice.read_episode(t, id).await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn the_store_refuses_a_database_with_no_gnomon_schema() {
     let db = TestDb::empty_with_login().await;
 
-    match Store::connect(&db.login_url(), &support::connect_options()).await {
+    match support::connect_and_check(&db.login_url(), &support::connect_options()).await {
         Err(Error::SchemaVersion { expected, found }) => {
             assert_eq!(expected, gnomon::migrations::SCHEMA_VERSION);
             assert_eq!(found, None);
@@ -52,7 +132,7 @@ async fn the_store_refuses_a_schema_newer_than_it_expects() {
         .await
         .unwrap();
 
-    match Store::connect(&db.login_url(), &support::connect_options()).await {
+    match support::connect_and_check(&db.login_url(), &support::connect_options()).await {
         Err(Error::SchemaVersion { expected, found }) => {
             assert_eq!(expected, gnomon::migrations::SCHEMA_VERSION);
             assert_eq!(found, Some(next));
@@ -74,7 +154,7 @@ async fn the_store_refuses_a_half_applied_chain() {
         .await
         .unwrap();
 
-    match Store::connect(&db.login_url(), &support::connect_options()).await {
+    match support::connect_and_check(&db.login_url(), &support::connect_options()).await {
         Err(Error::SchemaVersion { found, .. }) => assert_eq!(found, Some(last - 1)),
         Err(other) => panic!("expected a schema version error, got {other:?}"),
         Ok(_) => panic!("the Store ran against a half-applied chain"),
@@ -93,7 +173,7 @@ async fn the_store_refuses_a_schema_whose_embedding_dimension_pgvector_cannot_st
         .await
         .unwrap();
 
-    match Store::connect(&db.login_url(), &support::connect_options()).await {
+    match support::connect_and_check(&db.login_url(), &support::connect_options()).await {
         Err(Error::InvalidEmbeddingDimension(0)) => {}
         Err(other) => panic!("expected an invalid embedding dimension, got {other:?}"),
         Ok(_) => panic!("the Store accepted embedding dimension 0"),
@@ -136,11 +216,14 @@ fn assert_mismatch<T: std::fmt::Debug>(result: Result<T, Error>) {
 
 fn assert_denied(result: Result<EpisodeId, Error>) {
     match result {
-        Err(e) => assert_eq!(
-            e.sqlstate(),
-            Some(&SqlState::INSUFFICIENT_PRIVILEGE),
-            "expected an RLS refusal, got {e:?}"
-        ),
+        Err(e) => {
+            assert!(matches!(e, Error::Forbidden(_)), "{e:?}");
+            assert_eq!(
+                e.sqlstate(),
+                Some(&SqlState::INSUFFICIENT_PRIVILEGE),
+                "expected an RLS refusal, got {e:?}"
+            )
+        }
         Ok(id) => panic!("the write was allowed and recorded Episode {id}"),
     }
 }
@@ -388,8 +471,13 @@ async fn a_caller_without_tenant_claims_sees_nothing_and_writes_nothing() {
 #[tokio::test]
 async fn no_call_carries_its_claims_into_the_next_call_on_the_same_connection() {
     let db = TestDb::migrated().await;
-    // One Store holds one connection, so every call below shares it.
-    let store = store(&db).await;
+    // A pool of one connection, so every call below shares it.
+    let store = Store::connect(
+        &db.login_url(),
+        &support::connect_options().max_connections(1),
+    )
+    .await
+    .unwrap();
     let (t1, t2) = (tenant(), tenant());
 
     for round in 0..3 {
@@ -455,7 +543,8 @@ async fn a_refused_call_leaves_the_store_usable() {
 
 use support::wire::{self, Sent};
 
-/// The statements of one transaction, from BEGIN to COMMIT or ROLLBACK.
+/// The statements of one transaction, from the one that opens it, which
+/// starts with BEGIN, to COMMIT or ROLLBACK, the opening one included.
 fn transactions(sent: &[Sent]) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let mut current: Option<Vec<String>> = None;
@@ -466,9 +555,9 @@ fn transactions(sent: &[Sent]) -> Vec<Vec<String>> {
             Sent::Other(_) => continue,
         };
         let upper = sql.to_ascii_uppercase();
-        if upper == "BEGIN" || upper == "START TRANSACTION" {
+        if upper == "BEGIN" || upper.starts_with("BEGIN;") || upper == "START TRANSACTION" {
             assert!(current.is_none(), "BEGIN inside an open transaction");
-            current = Some(Vec::new());
+            current = Some(vec![sql]);
         } else if upper == "COMMIT" || upper == "ROLLBACK" {
             out.push(
                 current
@@ -491,7 +580,6 @@ async fn every_call_sends_only_unnamed_statements_inside_one_transaction_that_se
  {
     let db = TestDb::migrated().await;
     let (proxy, log) = wire::record(db.server_addr().await).await;
-    // The default statement mode, whatever GNOMON_TEST_NAMED_STATEMENTS says.
     let options = gnomon::ConnectOptions::default().tls(gnomon::Tls::plaintext());
     let store = Store::connect(&db.login_url_through(proxy), &options)
         .await
@@ -527,8 +615,11 @@ async fn every_call_sends_only_unnamed_statements_inside_one_transaction_that_se
     }
 
     let txs = transactions(&sent);
-    // The connect-time schema check, then the five calls.
+    // The schema check of the first connection, then the five calls, all
+    // on the one connection the calls took in turn.
+    assert_eq!(log.connections(), 1);
     assert_eq!(txs.len(), 6, "{txs:#?}");
+    assert_eq!(txs[0][0], "begin; set local role authenticated");
     let expected_roles = [
         "authenticated",
         "authenticated",
@@ -537,7 +628,8 @@ async fn every_call_sends_only_unnamed_statements_inside_one_transaction_that_se
         "gnomon_worker",
     ];
     for (tx, role) in txs[1..].iter().zip(expected_roles) {
-        assert_eq!(tx[0], format!("set local role {role}"), "{tx:#?}");
+        // BEGIN and the role go in one simple query, one round trip.
+        assert_eq!(tx[0], format!("begin; set local role {role}"), "{tx:#?}");
         assert_eq!(
             tx[1],
             "with claims as materialized (select set_config('request.jwt.claims', $1, true)) \
@@ -549,57 +641,8 @@ async fn every_call_sends_only_unnamed_statements_inside_one_transaction_that_se
     }
 }
 
-#[tokio::test]
-async fn with_named_statements_turned_on_each_statement_is_prepared_once_per_connection_and_reused()
-{
-    let db = TestDb::migrated().await;
-    // Straight to the server: this is what the Store sends, and a lane's
-    // pooler may not support named statements.
-    let (proxy, log) = wire::record(db.direct_server_addr().await).await;
-    let options = gnomon::ConnectOptions::default()
-        .tls(gnomon::Tls::plaintext())
-        .named_statements(true);
-    let store = Store::connect(&db.direct_login_url_through(proxy), &options)
-        .await
-        .unwrap();
-    let t = tenant();
-
-    let alice = store.as_user(user(t, &["support"]));
-    for i in 0..3 {
-        let content = format!("Call {i}.");
-        let id = alice
-            .record_episode(&episode(t, "support", &content))
-            .await
-            .unwrap();
-        let read = alice.read_episode(t, id).await.unwrap().unwrap();
-        assert_eq!(read.content, content);
-    }
-
-    let parses: Vec<(String, String)> = log
-        .sent()
-        .into_iter()
-        .filter_map(|m| match m {
-            Sent::Parse { name, sql } => Some((name, sql)),
-            _ => None,
-        })
-        .collect();
-    for (name, sql) in &parses {
-        assert!(
-            !name.is_empty(),
-            "an unnamed statement was sent for {sql:?}"
-        );
-    }
-    // The schema check, the claims, recording and reading: each prepared
-    // once, though the calls ran three times.
-    assert_eq!(parses.len(), 4, "{parses:#?}");
-    let mut sqls: Vec<_> = parses.iter().map(|(_, sql)| sql).collect();
-    sqls.sort();
-    sqls.dedup();
-    assert_eq!(sqls.len(), 4, "a statement was prepared twice: {parses:#?}");
-}
-
-/// The statements of each Store call of a recorded run, after the
-/// connect-time schema check.
+/// The statements of each Store call of a recorded run, after the schema
+/// check of the first connection.
 fn calls_after_connect(sent: &[Sent]) -> Vec<Vec<String>> {
     let txs = transactions(sent);
     txs[1..].to_vec()
@@ -677,7 +720,7 @@ async fn a_batch_as_of_read_of_many_nodes_and_a_traversal_are_each_one_call_what
         "gnomon.read_nodes(",
         "gnomon.traverse(",
     ]) {
-        assert_eq!(call[0], "set local role gnomon_worker", "{call:#?}");
+        assert_eq!(call[0], "begin; set local role gnomon_worker", "{call:#?}");
         assert_eq!(
             call.len(),
             3,
@@ -694,7 +737,7 @@ async fn a_batch_as_of_read_of_many_nodes_and_a_traversal_are_each_one_call_what
         let mut open = false;
         for m in &sent {
             match m {
-                Sent::Query(q) if q.trim().eq_ignore_ascii_case("begin") => {
+                Sent::Query(q) if q.trim().to_ascii_lowercase().starts_with("begin") => {
                     open = true;
                     n = 0;
                 }

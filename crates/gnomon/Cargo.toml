@@ -21,14 +21,14 @@ required-features = ["performance"]
 
 [dependencies]
 chrono = "0.4"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+deadpool-postgres = { version = "0.14", default-features = false, features = ["rt_tokio_1"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
-rustls-pki-types = "1"
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-postgres = { version = "0.7.18", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
-tokio-postgres-rustls = "0.14"
+tokio-postgres-rustls = { version = "0.14", features = ["aws-lc-rs"] }
 uuid = "1"
 
 [dev-dependencies]
@@ -36,9 +36,9 @@ chrono = "0.4"
 serde_json = "1"
 proptest = "1"
 tempfile = "3"
-testcontainers = { version = "0.28", features = ["reusable-containers"] }
+testcontainers = { version = "0.28", default-features = false, features = ["aws-lc-rs", "reusable-containers"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
 tokio-postgres = "0.7.18"
 uuid = { version = "1", features = ["v4"] }
-rcgen = "0.14"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }

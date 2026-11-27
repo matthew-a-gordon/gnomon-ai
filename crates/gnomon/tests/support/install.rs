@@ -90,7 +90,7 @@ pub async fn assert_installed(db: &TestDb, schema: &str) {
         ],
         "the extensions the first file created"
     );
-    gnomon::Store::connect(&db.login_url(), &super::connect_options())
+    super::connect_and_check(&db.login_url(), &super::connect_options())
         .await
         .expect("the Store accepts the schema");
 }

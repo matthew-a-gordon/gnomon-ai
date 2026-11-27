@@ -169,11 +169,26 @@ The Store connects as a login role of your deployment, which may switch to the `
 
 ```rust
 let store = Store::connect(&url, &ConnectOptions::default()).await?;
+store.check().await?; // optional: fail at startup if the schema is not the one this build expects
 ```
 
-By default the Store connects with TLS and verifies the server's certificate and host name against the platform's trusted roots. The connection string's `sslmode` cannot turn that off. A managed Postgres often signs its servers with a CA of its own. Trust that CA with `ConnectOptions::default().tls(Tls::trust_pem(ca_pem)?)`. `Tls::unverified()` encrypts without verifying the certificate, and `Tls::plaintext()` turns TLS off. Use either only where you have decided you need it.
+`Store::connect` opens no connection. The Store keeps a small pool: it opens a connection when a call needs one and none is free, keeps at most 10 by default (`ConnectOptions::max_connections`), and runs no background task. A call waits at most 30 seconds for a free connection (`wait_timeout`) and then fails with `Error::Unavailable`. `idle_timeout` closes a connection that sat idle longer than it, when a call would take it next. The first connection checks the schema version and the embedding dimension, and `Store::check` runs that check on its own.
 
-The Store works through transaction-mode poolers such as PgBouncer and Supavisor at their default settings. Every call is one transaction that sets its role and its claims locally, and every statement is sent unnamed. Named prepared statements are an opt-in, `ConnectOptions::named_statements(true)`. Turn them on only behind a pooler that supports them: PgBouncer 1.21 or later with `max_prepared_statements` above 0, or Supavisor with named prepared statements enabled. Elsewhere calls fail.
+By default the Store connects with TLS and verifies the server's certificate and host name against the platform's trusted roots. The connection string's `sslmode` cannot turn that off, and `sslmode=verify-full` asks for what the Store does already. A managed Postgres often signs its servers with a CA of its own. Trust that CA with `ConnectOptions::default().tls(Tls::trust_pem(ca_pem)?)`. `Tls::unverified()` encrypts without verifying the certificate, and `Tls::plaintext()` turns TLS off. Use either only where you have decided you need it.
+
+The Store works through transaction-mode poolers such as PgBouncer and Supavisor at their default settings. Every call is one transaction that sets its role and its claims locally, and every statement is sent unnamed, so the Store needs no pooler setting for prepared statements.
+
+Each call on a `Caller` is a transaction of its own. To make several calls in one, start a transaction:
+
+```rust
+let worker = store.as_worker(tenant, Scope::new("ingest"), None);
+let mut tx = worker.transaction(tenant).await?;
+tx.store_sentence(version, &sentence).await?;
+tx.write_stages(&[finish]).await?;
+tx.commit().await?;
+```
+
+Nothing in it is saved until `commit` succeeds. Dropping it saves nothing, and `commit` fails once a call in it has failed. It holds one pooled connection until it ends, so make model calls before you start it.
 
 ## Development
 

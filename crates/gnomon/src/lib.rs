@@ -2,9 +2,11 @@
 //!
 //! A [`Store`] runs every call as a caller under RLS: [`Store::as_user`] for
 //! an end user with verified JWT claims, and [`Store::as_worker`] for
-//! background work in one Tenant and Scope. [`migrations`] lists the files
-//! of the schema the Store expects, which a consumer copies into its own
-//! migration chain.
+//! background work in one Tenant and Scope. Each call on a [`Caller`] is one
+//! transaction on a connection of the Store's pool, and
+//! [`Caller::transaction`] starts a [`Transaction`] for several calls that
+//! commit together. [`migrations`] lists the files of the schema the Store
+//! expects, which a consumer copies into its own migration chain.
 
 mod connect;
 mod edge;
@@ -17,6 +19,7 @@ mod search;
 mod stage;
 mod store;
 mod summary;
+mod transaction;
 
 use std::fmt;
 
@@ -24,7 +27,7 @@ use chrono::{DateTime, Utc};
 use tokio_postgres::error::SqlState;
 use uuid::Uuid;
 
-pub use connect::{ConnectOptions, Tls};
+pub use connect::{ConnectOptions, DEFAULT_MAX_CONNECTIONS, DEFAULT_WAIT_TIMEOUT, Tls};
 pub use edge::{
     Direction, EdgeId, EdgeVersion, EpisodeErasure, GraphErasure, NewEdge, Step, Traversal,
 };
@@ -48,6 +51,7 @@ pub use store::{Caller, Store};
 pub use summary::{
     Community, CommunityId, DerivedCitation, NewCommunity, NewSummary, Summary, SummaryId,
 };
+pub use transaction::Transaction;
 
 /// The SQLSTATE Kind registration raises for a definition outside the
 /// profile or the Ontology's rules.
@@ -202,12 +206,14 @@ pub enum Error {
     #[error("Tenant required: {0}")]
     TenantRequired(String),
     /// The Tenant the call named is not the Tenant the caller's claims
-    /// bind, or the claims bind none. The message names both.
+    /// bind, or the claims bind none, or, in a [`Transaction`], not the
+    /// transaction's Tenant. The message names both.
     #[error("Tenant mismatch: {0}")]
     TenantMismatch(String),
     /// The connection settings are invalid or contradict each other, such
-    /// as a trusted CA PEM that does not parse, or a connection string whose
-    /// `sslmode` contradicts the Store's [`Tls`] setting.
+    /// as a trusted CA PEM that does not parse, a connection string that does
+    /// not parse, or one whose `sslmode` contradicts the Store's [`Tls`]
+    /// setting.
     #[error("invalid connection settings: {0}")]
     InvalidConnection(String),
     /// A stage write finished a record that another claim has taken since
@@ -215,18 +221,109 @@ pub enum Error {
     /// the stage's output with it. The message names the record.
     #[error("stage claim lost: {0}")]
     StageClaimLost(String),
-    /// Postgres refused or failed the call. RLS refusals and a missing grant
-    /// arrive here, and so do failures to connect, a refused TLS
-    /// certificate included.
+    /// The caller lacks a privilege the call needs: Postgres raised
+    /// `insufficient_privilege` (SQLSTATE 42501). A write to a Scope the
+    /// caller may read and not write, a row RLS refuses, and a function the
+    /// deployment has not granted, such as Erasure, arrive here.
+    /// [`sqlstate`](Self::sqlstate) returns 42501, and the Postgres error is
+    /// the source.
+    #[error("forbidden: {}", db_message(.0))]
+    Forbidden(#[source] tokio_postgres::Error),
+    /// A concurrent transaction conflicted with this one: Postgres raised a
+    /// serialization failure (40001) or a deadlock (40P01) and rolled this
+    /// transaction back, so it saved nothing. A single call on a
+    /// [`Caller`] has already run again before it returns this. Whoever
+    /// holds a [`Transaction`] runs the whole transaction again themselves;
+    /// [`can_run_again`](Self::can_run_again) is true.
+    #[error(
+        "a concurrent transaction conflicted with this one, which rolled back and saved \
+         nothing; run the transaction again: {}",
+        db_message(.0)
+    )]
+    Conflict(#[source] tokio_postgres::Error),
+    /// The Store could not reach the database: no free connection within
+    /// the wait timeout, no connection could be opened, or the connection
+    /// was lost. `reason` says which, and `source` is the cause, such as the
+    /// pool's timeout, the refused TLS certificate or the I/O error.
+    #[error("{}", reason.message())]
+    Unavailable {
+        reason: UnavailableReason,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// [`Transaction::commit`] found that a call in the transaction failed
+    /// or was cancelled, so it rolled the transaction back. Nothing in it
+    /// was saved. Postgres answers a COMMIT of a failed transaction by
+    /// rolling it back without an error, so the Store reports it here.
+    #[error(
+        "the transaction rolled back and saved nothing, because a call in it failed or was \
+         cancelled"
+    )]
+    RolledBack,
+    /// Postgres refused or failed the call for any other reason, such as a
+    /// check violation or an invalid argument (SQLSTATE 22023).
     #[error(transparent)]
-    Database(#[from] tokio_postgres::Error),
+    Database(tokio_postgres::Error),
+}
+
+/// Why the Store could not reach the database, in [`Error::Unavailable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnavailableReason {
+    /// Every connection of the pool was in use for the whole wait timeout
+    /// ([`ConnectOptions::wait_timeout`]). Nothing was sent.
+    PoolTimeout,
+    /// A new connection could not be opened: the server could not be
+    /// reached, refused the login, or failed the TLS handshake. Nothing was
+    /// sent.
+    Connect,
+    /// The connection was lost before COMMIT was sent. The transaction did
+    /// not commit, so nothing was saved.
+    Lost,
+    /// The connection was lost after COMMIT was sent and before it was
+    /// answered. Whether the transaction committed is unknown, and nothing
+    /// runs again automatically.
+    LostDuringCommit,
+}
+
+impl UnavailableReason {
+    fn message(self) -> &'static str {
+        match self {
+            UnavailableReason::PoolTimeout => {
+                "the database is unavailable: no connection was free within the wait timeout"
+            }
+            UnavailableReason::Connect => {
+                "the database is unavailable: a connection could not be opened"
+            }
+            UnavailableReason::Lost => {
+                "the database is unavailable: the connection was lost, and the transaction saved \
+                 nothing"
+            }
+            UnavailableReason::LostDuringCommit => {
+                "the connection was lost during COMMIT, so whether the transaction committed is \
+                 unknown; nothing ran again"
+            }
+        }
+    }
+}
+
+/// Postgres's own message for a database error, or the error itself.
+fn db_message(e: &tokio_postgres::Error) -> String {
+    match e.as_db_error() {
+        Some(db) => db.message().to_owned(),
+        None => e.to_string(),
+    }
 }
 
 impl Error {
-    /// The SQLSTATE Postgres returned, if this is a database error.
+    /// The SQLSTATE Postgres returned, if this is a database error or a
+    /// refused connection that carries one.
     pub fn sqlstate(&self) -> Option<&SqlState> {
         match self {
-            Error::Database(e) => e.code(),
+            Error::Database(e) | Error::Forbidden(e) | Error::Conflict(e) => e.code(),
+            Error::Unavailable { source, .. } => source
+                .downcast_ref::<tokio_postgres::Error>()
+                .and_then(tokio_postgres::Error::code),
             Error::SchemaVersion { .. }
             | Error::InvalidEmbeddingDimension(_)
             | Error::InvalidConnection(_)
@@ -235,13 +332,55 @@ impl Error {
             | Error::InvalidWrite(_)
             | Error::TenantRequired(_)
             | Error::TenantMismatch(_)
-            | Error::StageClaimLost(_) => None,
+            | Error::StageClaimLost(_)
+            | Error::RolledBack => None,
         }
     }
 
-    /// Turns the SQLSTATEs the Store's functions raise, for a refused Kind,
-    /// a refused write or a refused Tenant, into their variants.
-    pub(crate) fn from_store(e: tokio_postgres::Error) -> Error {
+    /// Whether running the call or the transaction again can succeed with
+    /// nothing saved twice: after a [`Conflict`](Error::Conflict), and after
+    /// an [`Unavailable`](Error::Unavailable) whose transaction is known not
+    /// to have committed. It is false after the connection was lost during
+    /// COMMIT, because the first run may have committed.
+    pub fn can_run_again(&self) -> bool {
+        match self {
+            Error::Conflict(_) => true,
+            Error::Unavailable { reason, .. } => *reason != UnavailableReason::LostDuringCommit,
+            _ => false,
+        }
+    }
+
+    /// Whether this is a serialization failure or a deadlock.
+    pub(crate) fn is_conflict(&self) -> bool {
+        matches!(self, Error::Conflict(_))
+    }
+
+    /// Whether the connection was lost under the call.
+    pub(crate) fn is_lost_connection(&self) -> bool {
+        matches!(
+            self,
+            Error::Unavailable {
+                reason: UnavailableReason::Lost | UnavailableReason::LostDuringCommit,
+                ..
+            }
+        )
+    }
+
+    /// The one conversion every statement's error goes through, COMMIT's
+    /// included (`during_commit`): a lost connection, a refused privilege, a
+    /// conflict and the SQLSTATEs the Store's functions raise for a refused
+    /// Kind, write or Tenant each become their variant.
+    pub(crate) fn from_statement(e: tokio_postgres::Error, during_commit: bool) -> Error {
+        if is_lost(&e) {
+            return Error::Unavailable {
+                reason: if during_commit {
+                    UnavailableReason::LostDuringCommit
+                } else {
+                    UnavailableReason::Lost
+                },
+                source: Box::new(e),
+            };
+        }
         let message = e.as_db_error().map(|d| d.message().to_owned());
         match (e.code().map(SqlState::code), message) {
             (Some(INVALID_KIND), Some(m)) => Error::InvalidKind(m),
@@ -250,7 +389,29 @@ impl Error {
             (Some(TENANT_REQUIRED), Some(m)) => Error::TenantRequired(m),
             (Some(TENANT_MISMATCH), Some(m)) => Error::TenantMismatch(m),
             (Some(STAGE_CLAIM_LOST), Some(m)) => Error::StageClaimLost(m),
+            (Some("42501"), _) => Error::Forbidden(e),
+            (Some("40001" | "40P01"), _) => Error::Conflict(e),
             _ => Error::Database(e),
         }
     }
+}
+
+impl From<tokio_postgres::Error> for Error {
+    fn from(e: tokio_postgres::Error) -> Error {
+        Error::from_statement(e, false)
+    }
+}
+
+/// Whether an error means the connection is gone: the client saw it close,
+/// an I/O error broke it, or the server ended the session (a connection
+/// exception, class 08, or an operator or crash shutdown, 57P01 to 57P03).
+fn is_lost(e: &tokio_postgres::Error) -> bool {
+    if e.is_closed() {
+        return true;
+    }
+    if let Some(code) = e.code() {
+        let code = code.code();
+        return code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03");
+    }
+    std::error::Error::source(e).is_some_and(|s| s.is::<std::io::Error>())
 }

@@ -20,7 +20,11 @@ We chose this because ADR-0001 put the Pipeline in the core so that it is writte
 
 ## Connections
 
-A consumer creates one client object per process, at module scope, and creating it opens no connection. The pool is small and lazy: a default maximum of 2 in the bindings and 10 in the server, a minimum of 0, and connections open on first use. Each connection is checked when it is taken from the pool, and a dead one is replaced once before the call fails. `pool.max` and `pool.idle_timeout` are set in the deployment configuration, which the bindings read from a file path, a dict or object, or the environment. Model calls run before the transaction that writes their output (#23), so a connection is held only for the short transaction.
+A consumer creates one client object per process, at module scope, and creating it opens no connection. The pool is small and lazy: a default maximum of 2 in the bindings and 10 in the server, a minimum of 0, and connections open on first use. The Rust core's pool is `deadpool-postgres`, and nothing runs between calls: no keepalive, no reaper and no health check on a timer. `pool.max` and `pool.idle_timeout` are set in the deployment configuration, which the bindings read from a file path, a dict or object, or the environment. Model calls run before the transaction that writes their output (#23), so a connection is held only for the short transaction.
+
+- A connection is checked when a call takes it from the pool, at no cost: the pool drops one whose socket the client has seen close, and one idle for longer than `pool.idle_timeout`, if that is set. A healthy call sends no extra query.
+- A connection that died unseen, such as one a server or a network dropped while it sat idle, fails when its transaction starts: the `begin`, the claims or the first schema check reports it lost. The Store closes it and starts the transaction once more on another connection. A second failure fails the call with `Error::Unavailable`. A connection lost after its transaction started is not replaced, and the call fails.
+- A call waits at most 30 seconds for a free connection by default (`ConnectOptions::wait_timeout` in the core), then fails with `Error::Unavailable`. A transaction a consumer holds keeps its connection until it ends, so a slow holder makes others wait.
 
 ## Types
 
