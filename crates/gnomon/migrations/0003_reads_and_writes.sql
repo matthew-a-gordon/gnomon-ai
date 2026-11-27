@@ -2179,7 +2179,13 @@ create function gnomon.merge_versions(
     w0 timestamptz;
     w1 timestamptz;
     candidates gnomon.merge_candidate[];
+    -- What step 4 finds: the candidates to insert, those that open a Version
+    -- (inserted or reopened), those an open Version already holds, and the
+    -- closed Versions to reopen.
     v_fresh gnomon.merge_candidate[];
+    v_opening gnomon.merge_candidate[];
+    v_kept gnomon.merge_candidate[];
+    v_reopen uuid[];
     stale uuid[];
     -- The statements and bound statements of this Node or Edge that belong to
     -- an Episode retracted by `p_at`, which the merge leaves out.
@@ -2246,7 +2252,17 @@ create function gnomon.merge_versions(
         and v.valid_from <= p_to and v.valid_to >= p_from;
 
     -- 2 and 3. The new Versions over the window, each with its Citations.
-    with contributions as (
+    --
+    -- Every step is materialized, so each runs once whatever PostgreSQL
+    -- estimates, and no step joins two sets of rows on a condition a
+    -- misestimate could turn into a nested loop over both. The instants of
+    -- the window are one sorted array, and segment `ord` runs from its
+    -- `ord`th instant to the next. A Contribution finds the segments it
+    -- covers by binary search in the array (`width_bucket`), each segment's
+    -- winner and the Contributions that state its value come from one window
+    -- over those pairs, and each island gathers its Citations by a window
+    -- over the segments, not a join.
+    with contributions as materialized (
       select c.id, c.episode_id, c.property, c.value, c.place,
              greatest(e.vf, w0) as vf, least(e.vt, w1) as vt,
              case when e.vf >= w0 then e.vfp end as vfp,
@@ -2295,92 +2311,173 @@ create function gnomon.merge_versions(
         -- The statements of a retracted Episode no longer count, except the
         -- Retractions Retract Episode made.
         and (c.statement_id is null or c.statement_id <> all (ignored_statements))
-    ), bounds as (
-      select vf as at from contributions
-      union select vt from contributions
-      union select w0
-      union select w1
-    ), segments as (
-      select at as sf, lead(at) over (order by at) as st from bounds
-    ), winners as (
-      select distinct on (s.sf, c.property) s.sf, s.st, c.property, c.value
-      from segments s join contributions c on c.vf <= s.sf and c.vt >= s.st
-      where s.st is not null
-      order by s.sf, c.property, c.auth desc, c.ref desc, c.rec desc, c.id desc
-    ), supporters as (
-      -- Every Contribution in a segment that states its winning value, and
-      -- whether the step recorded it.
-      select w.sf, w.property, c.episode_id, c.place, c.ref, c.episode_rec,
-             bool_or(c.rec = t) as fresh
-      from winners w
-      join contributions c
-        on c.property = w.property and c.value = w.value and c.vf <= w.sf and c.vt >= w.st
-      where w.value <> 'null'::jsonb
-      group by w.sf, w.property, c.episode_id, c.place, c.ref, c.episode_rec
-    ), segment_values as (
-      select sf, max(st) as st,
-             coalesce(
-               jsonb_object_agg(property, value)
-                 filter (where value <> 'null'::jsonb and not (p_is_edge and property = 'holds')),
-               '{}'::jsonb) as props,
-             case when p_is_edge then coalesce(bool_or(property = 'holds' and value <> 'null'::jsonb), false)
-                  else bool_or(value <> 'null'::jsonb) end as held
-      from winners group by sf
-    ), islands as (
-      select sf, st, props,
-             sum(case when prev_st = sf and prev_props = props then 0 else 1 end)
-               over (order by sf) as island
+    ), instants as materialized (
+      -- The bounds of the Contributions and of the window, sorted, each with
+      -- the precision a Version takes that starts or ends there: the finest
+      -- a Contribution starting or ending there states, else the open
+      -- Version's that does, else instant or unknown. An open Version's
+      -- bounds give a precision and no instant.
+      select array_agg(p.at order by p.at) as at,
+             array_agg(coalesce(p.fp, p.version_fp,
+                                case when p.at in ('-infinity', 'infinity') then 'unknown'
+                                     else 'instant' end::gnomon.time_precision)
+                       order by p.at) as fp,
+             array_agg(coalesce(p.tp, p.version_tp,
+                                case when p.at in ('-infinity', 'infinity') then 'unknown'
+                                     else 'instant' end::gnomon.time_precision)
+                       order by p.at) as tp
       from (
-        select sf, st, props,
-               lag(st) over (order by sf) as prev_st, lag(props) over (order by sf) as prev_props
+        select b.at, max(b.fp) as fp, max(b.tp) as tp,
+               max(b.version_fp) as version_fp, max(b.version_tp) as version_tp
+        from (
+          select c.vf as at, c.vfp as fp, null::gnomon.time_precision as tp,
+                 null::gnomon.time_precision as version_fp,
+                 null::gnomon.time_precision as version_tp, true as bound
+            from contributions c
+          union all
+          select c.vt, null, c.vtp, null, null, true from contributions c
+          union all
+          select w0, null, null, null, null, true
+          union all
+          select w1, null, null, null, null, true
+          union all
+          select x.valid_from, null, null, x.valid_from_precision, null, false
+            from gnomon.version x
+            where x.tenant_id = p_tenant_id and x.scope = v_scope and x.versioned_id = p_id
+              and x.recorded_to = 'infinity' and x.valid_from <= w1 and x.valid_to >= w0
+          union all
+          select x.valid_to, null, null, null, x.valid_to_precision, false
+            from gnomon.version x
+            where x.tenant_id = p_tenant_id and x.scope = v_scope and x.versioned_id = p_id
+              and x.recorded_to = 'infinity' and x.valid_from <= w1 and x.valid_to >= w0
+        ) b
+        group by b.at
+        having bool_or(b.bound)
+      ) p
+    ), cover as materialized (
+      -- Each Contribution with each segment it covers.
+      select c.*, g.ord
+      from contributions c
+      cross join instants i
+      cross join lateral generate_series(
+        pg_catalog.width_bucket(c.vf, i.at), pg_catalog.width_bucket(c.vt, i.at) - 1) g(ord)
+    ), ranked as materialized (
+      -- In each segment, the Contributions of each property in merge order:
+      -- the first wins, and every one stating its value supports it.
+      select k.ord, k.property, k.value, k.episode_id, k.place, k.ref, k.episode_rec, k.rec,
+             row_number() over w = 1 as wins,
+             first_value(k.value) over w as winning
+      from cover k
+      window w as (partition by k.ord, k.property
+                   order by k.auth desc, k.ref desc, k.rec desc, k.id desc)
+    ), segment_values as materialized (
+      select r.ord,
+             coalesce(
+               jsonb_object_agg(r.property, r.value)
+                 filter (where r.value <> 'null'::jsonb and not (p_is_edge and r.property = 'holds')),
+               '{}'::jsonb) as props,
+             case when p_is_edge
+                  then coalesce(bool_or(r.property = 'holds' and r.value <> 'null'::jsonb), false)
+                  else bool_or(r.value <> 'null'::jsonb) end as held
+      from ranked r
+      where r.wins
+      group by r.ord
+    ), islands as materialized (
+      -- Held segments in a row with the same values make one Version.
+      select ord, props,
+             sum(case when prev_ord = ord - 1 and prev_props = props then 0 else 1 end)
+               over (order by ord) as island
+      from (
+        select ord, props,
+               lag(ord) over (order by ord) as prev_ord, lag(props) over (order by ord) as prev_props
         from segment_values where held
       ) x
-    ), merged as (
-      select island, min(sf) as vf, max(st) as vt, (array_agg(props))[1] as props
-      from islands group by island
-    ), merged_precision as (
-      select m.island, m.vf, m.vt, m.props,
-             coalesce(
-               (select max(c.vfp) from contributions c where c.vf = m.vf),
-               (select x.valid_from_precision from gnomon.version x
-                 where x.tenant_id = p_tenant_id and x.scope = v_scope and x.versioned_id = p_id
-                   and x.recorded_to = 'infinity' and x.valid_from = m.vf limit 1),
-               gnomon.instant_or_unknown(m.vf)) as vfp,
-             coalesce(
-               (select max(c.vtp) from contributions c where c.vt = m.vt),
-               (select x.valid_to_precision from gnomon.version x
-                 where x.tenant_id = p_tenant_id and x.scope = v_scope and x.versioned_id = p_id
-                   and x.recorded_to = 'infinity' and x.valid_to = m.vt limit 1),
-               gnomon.instant_or_unknown(m.vt)) as vtp
-      from merged m
-    ), island_citations as (
-      select i.island,
-             array_agg(distinct row(s.property, s.episode_id, s.place, s.fresh, s.ref,
-                                    s.episode_rec)::gnomon.merge_citation) as cites
-      from islands i join supporters s on s.sf = i.sf
-      group by i.island
+    ), supporters as materialized (
+      -- Every Contribution in a segment that states its winning value, and
+      -- whether the step recorded it.
+      select r.ord, r.property, r.episode_id, r.place, r.ref, r.episode_rec,
+             bool_or(r.rec = t) as fresh
+      from ranked r
+      where r.value = r.winning and r.winning <> 'null'::jsonb
+      group by r.ord, r.property, r.episode_id, r.place, r.ref, r.episode_rec
+    ), merged as materialized (
+      -- Each island's segments and Citations. A supporter takes the island of
+      -- its segment from the segment's own row, by a window over the
+      -- segment, and one of a segment no island holds is dropped.
+      select y.island, min(y.ord) as first_ord, max(y.ord) as last_ord,
+             (array_agg(y.props) filter (where not y.is_cite))[1] as props,
+             coalesce(array_agg(distinct y.cite) filter (where y.is_cite), '{}') as cites
+      from (
+        select max(x.island) over (partition by x.ord) as island, x.ord, x.props, x.cite,
+               x.is_cite
+        from (
+          select i.ord, i.island, i.props, null::gnomon.merge_citation as cite,
+                 false as is_cite
+          from islands i
+          union all
+          select s.ord, null, null,
+                 row(s.property, s.episode_id, s.place, s.fresh, s.ref,
+                     s.episode_rec)::gnomon.merge_citation,
+                 true
+          from supporters s
+        ) x
+      ) y
+      where y.island is not null
+      group by y.island
     )
-    select coalesce(array_agg(row(m.vf, m.vfp, m.vt, m.vtp, m.props,
-                                  coalesce(ic.cites, '{}'))::gnomon.merge_candidate),
-                    '{}')
+    select coalesce(
+             array_agg(row(n.at[m.first_ord], n.fp[m.first_ord], n.at[m.last_ord + 1],
+                           n.tp[m.last_ord + 1], m.props, m.cites)::gnomon.merge_candidate),
+             '{}')
       into candidates
-      from merged_precision m left join island_citations ic using (island);
+      from merged m cross join instants n;
 
-    -- 4. The stale Versions. One the step wrote is deleted with its
-    -- Citations, so no empty Recorded time is left; every other is closed at
-    -- the step and loses the Citations the step added to it.
-    select coalesce(array_agg(v.id), '{}') into stale
-      from gnomon.version v
-      where v.tenant_id = p_tenant_id and v.scope = v_scope and v.versioned_id = p_id
-        and v.recorded_to = 'infinity'
-        and v.valid_from >= w0 and v.valid_to <= w1
-        and not exists (
-          select from unnest(candidates) cand
-          where cand.valid_from = v.valid_from and cand.valid_to = v.valid_to
-            and cand.props = v.props
-            and cand.valid_from_precision = v.valid_from_precision
-            and cand.valid_to_precision = v.valid_to_precision
-        );
+    -- 4. Each candidate, by its Valid time, precisions and values, against the
+    -- Versions that hold the same: the open Versions in the window, and the
+    -- closed Versions the step closed. One grouping finds them, so no
+    -- candidate is compared with every Version:
+    --
+    --   stale     an open Version no candidate holds
+    --   reopen    a closed Version a candidate holds again
+    --   fresh     a candidate no Version holds, which is inserted
+    --   opening   the fresh candidates and those that reopen a Version
+    --   kept      a candidate an open Version already holds
+    -- A composite is null only when every field is, so each row says what
+    -- it is with `is_candidate`.
+    select coalesce(array_agg(g.open_id) filter (where not g.wanted and g.open_id is not null),
+                    '{}'),
+           coalesce(array_agg(g.closed_id) filter (where g.wanted and g.closed_id is not null),
+                    '{}'),
+           coalesce(array_agg(g.cand)
+                      filter (where g.wanted and g.open_id is null and g.closed_id is null), '{}'),
+           coalesce(array_agg(g.cand) filter (where g.wanted and g.open_id is null), '{}'),
+           coalesce(array_agg(g.cand) filter (where g.wanted and g.open_id is not null), '{}')
+      into stale, v_reopen, v_fresh, v_opening, v_kept
+      from (
+        select bool_or(k.is_candidate) as wanted,
+               (array_agg(k.cand) filter (where k.is_candidate))[1] as cand,
+               (array_agg(k.open_id) filter (where k.open_id is not null))[1] as open_id,
+               (array_agg(k.closed_id) filter (where k.closed_id is not null))[1] as closed_id
+        from (
+          select cand.valid_from, cand.valid_from_precision, cand.valid_to,
+                 cand.valid_to_precision, cand.props, cand::gnomon.merge_candidate as cand,
+                 true as is_candidate, null::uuid as open_id, null::uuid as closed_id
+          from unnest(candidates) cand
+          union all
+          select v.valid_from, v.valid_from_precision, v.valid_to, v.valid_to_precision, v.props,
+                 null, false, case when v.recorded_to = 'infinity' then v.id end,
+                 case when v.recorded_to <> 'infinity' then v.id end
+          from gnomon.version v
+          where v.tenant_id = p_tenant_id and v.scope = v_scope and v.versioned_id = p_id
+            and ((v.recorded_to = 'infinity' and v.valid_from >= w0 and v.valid_to <= w1)
+                 or (v.recorded_to = t and (p_replay or v.closed_in = me)))
+        ) k
+        group by k.valid_from, k.valid_from_precision, k.valid_to, k.valid_to_precision, k.props
+      ) g;
+
+    -- The stale Versions. One the step wrote is deleted with its Citations,
+    -- so no empty Recorded time is left; every other is closed at the step
+    -- and loses the Citations the step added to it.
     changed := cardinality(stale) > 0;
     delete from gnomon.citation x
       where x.tenant_id = p_tenant_id and x.version_id = any(stale)
@@ -2392,29 +2489,9 @@ create function gnomon.merge_versions(
       where v.tenant_id = p_tenant_id and v.id = any(stale);
 
     -- 5. Reopen what the step closed and now restores, and insert the rest.
-    -- The new Versions are those no open Version, and none the step closed,
-    -- already holds, found before the reopening.
-    select coalesce(array_agg(cand), '{}') into v_fresh
-      from unnest(candidates) cand
-      where not exists (
-        select from gnomon.version v
-        where v.tenant_id = p_tenant_id and v.scope = v_scope and v.versioned_id = p_id
-          and v.valid_from = cand.valid_from and v.valid_to = cand.valid_to
-          and v.props = cand.props
-          and v.valid_from_precision = cand.valid_from_precision
-          and v.valid_to_precision = cand.valid_to_precision
-          and (v.recorded_to = 'infinity'
-               or (v.recorded_to = t and (p_replay or v.closed_in = me)))
-      );
     with reopened as (
       update gnomon.version v set recorded_to = 'infinity'
-        from unnest(candidates) cand
-        where v.tenant_id = p_tenant_id and v.scope = v_scope and v.versioned_id = p_id
-          and v.recorded_to = t and (p_replay or v.closed_in = me)
-          and v.valid_from = cand.valid_from and v.valid_to = cand.valid_to
-          and v.props = cand.props
-          and v.valid_from_precision = cand.valid_from_precision
-          and v.valid_to_precision = cand.valid_to_precision
+        where v.tenant_id = p_tenant_id and v.id = any(v_reopen)
         returning v.id
     )
     select coalesce(array_agg(id), '{}') into opened from reopened;
@@ -2451,7 +2528,8 @@ create function gnomon.merge_versions(
     end if;
     changed := changed or cardinality(opened) > 0;
 
-    -- 6. The Citations.
+    -- 6. The Citations: all of each Version the step opened, and those the
+    -- step recorded of each Version it kept.
     if p_replay then
       insert into gnomon.citation (
         tenant_id, scope, version_id, episode_id, property, place,
@@ -2459,13 +2537,17 @@ create function gnomon.merge_versions(
       )
         select p_tenant_id, v_scope, v.id, cc.episode_id, cc.property, cc.place,
                cc.episode_reference_time, cc.episode_recorded_at, t, '0'::xid8
-        from unnest(candidates) cand
+        from (
+          select o.valid_from, o.valid_to, o.citations, true as opening from unnest(v_opening) o
+          union all
+          select k.valid_from, k.valid_to, k.citations, false from unnest(v_kept) k
+        ) cand
         join gnomon.version v
           on v.tenant_id = p_tenant_id and v.scope = v_scope and v.versioned_id = p_id
          and v.recorded_to = 'infinity'
          and v.valid_from = cand.valid_from and v.valid_to = cand.valid_to
         cross join lateral unnest(cand.citations) cc
-        where v.id = any(opened) or cc.fresh
+        where cand.opening or cc.fresh
         on conflict do nothing;
     else
       insert into gnomon.citation (
@@ -2474,13 +2556,17 @@ create function gnomon.merge_versions(
       )
         select p_tenant_id, v_scope, v.id, cc.episode_id, cc.property, cc.place,
                cc.episode_reference_time, cc.episode_recorded_at
-        from unnest(candidates) cand
+        from (
+          select o.valid_from, o.valid_to, o.citations, true as opening from unnest(v_opening) o
+          union all
+          select k.valid_from, k.valid_to, k.citations, false from unnest(v_kept) k
+        ) cand
         join gnomon.version v
           on v.tenant_id = p_tenant_id and v.scope = v_scope and v.versioned_id = p_id
          and v.recorded_to = 'infinity'
          and v.valid_from = cand.valid_from and v.valid_to = cand.valid_to
         cross join lateral unnest(cand.citations) cc
-        where v.id = any(opened) or cc.fresh
+        where cand.opening or cc.fresh
         on conflict do nothing;
       -- 7. Every Version the step opened cites an Episode, so Erase Episode,
       -- which starts from an Episode's Citations, finds it.
