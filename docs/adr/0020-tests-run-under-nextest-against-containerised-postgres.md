@@ -19,19 +19,24 @@ Lane 3 exists apart from lane 2 because the two test different things. The bare 
 
 ## What CI runs, and when
 
-GitHub Actions runs `.github/workflows/ci.yml` on each pull request and on demand (`workflow_dispatch`), never on a push to `main`. Three jobs run in parallel:
+GitHub Actions runs `.github/workflows/ci.yml` on each pull request and on demand (`workflow_dispatch`), never on a push to `main`. Four jobs run in parallel:
 
-| Job | Runs |
-|---|---|
-| `test-pg17` | `cargo nextest run --workspace`, which is lane 1 |
-| `test-supabase` | The same with `GNOMON_TEST_IMAGE=supabase`, which is lane 2 |
-| `lint` | `cargo fmt --all --check`, and `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| Job | Runs | Required |
+|---|---|---|
+| `test-pg17` | `cargo nextest run --workspace`, which is lane 1 | Yes |
+| `test-supabase` | The same with `GNOMON_TEST_IMAGE=supabase`, which is lane 2 | Yes |
+| `lint` | `cargo fmt --all --check`, `cargo deny check bans licenses sources`, and `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Yes |
+| `advisories` | `cargo deny check advisories` | No |
 
-A ruleset on `main` requires the three checks, accepted only from GitHub Actions, and requires the branch to be up to date, so the pull request run tests what lands on `main`. The repository admin role can bypass it, so the owner can still commit documents directly. No run caches the build or its dependencies. We accept that each new pull request builds from nothing, and that a direct commit to `main` runs no tests. The builds leave out debug information.
+A ruleset on `main` requires the three checks marked above, accepted only from GitHub Actions, and requires the branch to be up to date, so the pull request run tests what lands on `main`. The repository admin role can bypass it, so the owner can still commit documents directly. No run caches the build or its dependencies. We accept that each new pull request builds from nothing, and that a direct commit to `main` runs no tests. The builds leave out debug information.
 
-The workflow installs each tool with the action its maker publishes or its documentation names. The Rust toolchain has no such action: rustup is on the runner already and reads `rust-toolchain.toml`, so the workflow runs it. Supabase's `setup-cli` action caches the Bun runtime it runs on, and has no input to turn that off.
+`cargo deny` checks the dependencies, dev-dependencies included, against the rules in `deny.toml`. gnomon is Apache-2.0 and ships its dependencies inside its artifacts, so only the permissive licences listed there pass, and any other needs an exception that names one crate and gives the reason. crates.io is the only source. `ring`, `openssl-sys` and `native-tls` are banned (ADR-0021). A crate in two versions warns. Bans, licences and sources depend only on `Cargo.lock`, the crates it names and `deny.toml`, so the required `lint` job runs them with `--locked` and the result does not change between runs of one commit. Advisories depend on the RustSec database, which changes daily, so they stay out of the required checks.
 
-The repository is public, so the workflow token only reads the repository, the workflow uses no secret, it is triggered by `pull_request` and never `pull_request_target`, and every third-party action is pinned to a full commit SHA. Lanes 3 and 4 run on demand.
+`.github/workflows/advisories.yml` also runs the advisory check each week and through `workflow_dispatch`, so an advisory published while no pull request is open is still seen. When the check does not succeed, a second job opens an issue, or comments on the one it already opened. GitHub runs a schedule, and accepts `workflow_dispatch`, only for a workflow file on `main`.
+
+The workflows install each tool with the action its maker publishes or its documentation names. For `cargo deny` that is Embark's `cargo-deny-action`, whose commit pins the `cargo deny` version. The Rust toolchain has no such action: rustup is on the runner already and reads `rust-toolchain.toml`, so the workflow runs it. Supabase's `setup-cli` action caches the Bun runtime it runs on, and has no input to turn that off.
+
+The repository is public, so the workflow tokens only read the repository, no workflow uses a stored secret, pull request runs are triggered by `pull_request` and never `pull_request_target`, and every third-party action is pinned to a full commit SHA. The one token that can write belongs to the weekly workflow's report job: it writes issues, and that job runs no third-party action. Lanes 3 and 4 run on demand.
 
 Only the performance suite asserts a time budget, and CI does not run it, because it needs a quiet machine. CI builds it through Clippy's `--all-features`. The time limits in `.config/nextest.toml` stop a hung test and are not budgets.
 
