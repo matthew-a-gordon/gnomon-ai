@@ -151,7 +151,7 @@ fn as_of_reads_agree_with_an_oracle_over_the_contributions() {
 /// Writes the sequence to a new Node and compares the reads with the oracle.
 /// Returns the disagreements and the number of reads made.
 async fn check(store: &Store, tenant: TenantId, sequence: &[Vec<Write>]) -> (Vec<String>, usize) {
-    let caller = store.as_worker(tenant, Scope::new(SCOPE));
+    let caller = store.as_worker(tenant, Scope::new(SCOPE), None);
     let mut node: Option<NodeId> = None;
     let mut known_at = Vec::new();
     for tx in sequence {

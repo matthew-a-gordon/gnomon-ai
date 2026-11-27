@@ -386,7 +386,7 @@ async fn build(texts: usize, name: &str) {
             .await
             .unwrap();
         store
-            .as_worker(tenant, gnomon::Scope::new(SCOPE))
+            .as_worker(tenant, gnomon::Scope::new(SCOPE), None)
             .register_kind(&gnomon::NewKind {
                 tenant: Some(tenant),
                 name: "company".into(),
@@ -399,7 +399,7 @@ async fn build(texts: usize, name: &str) {
             .unwrap();
         // The Edges' Episode.
         store
-            .as_worker(tenant, gnomon::Scope::new(SCOPE))
+            .as_worker(tenant, gnomon::Scope::new(SCOPE), None)
             .record_episode(&gnomon::NewEpisode {
                 tenant: Some(tenant),
                 scope: gnomon::Scope::new(SCOPE),

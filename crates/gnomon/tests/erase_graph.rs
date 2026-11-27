@@ -451,7 +451,7 @@ async fn writes_to_what_an_erasure_erases_wait_for_it_and_writes_elsewhere_do_no
         let other = w.db.store().await;
         async move {
             other
-                .as_worker(tenant, Scope::new("billing"))
+                .as_worker(tenant, Scope::new("billing"), None)
                 .write_node(
                     tenant,
                     acme,
@@ -547,9 +547,10 @@ async fn an_episode_recorded_in_a_scope_while_its_erasure_waits_is_erased_on_the
         .await;
 
     // A write to Acme holds Acme's lock, so the Erasure waits there after it
-    // has locked billing's Episodes.
-    let mut client = w.db.login().await;
-    let holder = w.raw(&mut client).await;
+    // has locked billing's Episodes. The operator takes the lock a write
+    // would, because no caller may run the write path's helpers.
+    let mut client = w.db.admin().await;
+    let holder = client.transaction().await.unwrap();
     holder
         .query_typed(
             "select pg_advisory_xact_lock(gnomon.node_lock_key($1, $2))",
@@ -562,7 +563,7 @@ async fn an_episode_recorded_in_a_scope_while_its_erasure_waits_is_erased_on_the
         let other = w.db.store().await;
         async move {
             other
-                .as_worker(tenant, Scope::new("billing"))
+                .as_worker(tenant, Scope::new("billing"), None)
                 .erase_scope(tenant, &Scope::new("billing"))
                 .await
         }

@@ -26,3 +26,11 @@ An Episode is an immutable record of its own, not a Node. A Version, Summary, Co
   - gnomon offers no call for it and promises nothing about the bytes on disk, in WAL, in backups or on replicas.
   - Spec #1 asked for a vacuum call after Erasure. It was built and then dropped by the project owner's decision, because it kept a privileged role and code for a physical guarantee the library cannot give. A plain `VACUUM` leaves the bytes in free space and index pages, and skips pruning a page another process has pinned. A transaction that began before the Erasure committed keeps the tuples through `VACUUM FULL` too, and no call reaches WAL, backups or replicas.
 - Erasure is not exposed over MCP unless a deployment turns it on.
+
+## Amendment: who recorded an Episode (#81)
+
+- An Episode and the row that marks it retracted record who recorded them in `recorded_by`, the value of `gnomon.user_id()` at their insert. The reference function returns the `sub` claim, or null when the claim is missing or empty, and each deployment may replace it. A worker call carries the user it was given as `sub`, so a background job records Episodes for a person.
+- A null `recorded_by` is allowed, and gnomon does not refuse the write. No role but the schema's owner may insert the column, so no write call can pass a value.
+- Whoever can read the row can read `recorded_by`. Erasing the Episode removes both values, and an Erasure that rebuilds history leaves them as they were on the Episodes that survive.
+- A person's edit is an Episode of its own, so a Version, Summary or Community leads to who stated it through its Citations. A write that cites an older Episode shows who recorded that one.
+- gnomon does not record who ran an Erasure, registered a Kind, set a merge rule or made any other write. The application logs what it needs (ADR-0024).

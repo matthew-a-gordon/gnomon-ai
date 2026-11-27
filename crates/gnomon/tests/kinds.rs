@@ -1101,7 +1101,7 @@ async fn each_tenant_has_its_own_ontology_which_every_scope_of_the_tenant_shares
         in_billing.read_kind(a, "person").await.unwrap().is_some(),
         "another Scope of the Tenant reads the Kind"
     );
-    let worker = store.as_worker(a, gnomon::Scope::new("billing"));
+    let worker = store.as_worker(a, gnomon::Scope::new("billing"), None);
     assert!(
         worker.read_kind(a, "person").await.unwrap().is_some(),
         "a worker reads it"

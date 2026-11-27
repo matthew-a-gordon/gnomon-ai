@@ -121,9 +121,10 @@
 -- Where pgvector lives. pgvector is in `public` on most hosts and in
 -- `extensions` on Supabase. The functions that use it name its types,
 -- operators and functions without a schema, under the path this file sets
--- (see pgvector's names below), which each keeps. The functions run as the
--- caller, so 0001 grants the caller roles USAGE on that schema when they
--- lack it, and fails when the role that applies it cannot grant that.
+-- (see pgvector's names below), which each keeps. The read functions run as
+-- the caller and the store functions as `gnomon_writer`, so 0001 grants
+-- those roles USAGE on that schema when they lack it, and fails when the
+-- role that applies it cannot grant that.
 --
 -- The dimension. The vector columns are of type `vector` and the bit
 -- columns `bit varying`, untyped by width, and a check holds each to
@@ -211,8 +212,8 @@
 -- text, so the search index trigger, `gnomon.maintain_search_index`, writes
 -- them, as it writes the token rows (ADR-0009). It calls
 -- `gnomon.index_search_text`, which writes a Version's name rows with its
--- token rows. Callers hold SELECT
--- on the table and no insert or delete. A Version is closed by an update of
+-- token rows. Callers hold SELECT on the table and no write privilege, and
+-- the writer role updates only the bits, through `gnomon.store_name_embedding`. A Version is closed by an update of
 -- its Recorded-time end, which reaches its name rows through the foreign key
 -- `(tenant_id, scope, version_id, recorded_to)` with ON UPDATE CASCADE, as it
 -- reaches its quantized row. A Version deleted by the
@@ -386,10 +387,10 @@
 -- `gnomon.maintain_search_index`, also fires when a Summary or a Community is inserted and when its token rows are written or
 -- deleted, and writes those rows and their count changes as it writes a
 -- Version's. Callers hold SELECT on the token rows and no write privilege.
--- The embedding functions are invokers that check the call's Tenant and
--- Scope. Callers may insert an embedding row and nothing more, and a trigger
--- sets its bits and time columns from the stored row, whatever the caller
--- supplied. Closing a Summary or Community reaches its embedding row's
+-- The embedding functions run as `gnomon_writer` and check the call's
+-- Tenant and Scope. The writer role may insert an embedding row and nothing
+-- more, and a trigger sets its bits and time columns from the stored row,
+-- whatever the insert supplied. Closing a Summary or Community reaches its embedding row's
 -- Recorded-time end through the foreign key
 -- `(tenant_id, scope, ..., recorded_to)` with ON UPDATE CASCADE.
 --
@@ -428,7 +429,8 @@
 -- replaced Sentence's old embedding must not stay: vector Search would find
 -- the Version by a text it no longer has, and once the Version was embedded
 -- again no row would use the old full vector, so no Erasure would ever find
--- it (ADR-0003). Callers hold no DELETE on the embedding tables, so the
+-- it (ADR-0003). No caller and not the writer role holds DELETE on the
+-- embedding tables, so the
 -- search index trigger, the fourth definer (ADR-0009), also deletes them
 -- when a Sentence is stored. That is the Version's quantized row of a text it
 -- no longer has, and that text's full vector unless a quantized row or a name
@@ -932,8 +934,8 @@ create function gnomon.embedding_vector(p_embedding real[])
   end
   $fn$;
 
--- A quantized row as the Store derives it (see the header). It runs as the
--- caller, under RLS.
+-- A quantized row as the Store derives it (see the header). It runs as
+-- `gnomon_writer`, under RLS.
 create function gnomon.embedding_bit_derive() returns trigger
   language plpgsql security invoker set search_path from current
   as $fn$
@@ -987,7 +989,7 @@ create function gnomon.store_embedding(
   p_embedding real[]
 )
   returns void
-  language plpgsql volatile security invoker set search_path from current
+  language plpgsql volatile security definer set search_path from current
   as $fn$
   declare
     v_vector vector := gnomon.embedding_vector(p_embedding);
@@ -999,6 +1001,7 @@ create function gnomon.store_embedding(
       raise exception using errcode = 'GNW01',
         message = pg_catalog.format('Version %s is not visible to the caller', p_version_id);
     end if;
+    perform gnomon.check_scope_writable(v_scope);
     insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
       values (p_tenant_id, v_scope, p_text_hash, v_vector)
       on conflict (tenant_id, scope, text_hash) do nothing;
@@ -1296,7 +1299,7 @@ create function gnomon.store_name_embedding(
   p_embedding real[]
 )
   returns void
-  language plpgsql volatile security invoker set search_path from current
+  language plpgsql volatile security definer set search_path from current
   as $fn$
   declare
     v_vector vector := gnomon.embedding_vector(p_embedding);
@@ -1309,6 +1312,7 @@ create function gnomon.store_name_embedding(
       raise exception using errcode = 'GNW01',
         message = pg_catalog.format('Node %s is not visible to the caller', p_node_id);
     end if;
+    perform gnomon.check_scope_writable(v_scope);
     if not exists (select from gnomon.node_name n
                    where n.tenant_id = p_tenant_id and n.scope = v_scope
                      and n.text_hash = v_hash and n.node_id = p_node_id
@@ -1665,7 +1669,7 @@ create function gnomon.search_full_text_branch(
 
 -- An embedding row as the Store derives it: of a Summary or Community the
 -- caller can see in that Scope, with its bits and the row's time columns,
--- whatever the caller supplied. It runs as the caller, under RLS.
+-- whatever the insert supplied. It runs as `gnomon_writer`, under RLS.
 create function gnomon.derived_embedding_derive() returns trigger
   language plpgsql security invoker set search_path from current
   as $fn$
@@ -1749,7 +1753,7 @@ create function gnomon.store_summary_embedding(
   p_embedding real[]
 )
   returns void
-  language sql volatile security invoker set search_path = pg_catalog, pg_temp
+  language sql volatile security definer set search_path = pg_catalog, pg_temp
   as $fn$
     select gnomon.store_derived_embedding(p_tenant_id, 'summary', p_summary_id, p_embedding)
   $fn$;
@@ -1760,7 +1764,7 @@ create function gnomon.store_community_embedding(
   p_embedding real[]
 )
   returns void
-  language sql volatile security invoker set search_path = pg_catalog, pg_temp
+  language sql volatile security definer set search_path = pg_catalog, pg_temp
   as $fn$
     select gnomon.store_derived_embedding(p_tenant_id, 'community', p_community_id, p_embedding)
   $fn$;
@@ -2361,14 +2365,14 @@ create function gnomon.search(
   $$;
 
 -- Stores the Sentence of Edge Version `p_version_id`, replacing any stored
--- before. It runs as the caller, under RLS.
+-- before. It runs as `gnomon_writer`, under its policies (ADR-0009).
 create function gnomon.store_sentence(
   p_tenant_id uuid,
   p_version_id uuid,
   p_sentence text
 )
   returns void
-  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
+  language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_scope text;
@@ -2390,6 +2394,7 @@ create function gnomon.store_sentence(
           'a Sentence states what an Edge Version says, and %s is not an Edge Version the '
           'caller can see', p_version_id);
     end if;
+    perform gnomon.check_scope_writable(v_scope);
     insert into gnomon.sentence as s (tenant_id, scope, version_id, sentence)
       values (p_tenant_id, v_scope, p_version_id, p_sentence)
       on conflict (tenant_id, scope, version_id)

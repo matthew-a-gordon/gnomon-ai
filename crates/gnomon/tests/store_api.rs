@@ -208,7 +208,7 @@ async fn a_worker_records_an_episode_and_reads_it_back() {
     let db = TestDb::migrated().await;
     let store = store(&db).await;
     let t = tenant();
-    let worker = store.as_worker(t, Scope::new("ingest"));
+    let worker = store.as_worker(t, Scope::new("ingest"), None);
 
     let id = worker
         .record_episode(&episode(t, "ingest", "A nightly import."))
@@ -337,7 +337,7 @@ async fn a_worker_is_confined_to_its_tenant_and_scope() {
         .await
         .unwrap();
 
-    let worker = store.as_worker(t1, Scope::new("ingest"));
+    let worker = store.as_worker(t1, Scope::new("ingest"), None);
     assert_eq!(worker.read_episode(t1, other_scope).await.unwrap(), None);
     assert_mismatch(worker.read_episode(t2, other_tenant).await);
     assert_denied(
@@ -408,7 +408,7 @@ async fn no_call_carries_its_claims_into_the_next_call_on_the_same_connection() 
         assert_mismatch(store.as_user(Map::new()).read_episode(t1, id).await);
         assert_mismatch(
             store
-                .as_worker(t2, Scope::new("support"))
+                .as_worker(t2, Scope::new("support"), None)
                 .read_episode(t1, id)
                 .await,
         );
@@ -422,7 +422,7 @@ async fn no_call_carries_its_claims_into_the_next_call_on_the_same_connection() 
         );
         assert!(
             store
-                .as_worker(t1, Scope::new("support"))
+                .as_worker(t1, Scope::new("support"), None)
                 .read_episode(t1, id)
                 .await
                 .unwrap()
@@ -509,7 +509,7 @@ async fn every_call_sends_only_unnamed_statements_inside_one_transaction_that_se
             .record_episode(&episode(t, "billing", "Refused."))
             .await,
     );
-    let worker = store.as_worker(t, Scope::new("support"));
+    let worker = store.as_worker(t, Scope::new("support"), None);
     worker.read_episode(t, id).await.unwrap();
     worker
         .record_episode(&episode(t, "support", "From the worker."))
@@ -614,7 +614,7 @@ async fn a_batch_as_of_read_of_many_nodes_and_a_traversal_are_each_one_call_what
     // The graph is written without the proxy: fifty Nodes, each joined to the
     // first by an Edge.
     let writer = store(&db).await;
-    let w = writer.as_worker(t, Scope::new(scope));
+    let w = writer.as_worker(t, Scope::new(scope), None);
     let ep = w
         .record_episode(&episode(t, scope, "Fifty Nodes."))
         .await
@@ -659,7 +659,7 @@ async fn a_batch_as_of_read_of_many_nodes_and_a_traversal_are_each_one_call_what
     let reader = Store::connect(&db.login_url_through(proxy), &options)
         .await
         .unwrap();
-    let r = reader.as_worker(t, Scope::new(scope));
+    let r = reader.as_worker(t, Scope::new(scope), None);
     let now = gnomon::AsOf::current(Utc::now());
     let one = r.read_nodes(t, &nodes[..1], now).await.unwrap();
     let all = r.read_nodes(t, &nodes, now).await.unwrap();

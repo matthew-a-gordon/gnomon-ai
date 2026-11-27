@@ -48,7 +48,7 @@ impl World {
     }
 
     fn caller(&self) -> gnomon::Caller<'_> {
-        self.store.as_worker(self.tenant, Scope::new(SCOPE))
+        self.store.as_worker(self.tenant, Scope::new(SCOPE), None)
     }
 
     /// Records an Episode with a Reference time.
@@ -631,7 +631,7 @@ async fn a_write_must_cite_an_episode_the_caller_can_see_in_the_nodes_scope() {
         .await;
     let other_scope = w
         .store
-        .as_worker(w.tenant, Scope::new("billing"))
+        .as_worker(w.tenant, Scope::new("billing"), None)
         .record_episode(&NewEpisode {
             tenant: Some(w.tenant),
             scope: Scope::new("billing"),
@@ -929,7 +929,7 @@ async fn concurrent_writes_to_one_node_all_land_in_recorded_order() {
     let writes = stores.iter().enumerate().map(|(i, store)| {
         let w = &w;
         async move {
-            let caller = store.as_worker(w.tenant, Scope::new(SCOPE));
+            let caller = store.as_worker(w.tenant, Scope::new(SCOPE), None);
             let mut out = Vec::new();
             for j in 0..5 {
                 let ep = w.episode(day(2)).await;

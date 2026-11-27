@@ -72,7 +72,7 @@ async fn world() -> World {
         let scope = scope.to_owned();
         async move {
             let EpisodeId(id) = store
-                .as_worker(TenantId(t), Scope::new(scope.clone()))
+                .as_worker(TenantId(t), Scope::new(scope.clone()), None)
                 .record_episode(&NewEpisode {
                     tenant: Some(TenantId(t)),
                     scope: Scope::new(scope.clone()),
@@ -161,29 +161,6 @@ async fn a_caller_cannot_read_another_tenant_or_scope_through_read_episode() {
 }
 
 #[tokio::test]
-async fn a_caller_cannot_insert_an_episode_into_another_tenant_or_scope() {
-    let w = world().await;
-    let attempts = [
-        (w.t2, "support", "another Tenant"),
-        (w.t1, "billing", "another Scope"),
-    ];
-    for role in [USER, WORKER] {
-        for (tenant, scope, what) in attempts {
-            let mut client = w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
-            let insert = tx
-                .query_typed(
-                    "insert into gnomon.episode (tenant_id, scope, id, content, reference_time)
-                     values ($1, $2, gen_random_uuid(), 'forged', now()) returning id",
-                    &[(&tenant, Type::UUID), (&scope, Type::TEXT)],
-                )
-                .await;
-            assert_refused(insert, &format!("{role} inserting into {what}"));
-        }
-    }
-}
-
-#[tokio::test]
 async fn a_caller_cannot_record_an_episode_into_another_tenant_or_scope_through_record_episode() {
     let w = world().await;
     let attempts = [
@@ -201,48 +178,6 @@ async fn a_caller_cannot_record_an_episode_into_another_tenant_or_scope_through_
             .await;
         assert_refused(call, &format!("record_episode into {what}"));
     }
-}
-
-#[tokio::test]
-async fn a_caller_cannot_update_or_delete_any_episode_even_its_own() {
-    let w = world().await;
-    let statements = [
-        (
-            "update gnomon.episode set content = 'rewritten' where id = $1",
-            "update",
-        ),
-        (
-            "update gnomon.episode set tenant_id = gen_random_uuid() where id = $1",
-            "move Tenant",
-        ),
-        (
-            "update gnomon.episode set scope = 'billing' where id = $1",
-            "move Scope",
-        ),
-        ("delete from gnomon.episode where id = $1", "delete"),
-    ];
-    for role in [USER, WORKER] {
-        for target in [w.t1_support, w.t2_support] {
-            for (sql, what) in statements {
-                let mut client = w.db.login().await;
-                let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
-                let r = tx.execute_typed(sql, &[(&target, Type::UUID)]).await;
-                assert_refused(r, &format!("{role} {what} of {target}"));
-            }
-        }
-    }
-
-    // Nothing changed.
-    let store = Store::connect(&w.db.login_url(), &support::connect_options())
-        .await
-        .unwrap();
-    let read = store
-        .as_worker(TenantId(w.t2), Scope::new("support"))
-        .read_episode(TenantId(w.t2), EpisodeId(w.t2_support))
-        .await
-        .unwrap()
-        .expect("Tenant two's Episode survives");
-    assert_eq!(read.content, format!("{} support", w.t2));
 }
 
 #[tokio::test]
@@ -466,6 +401,20 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
                 assert_eq!(check, Some(own_check), "gnomon.{name} the definer's CHECK");
                 continue;
             }
+            // The writer role writes only a Scope the caller may both read
+            // and write, and some of its policies add a condition (#81).
+            if roles == ["gnomon_writer"] {
+                let writable = "((tenant_id = gnomon.tenant_id()) AND \
+                                (scope = ANY (gnomon.allowed_scopes())) AND \
+                                (scope = ANY (gnomon.writable_scopes()))";
+                for e in [&using, &check].into_iter().flatten() {
+                    assert!(
+                        e.starts_with(writable),
+                        "gnomon.{name}: the writer's policy is {e}"
+                    );
+                }
+                continue;
+            }
             if let Some(using) = using {
                 assert_eq!(using, expected, "gnomon.{name} USING");
             }
@@ -489,8 +438,171 @@ const DEFINERS: &[&str] = &[
     "gnomon.erase_scope(",
 ];
 
+/// The functions a caller writes through, each a definer owned by
+/// `gnomon_writer` (#81).
+const WRITERS: &[&str] = &[
+    "gnomon.record_episode(uuid,text,text,timestamp with time zone,integer)",
+    "gnomon.create_node(uuid,text,text)",
+    "gnomon.create_edge(uuid,text,text,uuid,uuid)",
+    "gnomon.write_node(uuid,uuid,uuid,timestamp with time zone,text,timestamp with time zone,text,jsonb,jsonb)",
+    "gnomon.write_edge(uuid,uuid,uuid,timestamp with time zone,text,timestamp with time zone,text,jsonb,jsonb)",
+    "gnomon.correct_node(uuid,uuid,uuid,timestamp with time zone,text,timestamp with time zone,text,jsonb,jsonb)",
+    "gnomon.correct_edge(uuid,uuid,uuid,timestamp with time zone,text,timestamp with time zone,text,jsonb,jsonb)",
+    "gnomon.state_bound(uuid,uuid,uuid,uuid,text,timestamp with time zone,text)",
+    "gnomon.state_edge_bound(uuid,uuid,uuid,uuid,text,timestamp with time zone,text)",
+    "gnomon.end_validity(uuid,uuid,boolean,uuid,timestamp with time zone,text)",
+    "gnomon.retract_version(uuid,uuid,boolean,uuid,uuid)",
+    "gnomon.retract_episode(uuid,uuid)",
+    "gnomon.stage_pending(uuid,uuid,text)",
+    "gnomon.claim_stage(uuid,uuid,interval)",
+    "gnomon.finish_stage(uuid,uuid,text,integer,gnomon.stage_status,text,integer,interval)",
+    "gnomon.add_stage_usage(uuid,uuid,text,text,integer,bigint,bigint,numeric)",
+    "gnomon.write_summary(uuid,text,uuid,text,timestamp with time zone,uuid[],text[],text[])",
+    "gnomon.write_community(uuid,text,uuid[],uuid[],text,timestamp with time zone,uuid[],text[],text[])",
+    "gnomon.store_embedding(uuid,uuid,text,real[])",
+    "gnomon.store_name_embedding(uuid,uuid,text,real[])",
+    "gnomon.store_summary_embedding(uuid,uuid,real[])",
+    "gnomon.store_community_embedding(uuid,uuid,real[])",
+    "gnomon.store_sentence(uuid,uuid,text)",
+];
+
+/// The read functions and the helpers they call as the caller, which the
+/// caller roles execute besides [`WRITERS`] (#81). Kind registration, the
+/// merge-rule setter and Erasure are the deployment's to grant.
+const CALLER_READS: &[&str] = &[
+    "gnomon.allowed_scopes()",
+    "gnomon.call_tenant(uuid)",
+    "gnomon.default_tenant()",
+    "gnomon.embedding_dimension()",
+    "gnomon.embedding_vector(real[])",
+    "gnomon.is_symmetric_kind(text)",
+    "gnomon.kind_lineage(uuid,text)",
+    "gnomon.kind_merge_rule(uuid,text)",
+    "gnomon.list_citations(uuid,uuid)",
+    "gnomon.list_gaps(uuid,text,text,uuid,text,integer)",
+    "gnomon.list_statements(uuid,uuid)",
+    "gnomon.neighbourhood_edges(uuid,uuid[],timestamp with time zone,timestamp with time zone)",
+    "gnomon.period_end(timestamp with time zone,gnomon.time_precision)",
+    "gnomon.read_communities(uuid,uuid,timestamp with time zone,timestamp with time zone)",
+    "gnomon.read_edge(uuid,uuid,timestamp with time zone,timestamp with time zone)",
+    "gnomon.read_episode(uuid,uuid)",
+    "gnomon.read_kind(uuid,text)",
+    "gnomon.read_node(uuid,uuid,timestamp with time zone,timestamp with time zone)",
+    "gnomon.read_nodes(uuid,uuid[],timestamp with time zone,timestamp with time zone)",
+    "gnomon.read_stage_records(uuid,uuid)",
+    "gnomon.read_stage_usage(uuid,uuid)",
+    "gnomon.read_summaries(uuid,uuid,timestamp with time zone,timestamp with time zone)",
+    "gnomon.reserved_kinds()",
+    "gnomon.resolve(uuid,text,real[],timestamp with time zone,integer)",
+    "gnomon.resolve_full_text(uuid,text,timestamp with time zone,integer)",
+    "gnomon.resolve_vector(uuid,real[],timestamp with time zone,integer)",
+    "gnomon.root_kinds()",
+    "gnomon.search(uuid,text,real[],timestamp with time zone,timestamp with time zone,uuid[],integer,double precision,double precision,double precision,double precision,double precision,integer)",
+    "gnomon.search_connectedness(uuid,uuid[],uuid[],uuid[],timestamp with time zone,timestamp with time zone)",
+    "gnomon.search_full_text(uuid,text,timestamp with time zone,timestamp with time zone,integer)",
+    "gnomon.search_full_text_branch(uuid,text,timestamp with time zone,timestamp with time zone,integer)",
+    "gnomon.search_full_text_derived(uuid,text,timestamp with time zone,timestamp with time zone,integer)",
+    "gnomon.search_mentions(uuid,uuid[],text[],uuid[],text[],timestamp with time zone,timestamp with time zone)",
+    "gnomon.search_neighbourhood(uuid,uuid[],integer,timestamp with time zone,timestamp with time zone,integer)",
+    "gnomon.search_query_words(uuid,text)",
+    "gnomon.search_vector(uuid,real[],timestamp with time zone,timestamp with time zone,integer)",
+    "gnomon.search_vector_branch(uuid,real[],timestamp with time zone,timestamp with time zone,integer)",
+    "gnomon.search_vector_derived(uuid,real[],timestamp with time zone,timestamp with time zone,integer)",
+    "gnomon.sentence_text_hash(text)",
+    "gnomon.tenant_id()",
+    "gnomon.traverse(uuid,uuid,timestamp with time zone,timestamp with time zone,text,text[])",
+    "gnomon.uncertain_at(timestamp with time zone,timestamp with time zone,gnomon.time_precision)",
+];
+
+/// The writes no caller role may make on any gnomon table, or any column.
+const WRITE_PRIVILEGES: &[&str] = &["INSERT", "UPDATE", "DELETE", "TRUNCATE"];
+
+/// The table and column write privileges, and the functions, `role` holds
+/// in `client`'s database, directly or through a role it belongs to.
+async fn caller_rights(client: &Client, role: &str) -> (Vec<String>, Vec<String>) {
+    let writes: Vec<String> = client
+        .query_typed(
+            "select format('%s %s', c.oid::regclass, p)
+             from pg_class c, unnest($2::text[]) p
+             where c.relnamespace = 'gnomon'::regnamespace and c.relkind in ('r', 'p')
+               and (has_table_privilege($1, c.oid, p)
+                    or (p in ('INSERT', 'UPDATE') and has_any_column_privilege($1, c.oid, p)))
+             order by 1",
+            &[(&role, Type::TEXT), (&WRITE_PRIVILEGES, Type::TEXT_ARRAY)],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let mut functions: Vec<String> = client
+        .query_typed(
+            "select replace(p.oid::regprocedure::text, ', ', ',')
+             from pg_proc p
+             where p.pronamespace = 'gnomon'::regnamespace
+               and has_function_privilege($1, p.oid, 'EXECUTE')",
+            &[(&role, Type::TEXT)],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    functions.sort();
+    (writes, functions)
+}
+
 #[tokio::test]
-async fn every_gnomon_function_runs_as_the_invoker_with_a_search_path_ending_in_pg_temp_but_the_definers()
+async fn no_caller_role_holds_a_write_privilege_and_each_executes_only_the_store_functions() {
+    let mut expected: Vec<String> = WRITERS
+        .iter()
+        .chain(CALLER_READS)
+        .map(|f| f.to_string())
+        .collect();
+    expected.sort();
+    // Once as the files leave it, and once after the role that applies them
+    // granted callers everything on every object it creates.
+    let plain = TestDb::migrated().await;
+    let granting = TestDb::empty_with_login().await;
+    let operator = granting.operator().await;
+    for objects in ["tables", "sequences", "functions", "schemas"] {
+        operator
+            .batch_execute(&format!(
+                "alter default privileges grant all on {objects} to authenticated, gnomon_worker"
+            ))
+            .await
+            .unwrap();
+    }
+    for (file, sql) in support::migration_files(support::DEFAULT_DIMENSION) {
+        operator
+            .batch_execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("apply {file}: {e:?}"));
+    }
+    for db in [&plain, &granting] {
+        let admin = db.admin().await;
+        for role in [USER, WORKER, support::LOGIN_ROLE] {
+            let (writes, functions) = caller_rights(&admin, role).await;
+            assert!(writes.is_empty(), "{role} may write: {writes:#?}");
+            if role == support::LOGIN_ROLE {
+                // NOINHERIT: it reaches the caller roles' rights only by
+                // switching to one.
+                assert!(functions.is_empty(), "{role} executes {functions:#?}");
+                continue;
+            }
+            let extra: Vec<_> = functions.iter().filter(|f| !expected.contains(f)).collect();
+            let missing: Vec<_> = expected.iter().filter(|f| !functions.contains(f)).collect();
+            assert!(
+                extra.is_empty() && missing.is_empty(),
+                "{role} executes functions beyond the Store's: {extra:#?}\n\
+                 and lacks: {missing:#?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_gnomon_function_runs_as_the_invoker_with_a_search_path_ending_in_pg_temp_but_the_definers_and_writers()
  {
     let w = world().await;
     let client = w.db.login().await;
@@ -543,10 +655,21 @@ async fn every_gnomon_function_runs_as_the_invoker_with_a_search_path_ending_in_
     for f in &functions {
         let (name, definer, config, owner): (String, bool, Vec<String>, String) =
             (f.get(0), f.get(1), f.get(2), f.get(3));
-        let allowed = DEFINERS.iter().any(|d| name.starts_with(d));
-        assert_eq!(definer, allowed, "{name}: SECURITY DEFINER is {definer}");
-        if definer {
-            assert_eq!(owner, "gnomon_definer", "{name} is owned by {owner}");
+        let compact = name.replace(", ", ",");
+        let owned_by = if DEFINERS.iter().any(|d| name.starts_with(d)) {
+            Some("gnomon_definer")
+        } else if WRITERS.contains(&compact.as_str()) {
+            Some("gnomon_writer")
+        } else {
+            None
+        };
+        assert_eq!(
+            definer,
+            owned_by.is_some(),
+            "{name}: SECURITY DEFINER is {definer}"
+        );
+        if let Some(role) = owned_by {
+            assert_eq!(owner, role, "{name} is owned by {owner}");
         }
         // With an empty path, Postgres still searches the temporary schema
         // first for tables and types, so every path lists it, last.
@@ -575,30 +698,50 @@ async fn every_gnomon_function_runs_as_the_invoker_with_a_search_path_ending_in_
 async fn the_definer_role_cannot_log_in_or_bypass_rls_and_no_role_belongs_to_it_or_it_to_one() {
     let w = world().await;
     let client = w.db.login().await;
-    // A migrating role acts as the definer role for one step, under the
+    // A migrating role acts as each definer role for one step, under the
     // server's lock when a test applies the files (tests/install.rs).
     let _lock = support::Server::get().await.lock();
-    let row = client
-        .query_typed(
-            "select rolcanlogin, rolsuper or rolbypassrls,
-                    exists (select from pg_auth_members m where m.member = r.oid),
-                    array(select m.member::regrole::text from pg_auth_members m
-                          where m.roleid = r.oid and (m.set_option or m.inherit_option))
-             from pg_roles r where rolname = 'gnomon_definer'",
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(row.len(), 1, "the definer role exists");
-    let (login, bypass, member): (bool, bool, bool) = (row[0].get(0), row[0].get(1), row[0].get(2));
-    assert!(!login, "gnomon_definer can log in");
-    assert!(!bypass, "gnomon_definer can bypass RLS");
-    assert!(!member, "gnomon_definer inherits another role's privileges");
-    // The migration role may act as the definer role only while it hands it
-    // the function. A CREATEROLE role keeps ADMIN on a role it created, which
-    // lets it grant the role but not act as it.
-    let members: Vec<String> = row[0].get(3);
-    assert!(members.is_empty(), "{members:?} can act as gnomon_definer");
+    // `gnomon_definer` owns Erasure, Kind registration, the merge-rule
+    // setter and the search index trigger, and `gnomon_writer` every
+    // function a caller writes through (ADR-0009, #81).
+    for role in ["gnomon_definer", "gnomon_writer"] {
+        let row = client
+            .query_typed(
+                "select rolcanlogin, rolinherit, rolsuper or rolbypassrls,
+                        exists (select from pg_auth_members m where m.member = r.oid),
+                        array(select m.member::regrole::text from pg_auth_members m
+                              where m.roleid = r.oid and (m.set_option or m.inherit_option)),
+                        array(select m.member::regrole::text from pg_auth_members m
+                              where m.roleid = r.oid),
+                        array(select c.oid::regclass::text from pg_class c where c.relowner = r.oid)
+                 from pg_roles r where rolname = $1",
+                &[(&role, Type::TEXT)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.len(), 1, "the role {role} exists");
+        let (login, inherit, bypass, member): (bool, bool, bool, bool) =
+            (row[0].get(0), row[0].get(1), row[0].get(2), row[0].get(3));
+        assert!(!login, "{role} can log in");
+        assert!(!inherit, "{role} inherits");
+        assert!(!bypass, "{role} can bypass RLS");
+        assert!(!member, "{role} is a member of another role");
+        // The migration role may act as the role only while it hands it the
+        // functions. A CREATEROLE role keeps ADMIN on a role it created, which
+        // lets it grant the role but not act as it.
+        let members: Vec<String> = row[0].get(4);
+        assert!(members.is_empty(), "{members:?} can act as {role}");
+        let all_members: Vec<String> = row[0].get(5);
+        for caller in [USER, WORKER, support::LOGIN_ROLE] {
+            assert!(
+                !all_members.iter().any(|m| m == caller),
+                "{caller} is a member of {role}"
+            );
+        }
+        // Row-level security applies to a role that owns no table.
+        let owned: Vec<String> = row[0].get(6);
+        assert!(owned.is_empty(), "{role} owns {owned:?}");
+    }
 }
 
 #[tokio::test]
@@ -723,62 +866,6 @@ async fn a_caller_with_the_grant_cannot_register_a_kind_in_another_tenant_or_wit
 }
 
 #[tokio::test]
-async fn a_caller_cannot_write_the_kind_tables_directly_even_with_the_grant() {
-    let w = world().await;
-    w.db.grant_kind_registration(USER).await;
-    w.db.grant_kind_registration(WORKER).await;
-    {
-        let mut client = w.db.login().await;
-        let tx = as_caller(&mut client, USER, &claims(w.t1, &["support"])).await;
-        tx.query_typed(REGISTER_PERSON, &[(&w.t1, Type::UUID)])
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-    }
-    let statements = [
-        (
-            "insert into gnomon.kind (tenant_id, name, kind_of, parent, ancestors, properties, search, definition)
-             values ($1, 'forged', 'node', 'node', '{node}', '{}', '{}', '{}')",
-            "insert a Kind",
-        ),
-        (
-            "insert into gnomon.kind_rule (tenant_id, kind, property, rule) values ($1, 'person', 'age', '1 == 1')",
-            "insert a rule",
-        ),
-        (
-            "update gnomon.kind_rule set rule = '1 == 1' where tenant_id = $1",
-            "weaken a rule",
-        ),
-        (
-            "update gnomon.kind set search = '{}' where tenant_id = $1",
-            "rewrite a Kind",
-        ),
-        ("delete from gnomon.kind_rule where tenant_id = $1", "delete a rule"),
-        ("delete from gnomon.kind where tenant_id = $1", "delete a Kind"),
-    ];
-    for role in [USER, WORKER] {
-        for (sql, what) in statements {
-            let mut client = w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
-            let r = tx.execute_typed(sql, &[(&w.t1, Type::UUID)]).await;
-            assert_refused(r, &format!("{role}: {what}"));
-        }
-    }
-    let rule: String = w
-        .db
-        .admin()
-        .await
-        .query_typed(
-            "select rule::text from gnomon.kind_rule where tenant_id = $1 and kind = 'person' and property = 'role'",
-            &[(&w.t1, Type::UUID)],
-        )
-        .await
-        .unwrap()[0]
-        .get(0);
-    assert!(rule.contains("\"string\""), "the rule changed: {rule}");
-}
-
-#[tokio::test]
 async fn a_caller_cannot_read_another_tenants_kinds() {
     let w = world().await;
     w.db.grant_kind_registration(USER).await;
@@ -888,14 +975,15 @@ const SHADOWED_TYPES: &[&str] = &[
 ];
 
 #[tokio::test]
-async fn temporary_types_named_like_built_in_types_run_nothing_of_the_callers_as_the_definer() {
+async fn temporary_types_named_like_built_in_types_run_nothing_of_the_callers_as_a_definer_role() {
     // With `search_path = ''`, Postgres still searches the temporary schema
     // first for tables and types. A caller creates a domain named like each
     // built-in type, whose check records the role it runs as, then calls
     // every group of definer functions: Kind registration, the merge-rule
-    // setter, a write that fires the search index trigger, and an Erasure.
-    // A function that resolved one of those names to the caller's domain
-    // would run the caller's check as `gnomon_definer`.
+    // setter, a write that fires the search index trigger, and an Erasure,
+    // and the write functions, which run as `gnomon_writer` (#81). A
+    // function that resolved one of those names to the caller's domain would
+    // run the caller's check as `gnomon_definer` or `gnomon_writer`.
     let w = world().await;
     w.db.grant_kind_registration(USER).await;
     w.db.grant_erasure(USER).await;
@@ -962,6 +1050,23 @@ async fn temporary_types_named_like_built_in_types_run_nothing_of_the_callers_as
         .get(0);
     assert!(indexed > 0, "the write wrote no token rows");
     tx.query_typed(
+        "select gnomon.record_episode($1, 'support', 'another Episode', now(), 1)",
+        &[(&w.t1, Type::UUID)],
+    )
+    .await
+    .expect("recording an Episode");
+    tx.query_typed(
+        "select gnomon.write_summary($1, 'support', $2, 'Ada, an engineer.', now(), $3,
+           null, null)",
+        &[
+            (&w.t1, Type::UUID),
+            (&node, Type::UUID),
+            (&vec![w.t1_support], Type::UUID_ARRAY),
+        ],
+    )
+    .await
+    .expect("a Summary");
+    tx.query_typed(
         ERASE_EPISODE,
         &[(&w.t1, Type::UUID), (&w.t1_billing, Type::UUID)],
     )
@@ -969,14 +1074,13 @@ async fn temporary_types_named_like_built_in_types_run_nothing_of_the_callers_as
     .expect("an Erasure");
 
     let ran_as = recorded_roles(&tx).await;
-    let as_definer = ran_as
-        .split_whitespace()
-        .filter(|r| *r == "gnomon_definer")
-        .count();
-    assert_eq!(
-        as_definer, 0,
-        "the caller's domain check ran {as_definer} times as gnomon_definer"
-    );
+    for definer in ["gnomon_definer", "gnomon_writer"] {
+        let times = ran_as.split_whitespace().filter(|r| *r == definer).count();
+        assert_eq!(
+            times, 0,
+            "the caller's domain check ran {times} times as {definer}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1026,7 +1130,7 @@ async fn nodes() -> Nodes {
         .unwrap();
     let mut made = Vec::new();
     for (t, ep) in [(w.t1, w.t1_support), (w.t2, w.t2_support)] {
-        let caller = store.as_worker(TenantId(t), Scope::new("support"));
+        let caller = store.as_worker(TenantId(t), Scope::new("support"), None);
         let patch = |n: &str| {
             gnomon::Patch::new(
                 EpisodeId(ep),
@@ -1102,329 +1206,271 @@ async fn version_rows(db: &TestDb, node: Uuid) -> (i64, i64) {
     (row[0].get(0), row[0].get(1))
 }
 
-#[tokio::test]
-async fn a_caller_cannot_delete_a_committed_version_or_citation() {
-    let n = nodes().await;
-    let before = version_rows(&n.w.db, n.n1).await;
-    let statements = [
-        (
-            "delete from gnomon.version where id = $1",
-            n.open,
-            "the open Version",
-        ),
-        (
-            "delete from gnomon.version where id = $1",
-            n.closed,
-            "a closed Version",
-        ),
-        (
-            "delete from gnomon.citation where version_id = $1",
-            n.open,
-            "the open Version's Citations",
-        ),
-        (
-            "delete from gnomon.citation where version_id = $1",
-            n.closed,
-            "a closed Version's Citations",
-        ),
-        (
-            "delete from gnomon.version where node_id = $1",
-            n.n1,
-            "every Version of the Node",
-        ),
-    ];
-    for role in [USER, WORKER] {
-        for (sql, target, what) in statements {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-            let r = tx.execute_typed(sql, &[(&target, Type::UUID)]).await;
-            assert_refused(r, &format!("{role} deleting {what}"));
-        }
+/// Opens a transaction as `gnomon_writer` with `claims`, as a write
+/// function runs. No caller may do this: the superuser does it for the test.
+async fn as_writer<'c>(client: &'c mut Client, claims: &str) -> Transaction<'c> {
+    let tx = client.transaction().await.unwrap();
+    tx.batch_execute("set local role gnomon_writer")
+        .await
+        .unwrap();
+    tx.query_typed(
+        "select set_config('request.jwt.claims', $1, true)",
+        &[(&claims, Type::TEXT)],
+    )
+    .await
+    .unwrap();
+    tx
+}
+
+/// Every row of the tables a write may delete from or update, past RLS.
+async fn history_rows(db: &TestDb) -> Vec<String> {
+    let admin = db.admin().await;
+    let mut rows = Vec::new();
+    for table in [
+        "version",
+        "citation",
+        "summary",
+        "summary_citation",
+        "community",
+        "community_member",
+        "community_citation",
+    ] {
+        rows.extend(
+            admin
+                .query_typed(
+                    &format!("select t::text from gnomon.{table} t order by 1"),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| format!("{table}: {}", r.get::<_, String>(0))),
+        );
     }
-    assert_eq!(
-        version_rows(&n.w.db, n.n1).await,
-        before,
-        "nothing was deleted"
-    );
+    rows
 }
 
 #[tokio::test]
-async fn a_caller_may_delete_only_the_versions_and_citations_its_own_transaction_wrote() {
+async fn as_the_writer_role_deleting_or_rewriting_committed_history_changes_nothing() {
+    // The write functions run as `gnomon_writer` (#81). Its policies let it
+    // delete only the rows its own transaction wrote, and change a
+    // committed row only by closing it at the start of the current
+    // transaction. Its grants let it update only the Recorded-time end.
     let n = nodes().await;
-    let before = version_rows(&n.w.db, n.n1).await;
-    for role in [USER, WORKER] {
-        let mut client = n.w.db.login().await;
-        let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-        write_node(
-            &tx,
-            n.w.t1,
-            n.n1,
-            Some(n.w.t1_support),
-            json!({ "name": "third" }),
+    let store = Store::connect(&n.w.db.login_url(), &support::connect_options())
+        .await
+        .unwrap();
+    let caller = store.as_worker(TenantId(n.w.t1), Scope::new("support"), None);
+    let cites = vec![gnomon::DerivedCitation::of(EpisodeId(n.w.t1_support))];
+    let gnomon::SummaryId(summary) = caller
+        .write_summary(
+            TenantId(n.w.t1),
+            &gnomon::NewSummary {
+                scope: Scope::new("support"),
+                node: gnomon::NodeId(n.n1),
+                content: "a Summary".into(),
+                as_of_valid: Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap(),
+                citations: cites.clone(),
+            },
         )
         .await
         .unwrap();
-        let fresh: Uuid = tx
-            .query_typed(
-                "select id from gnomon.version where node_id = $1 and recorded_to = 'infinity'",
-                &[(&n.n1, Type::UUID)],
-            )
-            .await
-            .unwrap()[0]
-            .get(0);
-        let cites = tx
-            .execute_typed(
-                "delete from gnomon.citation where version_id = $1",
-                &[(&fresh, Type::UUID)],
-            )
-            .await
-            .expect("deleting the transaction's own Citations");
-        assert_eq!(cites, 1);
-        let versions = tx
-            .execute_typed(
-                "delete from gnomon.version where id = $1",
-                &[(&fresh, Type::UUID)],
-            )
-            .await
-            .expect("deleting the transaction's own Version");
-        assert_eq!(versions, 1);
-        // The committed Versions stay out of reach in the same transaction.
-        let r = tx
-            .execute_typed(
-                "delete from gnomon.version where id = $1",
-                &[(&n.open, Type::UUID)],
-            )
-            .await;
-        assert_refused(
-            r,
-            &format!("{role} deleting a committed Version after its own"),
-        );
-    }
-    assert_eq!(version_rows(&n.w.db, n.n1).await, before);
-}
+    let gnomon::CommunityId(community) = caller
+        .write_community(
+            TenantId(n.w.t1),
+            &gnomon::NewCommunity {
+                scope: Scope::new("support"),
+                replaces: vec![],
+                members: vec![gnomon::NodeId(n.n1)],
+                content: "a Community".into(),
+                as_of_valid: Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap(),
+                citations: cites,
+            },
+        )
+        .await
+        .unwrap();
+    let before = history_rows(&n.w.db).await;
+    let claims = claims(n.w.t1, &["support"]);
 
-#[tokio::test]
-async fn a_caller_cannot_rewrite_the_history_of_a_version() {
-    let n = nodes().await;
-    let statements = [
+    // Statements that reach no row: deletes of committed rows, and updates
+    // of a row that is already closed.
+    let none = [
+        ("delete from gnomon.version where node_id = $1", n.n1),
+        ("delete from gnomon.citation where version_id = $1", n.open),
         (
-            "update gnomon.version set recorded_to = now() where id = $1",
+            "delete from gnomon.citation where version_id = $1",
             n.closed,
-            "move a closed end to now",
+        ),
+        ("delete from gnomon.summary where id = $1", summary),
+        (
+            "delete from gnomon.summary_citation where summary_id = $1",
+            summary,
+        ),
+        ("delete from gnomon.community where id = $1", community),
+        (
+            "delete from gnomon.community_member where community_id = $1",
+            community,
+        ),
+        (
+            "delete from gnomon.community_citation where community_id = $1",
+            community,
         ),
         (
             "update gnomon.version set recorded_to = 'infinity' where id = $1",
             n.closed,
-            "reopen a closed Version",
         ),
         (
-            "update gnomon.version set recorded_to = recorded_to + interval '1 second' where id = $1",
+            "update gnomon.version set recorded_to = transaction_timestamp() where id = $1",
             n.closed,
-            "move a closed end later",
         ),
+    ];
+    // Statements the policy's check or the grants refuse.
+    let refused = [
         (
             "update gnomon.version set recorded_to = now() - interval '1 second' where id = $1",
             n.open,
-            "close an open Version in the past",
         ),
         (
             "update gnomon.version set recorded_to = now() + interval '1 day' where id = $1",
             n.open,
-            "close an open Version in the future",
         ),
         (
             "update gnomon.version set props = '{\"name\": \"forged\"}' where id = $1",
             n.open,
-            "rewrite the values",
         ),
         (
             "update gnomon.version set recorded_from = '2000-01-01' where id = $1",
             n.open,
-            "move the start of Recorded time",
-        ),
-        (
-            "update gnomon.version set valid_from = '2000-01-01' where id = $1",
-            n.open,
-            "move Valid time",
         ),
         (
             "update gnomon.version set closed_in = null where id = $1",
             n.closed,
-            "clear the closing mark",
+        ),
+        (
+            "update gnomon.summary set recorded_to = now() - interval '1 second' where id = $1",
+            summary,
+        ),
+        (
+            "update gnomon.summary set content = 'forged' where id = $1",
+            summary,
+        ),
+        (
+            "update gnomon.community set recorded_to = now() + interval '1 day' where id = $1",
+            community,
         ),
         (
             "update gnomon.contribution set value = '\"forged\"' where node_id = $1",
             n.n1,
-            "rewrite a Contribution",
         ),
-        (
-            "delete from gnomon.contribution where node_id = $1",
-            n.n1,
-            "delete a Contribution",
-        ),
+        ("delete from gnomon.contribution where node_id = $1", n.n1),
         (
             "update gnomon.citation set place = 'forged' where version_id = $1",
             n.open,
-            "rewrite a Citation",
         ),
-        (
-            "update gnomon.node set kind = 'other' where id = $1",
-            n.n1,
-            "change a Node's Kind",
-        ),
-        (
-            "delete from gnomon.node where id = $1",
-            n.n1,
-            "delete a Node",
-        ),
+        ("delete from gnomon.node where id = $1", n.n1),
+        ("delete from gnomon.episode where tenant_id = $1", n.w.t1),
+        ("truncate gnomon.version cascade", n.n1),
     ];
-    for role in [USER, WORKER] {
-        for (sql, target, what) in statements {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-            let r = tx.execute_typed(sql, &[(&target, Type::UUID)]).await;
-            assert_refused(r, &format!("{role}: {what}"));
+    for (sql, target) in none {
+        let mut client = n.w.db.admin().await;
+        let tx = as_writer(&mut client, &claims).await;
+        let params: &[(&(dyn tokio_postgres::types::ToSql + Sync), Type)] =
+            &[(&target, Type::UUID)];
+        let changed = tx.execute_typed(sql, params).await.unwrap();
+        assert_eq!(changed, 0, "{sql} changed {changed} rows");
+        tx.commit().await.unwrap();
+    }
+    for (sql, target) in refused {
+        let mut client = n.w.db.admin().await;
+        let tx = as_writer(&mut client, &claims).await;
+        let r = if sql.starts_with("truncate") {
+            tx.batch_execute(sql).await.map(|()| 0)
+        } else {
+            tx.execute_typed(sql, &[(&target, Type::UUID)]).await
+        };
+        match r {
+            Err(e) => assert!(
+                e.code() == Some(&SqlState::INSUFFICIENT_PRIVILEGE)
+                    || e.code() == Some(&SqlState::CHECK_VIOLATION),
+                "{sql}: {e:?}"
+            ),
+            Ok(changed) => panic!("{sql} was allowed and changed {changed} rows"),
         }
     }
+    assert_eq!(history_rows(&n.w.db).await, before);
 
-    // Closing an open Version when the transaction started is the one change a
-    // caller may make, and it may not then rewrite what it just closed.
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
+    // In its own transaction the writer closes the open Version, and deletes
+    // the Version and Citations its own write made, as the write path does.
+    let mut client = n.w.db.admin().await;
+    let tx = as_writer(&mut client, &claims).await;
     let closed = tx
         .execute_typed(
             "update gnomon.version set recorded_to = transaction_timestamp() where id = $1",
             &[(&n.open, Type::UUID)],
         )
         .await
-        .expect("closing an open Version when its transaction started");
+        .unwrap();
     assert_eq!(closed, 1);
-    let r = tx
-        .execute_typed(
-            "update gnomon.version set recorded_to = now() + interval '1 day' where id = $1",
+    let closed_in: bool = tx
+        .query_typed(
+            "select closed_in = pg_current_xact_id() from gnomon.version where id = $1",
             &[(&n.open, Type::UUID)],
         )
-        .await;
-    assert_refused(r, "moving the end it just closed");
-}
-
-#[tokio::test]
-async fn a_caller_cannot_forge_the_mark_that_makes_a_committed_row_look_new() {
-    let n = nodes().await;
-    let before = version_rows(&n.w.db, n.n1).await;
-    let statements = [
-        (
-            "update gnomon.version set written_in = pg_current_xact_id() where id = $1",
-            "mark a committed Version as written now",
-        ),
-        (
-            "update gnomon.citation set written_in = pg_current_xact_id() where version_id = $1",
-            "mark a committed Citation as written now",
-        ),
-        (
-            "update gnomon.version set closed_in = pg_current_xact_id() where id = $1",
-            "mark a committed Version as closed now",
-        ),
-    ];
-    for role in [USER, WORKER] {
-        for (sql, what) in statements {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-            let r = tx.execute_typed(sql, &[(&n.open, Type::UUID)]).await;
-            assert_refused(r, &format!("{role}: {what}"));
-        }
-        // Nor can a row be inserted with a mark of the caller's choosing.
-        for (sql, what) in [
-            (
-                "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
-                   valid_from_precision, valid_to, valid_to_precision, merge_rule, written_in)
-                 values ($1, 'support', $2, '{}', '2030-01-01', 'instant', '2030-01-02', 'instant',
-                   'recency', pg_current_xact_id())",
-                "insert a Version with a mark",
-            ),
-            (
-                "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
-                   valid_from_precision, valid_to, valid_to_precision, merge_rule, written_in)
-                 values ($1, 'support', $2, '{}', '2030-01-01', 'instant', '2030-01-02', 'instant',
-                   'recency', '1')",
-                "insert a Version with an old mark",
-            ),
-        ] {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-            let r = tx
-                .execute_typed(sql, &[(&n.w.t1, Type::UUID), (&n.n1, Type::UUID)])
-                .await;
-            assert_refused(r, &format!("{role}: {what}"));
-        }
-    }
-    // And a committed Version is still out of reach of a delete.
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-    let r = tx
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert!(closed_in, "the closing transaction is recorded");
+    let reopened = tx
+        .execute_typed(
+            "update gnomon.version set recorded_to = 'infinity' where id = $1",
+            &[(&n.open, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened, 1, "a Version this transaction closed reopens");
+    write_node(
+        &tx,
+        n.w.t1,
+        n.n1,
+        Some(n.w.t1_support),
+        json!({ "name": "third" }),
+    )
+    .await
+    .unwrap();
+    let fresh: Uuid = tx
+        .query_typed(
+            "select id from gnomon.version where node_id = $1 and recorded_to = 'infinity'",
+            &[(&n.n1, Type::UUID)],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let deleted = tx
+        .execute_typed(
+            "delete from gnomon.citation where version_id = $1",
+            &[(&fresh, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1, "the transaction's own Citation");
+    let deleted = tx
+        .execute_typed(
+            "delete from gnomon.version where id = $1",
+            &[(&fresh, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1, "the transaction's own Version");
+    let deleted = tx
         .execute_typed(
             "delete from gnomon.version where id = $1",
             &[(&n.open, Type::UUID)],
         )
-        .await;
-    assert_refused(r, "deleting after the forgeries");
-    assert_eq!(version_rows(&n.w.db, n.n1).await, before);
-}
-
-#[tokio::test]
-async fn recorded_time_is_assigned_only_by_gnomon() {
-    let n = nodes().await;
-    let statements = [
-        (
-            "insert into gnomon.contribution (tenant_id, scope, node_id, episode_id, property, value,
-               valid_from, valid_from_precision, valid_to, valid_to_precision, recorded_at)
-             values ($1, 'support', $2, $3, 'name', '\"x\"', '-infinity', 'unknown', 'infinity',
-               'unknown', '2000-01-01')",
-            "a Contribution's Recorded time",
-        ),
-        (
-            "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
-               valid_from_precision, valid_to, valid_to_precision, merge_rule, recorded_from)
-             values ($1, 'support', $2, '{}', '2030-01-01', 'instant', '2030-01-02', 'instant',
-               'recency', '2000-01-01')",
-            "a Version's Recorded time",
-        ),
-        (
-            "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
-               valid_from_precision, valid_to, valid_to_precision, merge_rule, recorded_to)
-             values ($1, 'support', $2, '{}', '2030-01-01', 'instant', '2030-01-02', 'instant',
-               'recency', '2100-01-01')",
-            "a Version's Recorded-time end",
-        ),
-        (
-            "insert into gnomon.citation (tenant_id, scope, version_id, episode_id, property, recorded_at)
-             select $1, 'support', $2, $3, 'name', '2000-01-01'",
-            "a Citation's Recorded time",
-        ),
-    ];
-    for role in [USER, WORKER] {
-        for (sql, what) in statements {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-            let second = if what.starts_with("a Citation") {
-                n.open
-            } else {
-                n.n1
-            };
-            let params: Vec<(&(dyn tokio_postgres::types::ToSql + Sync), Type)> =
-                if sql.contains("$3") {
-                    vec![
-                        (&n.w.t1, Type::UUID),
-                        (&second, Type::UUID),
-                        (&n.w.t1_support, Type::UUID),
-                    ]
-                } else {
-                    vec![(&n.w.t1, Type::UUID), (&second, Type::UUID)]
-                };
-            let r = tx.execute_typed(sql, &params).await;
-            assert_refused(r, &format!("{role} choosing {what}"));
-        }
-    }
+        .await
+        .unwrap();
+    assert_eq!(deleted, 0, "a committed Version, after deleting its own");
+    drop(tx);
+    assert_eq!(history_rows(&n.w.db).await, before);
 }
 
 #[tokio::test]
@@ -1440,226 +1486,6 @@ async fn a_write_with_no_episode_fails() {
         err.as_db_error().unwrap().message(),
         "every write cites an Episode"
     );
-    drop(tx);
-
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-    let err = tx
-        .execute_typed(
-            "insert into gnomon.contribution (tenant_id, scope, node_id, episode_id, property, value,
-               valid_from, valid_from_precision, valid_to, valid_to_precision)
-             values ($1, 'support', $2, null, 'name', '\"x\"', '-infinity', 'unknown', 'infinity', 'unknown')",
-            &[(&n.w.t1, Type::UUID), (&n.n1, Type::UUID)],
-        )
-        .await
-        .expect_err("a Contribution with no Episode was inserted");
-    assert_eq!(err.code(), Some(&SqlState::NOT_NULL_VIOLATION));
-}
-
-#[tokio::test]
-async fn empty_intervals_are_refused_by_the_tables_as_well_as_the_write() {
-    let n = nodes().await;
-    let attempts = [
-        (
-            "insert into gnomon.contribution (tenant_id, scope, node_id, episode_id, property, value,
-               valid_from, valid_from_precision, valid_to, valid_to_precision,
-               episode_reference_time, episode_recorded_at)
-             select $1, 'support', $2, e.id, 'name', '\"x\"', '2030-01-01', 'instant', '2030-01-01',
-               'instant', e.reference_time, e.recorded_at
-             from gnomon.episode e where e.id = $3",
-            "an empty Contribution",
-        ),
-        (
-            "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
-               valid_from_precision, valid_to, valid_to_precision, merge_rule)
-             select $1, 'support', $2, '{}', '2030-01-01', 'instant', '2030-01-01', 'instant', 'recency'
-             where $3::uuid is not null",
-            "an empty Version",
-        ),
-    ];
-    for (sql, what) in attempts {
-        let mut client = n.w.db.login().await;
-        let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-        let err = tx
-            .execute_typed(
-                sql,
-                &[
-                    (&n.w.t1, Type::UUID),
-                    (&n.n1, Type::UUID),
-                    (&n.w.t1_support, Type::UUID),
-                ],
-            )
-            .await
-            .expect_err(what);
-        assert_eq!(
-            err.code(),
-            Some(&SqlState::CHECK_VIOLATION),
-            "{what}: {err:?}"
-        );
-    }
-    // And a Version may not be closed at its own start, which would leave
-    // its Recorded time empty.
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-    write_node(
-        &tx,
-        n.w.t1,
-        n.n1,
-        Some(n.w.t1_support),
-        json!({ "name": "third" }),
-    )
-    .await
-    .unwrap();
-    let r = tx
-        .execute_typed(
-            "update gnomon.version set recorded_to = transaction_timestamp()
-             where node_id = $1 and recorded_to = 'infinity'",
-            &[(&n.n1, Type::UUID)],
-        )
-        .await;
-    assert_refused(r, "closing a Version at its own start");
-}
-
-#[tokio::test]
-async fn a_node_cannot_hold_two_versions_at_once_even_when_inserted_directly() {
-    let n = nodes().await;
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-    let err = tx
-        .execute_typed(
-            "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
-               valid_from_precision, valid_to, valid_to_precision, merge_rule)
-             values ($1, 'support', $2, '{\"name\": \"overlap\"}', '2030-01-01', 'instant',
-               '2030-02-01', 'instant', 'recency')",
-            &[(&n.w.t1, Type::UUID), (&n.n1, Type::UUID)],
-        )
-        .await
-        .expect_err("an overlapping Version was inserted");
-    assert_eq!(err.code(), Some(&SqlState::EXCLUSION_VIOLATION), "{err:?}");
-    drop(tx);
-
-    // The same times on another Node, of this Tenant or another, are fine.
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-    let other: Uuid = tx
-        .query_typed(
-            "select gnomon.create_node($1, 'support', 'node')",
-            &[(&n.w.t1, Type::UUID)],
-        )
-        .await
-        .unwrap()[0]
-        .get(0);
-    write_node(
-        &tx,
-        n.w.t1,
-        other,
-        Some(n.w.t1_support),
-        json!({ "name": "other" }),
-    )
-    .await
-    .expect("the same Valid and Recorded time on another Node");
-}
-
-#[tokio::test]
-async fn a_caller_cannot_commit_a_version_that_no_episode_cites() {
-    // The caller closes the open Version of its own Node, as the update
-    // guard allows at the transaction's start, and inserts a Version of
-    // values no Episode states. Every statement succeeds and the commit is
-    // refused, so Erase Episode never meets a Version it cannot find.
-    let n = nodes().await;
-    let before = version_rows(&n.w.db, n.n1).await;
-    let close = "update gnomon.version set recorded_to = transaction_timestamp() where id = $1";
-    let insert = "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
-                    valid_from_precision, valid_to, valid_to_precision, merge_rule)
-                  values ($1, 'support', $2, '{\"name\": \"a person''s details\"}', '-infinity',
-                    'unknown', 'infinity', 'unknown', 'recency')
-                  returning id";
-    let cite = "insert into gnomon.citation (tenant_id, scope, version_id, episode_id, property,
-                  episode_reference_time, episode_recorded_at)
-                select $1, 'support', $2, e.id, 'name', e.reference_time, e.recorded_at
-                from gnomon.episode e where e.id = $3";
-    for role in [USER, WORKER] {
-        for how in [
-            "with no Citation",
-            "after deleting its Citation",
-            "after changing its claims",
-        ] {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-            let closed = tx
-                .execute_typed(close, &[(&n.open, Type::UUID)])
-                .await
-                .unwrap();
-            assert_eq!(closed, 1);
-            let version: Uuid = tx
-                .query_typed(insert, &[(&n.w.t1, Type::UUID), (&n.n1, Type::UUID)])
-                .await
-                .unwrap()[0]
-                .get(0);
-            match how {
-                "after deleting its Citation" => {
-                    tx.execute_typed(
-                        cite,
-                        &[
-                            (&n.w.t1, Type::UUID),
-                            (&version, Type::UUID),
-                            (&n.w.t1_support, Type::UUID),
-                        ],
-                    )
-                    .await
-                    .unwrap();
-                    let deleted = tx
-                        .execute_typed(
-                            "delete from gnomon.citation where version_id = $1",
-                            &[(&version, Type::UUID)],
-                        )
-                        .await
-                        .unwrap();
-                    assert_eq!(deleted, 1);
-                }
-                // Claims that no longer reach the Scope hide the Version from
-                // the check, and are refused rather than let through.
-                "after changing its claims" => {
-                    tx.query_typed(
-                        "select set_config('request.jwt.claims', $1, true)",
-                        &[(&claims(n.w.t1, &[]), Type::TEXT)],
-                    )
-                    .await
-                    .unwrap();
-                }
-                _ => {}
-            }
-            let err = tx
-                .commit()
-                .await
-                .expect_err(&format!("{role} committed a Version {how}"));
-            assert_eq!(
-                err.code().map(|c| c.code()),
-                Some(gnomon::INVALID_WRITE),
-                "{role} {how}: {err:?}"
-            );
-            assert_eq!(
-                err.as_db_error().unwrap().message(),
-                format!("Version {version} cites no Episode"),
-                "{role} {how}"
-            );
-        }
-    }
-    assert_eq!(version_rows(&n.w.db, n.n1).await, before);
-    let open: Vec<Uuid> =
-        n.w.db
-            .admin()
-            .await
-            .query_typed(
-                "select id from gnomon.version where node_id = $1 and recorded_to = 'infinity'",
-                &[(&n.n1, Type::UUID)],
-            )
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| r.get(0))
-            .collect();
-    assert_eq!(open, vec![n.open]);
 }
 
 #[tokio::test]
@@ -1674,7 +1500,7 @@ async fn the_write_patch_retract_and_erasure_paths_commit_versions_that_episodes
         .await
         .unwrap();
     let t = TenantId(n.w.t1);
-    let caller = store.as_worker(t, Scope::new("support"));
+    let caller = store.as_worker(t, Scope::new("support"), None);
     let mut episodes = Vec::new();
     for i in 0..4 {
         episodes.push(
@@ -1887,7 +1713,7 @@ async fn a_write_that_started_before_a_committed_write_to_the_node_fails_and_can
         .await
         .unwrap();
     store
-        .as_worker(TenantId(n.w.t1), Scope::new("support"))
+        .as_worker(TenantId(n.w.t1), Scope::new("support"), None)
         .write_node(
             TenantId(n.w.t1),
             gnomon::NodeId(n.n1),
@@ -1957,137 +1783,6 @@ async fn a_caller_cannot_redirect_the_write_through_its_search_path() {
     .await
     .expect_err("the write used the caller's shadow rule check");
     assert_eq!(err.code().map(|c| c.code()), Some(gnomon::INVALID_WRITE));
-}
-
-#[tokio::test]
-async fn a_caller_inserting_directly_cannot_skip_the_kinds_rules() {
-    let n = nodes().await;
-    n.w.db.grant_kind_registration(USER).await;
-    let person: Uuid = {
-        let mut client = n.w.db.login().await;
-        let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-        tx.query_typed(
-            "select gnomon.register_kind($1, 'person', 'node', null,
-               '{\"properties\": {\"age\": {\"type\": \"integer\"}}, \"required\": [\"age\"]}', '{}', null, null)",
-            &[(&n.w.t1, Type::UUID)],
-        )
-        .await
-        .unwrap();
-        let id = tx
-            .query_typed(
-                "select gnomon.create_node($1, 'support', 'person')",
-                &[(&n.w.t1, Type::UUID)],
-            )
-            .await
-            .unwrap()[0]
-            .get(0);
-        tx.commit().await.unwrap();
-        id
-    };
-    let contribution =
-        "insert into gnomon.contribution (tenant_id, scope, node_id, episode_id, property,
-           value, valid_from, valid_from_precision, valid_to, valid_to_precision)
-         values ($1, 'support', $2, $3, $4, $5, '-infinity', 'unknown', 'infinity', 'unknown')";
-    let version = "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
-           valid_from_precision, valid_to, valid_to_precision, merge_rule)
-         select $1, 'support', $2, $5, '2030-01-01', 'instant', '2030-01-02', 'instant', 'recency'
-         where $3::uuid is not null and $4::text is not null";
-    let attempts = [
-        (
-            contribution,
-            n.n1,
-            "age",
-            json!(1),
-            "Kind \"node\" has no property \"age\"",
-        ),
-        (
-            contribution,
-            n.n1,
-            "name",
-            json!(7),
-            "the value 7 of property \"name\" does not satisfy Kind \"node\"",
-        ),
-        (
-            contribution,
-            person,
-            "age",
-            json!("forty"),
-            "the value \"forty\" of property \"age\" does not satisfy Kind \"person\"",
-        ),
-        (
-            version,
-            n.n1,
-            "-",
-            json!({ "age": 1 }),
-            "Kind \"node\" has no property \"age\"",
-        ),
-        (
-            version,
-            person,
-            "-",
-            json!({ "age": 1.5 }),
-            "the value 1.5 of property \"age\" does not satisfy Kind \"person\"",
-        ),
-        (
-            version,
-            person,
-            "-",
-            json!({ "name": "Ada" }),
-            "the write leaves required property \"age\" of Kind \"person\" without a value over [2030-01-01 00:00:00+00, 2030-01-02 00:00:00+00)",
-        ),
-    ];
-    for role in [USER, WORKER] {
-        for (sql, node, property, value, message) in &attempts {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-            tx.batch_execute("set local timezone = 'UTC'")
-                .await
-                .unwrap();
-            let err = tx
-                .execute_typed(
-                    sql,
-                    &[
-                        (&n.w.t1, Type::UUID),
-                        (node, Type::UUID),
-                        (&n.w.t1_support, Type::UUID),
-                        (property, Type::TEXT),
-                        (value, Type::JSONB),
-                    ],
-                )
-                .await
-                .expect_err(message);
-            assert_eq!(
-                err.code().map(|c| c.code()),
-                Some(gnomon::INVALID_WRITE),
-                "{role}: {err:?}"
-            );
-            assert_eq!(err.as_db_error().unwrap().message(), *message, "{role}");
-        }
-    }
-}
-
-#[tokio::test]
-async fn a_caller_cannot_add_a_citation_to_closed_history() {
-    let n = nodes().await;
-    let before = version_rows(&n.w.db, n.n1).await;
-    let cite = "insert into gnomon.citation (tenant_id, scope, version_id, episode_id, property)
-                values ($1, 'support', $2, $3, 'name')";
-    for role in [USER, WORKER] {
-        let mut client = n.w.db.login().await;
-        let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-        let r = tx
-            .execute_typed(
-                cite,
-                &[
-                    (&n.w.t1, Type::UUID),
-                    (&n.closed, Type::UUID),
-                    (&n.w.t1_support, Type::UUID),
-                ],
-            )
-            .await;
-        assert_refused(r, &format!("{role} citing a closed Version"));
-    }
-    assert_eq!(version_rows(&n.w.db, n.n1).await, before);
 }
 
 #[tokio::test]
@@ -2184,7 +1879,7 @@ async fn in_multi_tenant_mode_claims_that_bind_no_tenant_reach_no_row_of_the_for
     let store = Store::connect(&db.login_url(), &support::connect_options())
         .await
         .unwrap();
-    let single = store.as_worker(None, Scope::new("support"));
+    let single = store.as_worker(None, Scope::new("support"), None);
     let episode = single
         .record_episode(&NewEpisode {
             tenant: None,
@@ -2575,205 +2270,8 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
 }
 
 // Bound precision, Refinement and the Correction a contradiction becomes
-// (ADR-0007, ADR-0008). A bound statement is select and insert only, its kind
-// is decided by a trigger, and a statement moves no committed row.
-
-/// The ID of the Contribution behind tenant one's first Version, and the
-/// Episode and Reference time a statement about it cites.
-async fn first_contribution(n: &Nodes) -> (i64, chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
-    let row =
-        n.w.db
-            .admin()
-            .await
-            .query_typed(
-                "select c.id, c.episode_reference_time, c.episode_recorded_at
-             from gnomon.contribution c where c.node_id = $1 order by c.id limit 1",
-                &[(&n.n1, Type::UUID)],
-            )
-            .await
-            .unwrap();
-    (row[0].get(0), row[0].get(1), row[0].get(2))
-}
-
-const INSERT_STATEMENT: &str = "insert into gnomon.bound_statement
-    (tenant_id, scope, node_id, episode_id, contribution_id, side, bound_at, bound_precision,
-     episode_reference_time, episode_recorded_at)
-  values ($1, 'support', $2, $3, $4, 'from', $5::text::timestamptz, $6::text::gnomon.time_precision,
-     $7, $8)";
-
-async fn insert_statement(
-    tx: &Transaction<'_>,
-    n: &Nodes,
-    contribution: (i64, chrono::DateTime<Utc>, chrono::DateTime<Utc>),
-    bound: &str,
-    precision: &str,
-) -> Result<u64, tokio_postgres::Error> {
-    tx.execute_typed(
-        INSERT_STATEMENT,
-        &[
-            (&n.w.t1, Type::UUID),
-            (&n.n1, Type::UUID),
-            (&n.w.t1_support, Type::UUID),
-            (&contribution.0, Type::INT8),
-            (&bound, Type::TEXT),
-            (&precision, Type::TEXT),
-            (&contribution.1, Type::TIMESTAMPTZ),
-            (&contribution.2, Type::TIMESTAMPTZ),
-        ],
-    )
-    .await
-}
-
-#[tokio::test]
-async fn a_caller_cannot_choose_the_kind_of_a_bound_statement_or_change_or_delete_one() {
-    let n = nodes().await;
-    let c = first_contribution(&n).await;
-    for role in [USER, WORKER] {
-        // The kind and the Recorded time are not the caller's to give.
-        for (column, value) in [("kind", "'refinement'"), ("recorded_at", "'2000-01-01'")] {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-            let r = tx
-                .execute_typed(
-                    &format!(
-                        "insert into gnomon.bound_statement
-                           (tenant_id, scope, node_id, episode_id, contribution_id, side,
-                            bound_at, bound_precision, episode_reference_time,
-                            episode_recorded_at, {column})
-                         values ($1, 'support', $2, $3, $4, 'from', '2024-03-01', 'month',
-                            $5, $6, {value})"
-                    ),
-                    &[
-                        (&n.w.t1, Type::UUID),
-                        (&n.n1, Type::UUID),
-                        (&n.w.t1_support, Type::UUID),
-                        (&c.0, Type::INT8),
-                        (&c.1, Type::TIMESTAMPTZ),
-                        (&c.2, Type::TIMESTAMPTZ),
-                    ],
-                )
-                .await;
-            assert_refused(r, &format!("{role}: insert a statement with its {column}"));
-        }
-        // A statement, once recorded, is neither changed nor deleted.
-        let mut client = n.w.db.login().await;
-        let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-        // The second role narrows what the first stated.
-        let (bound, precision) = if role == USER {
-            ("2024-03-09", "month")
-        } else {
-            ("2024-03-05", "day")
-        };
-        insert_statement(&tx, &n, c, bound, precision)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        for (sql, what) in [
-            (
-                "update gnomon.bound_statement set bound_at = '2030-01-01'",
-                "update a statement",
-            ),
-            (
-                "update gnomon.bound_statement set kind = 'correction'",
-                "relabel a statement",
-            ),
-            ("delete from gnomon.bound_statement", "delete a statement"),
-        ] {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-            assert_refused(tx.execute_typed(sql, &[]).await, &format!("{role}: {what}"));
-        }
-    }
-    let rows =
-        n.w.db
-            .admin()
-            .await
-            .query_typed(
-                "select count(*), min(bound_at)::text from gnomon.bound_statement",
-                &[],
-            )
-            .await
-            .unwrap();
-    assert_eq!(rows[0].get::<_, i64>(0), 2);
-    assert_eq!(rows[0].get::<_, String>(1), "2024-03-01 00:00:00+00");
-}
-
-#[tokio::test]
-async fn a_caller_inserting_a_bound_statement_directly_gets_the_kind_the_earlier_bound_decides() {
-    let n = nodes().await;
-    let c = first_contribution(&n).await;
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-    // The first Contribution's start was unknown: any bound refines it.
-    insert_statement(&tx, &n, c, "2024-03-17 12:00+00", "month")
-        .await
-        .unwrap();
-    // Inside March, narrower: still a Refinement.
-    insert_statement(&tx, &n, c, "2024-03-17 12:00+00", "day")
-        .await
-        .unwrap();
-    // April is outside March 17: a contradiction, so a Correction.
-    insert_statement(&tx, &n, c, "2024-04-02", "day")
-        .await
-        .unwrap();
-    // Coarser than the day it replaces: also a Correction.
-    insert_statement(&tx, &n, c, "2024-04-01", "month")
-        .await
-        .unwrap();
-    let rows = tx
-        .query_typed(
-            "select kind, bound_at::text from gnomon.bound_statement order by id",
-            &[],
-        )
-        .await
-        .unwrap();
-    let got: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
-    assert_eq!(
-        got,
-        [
-            ("refinement", "2024-03-01 00:00:00+00"),
-            ("refinement", "2024-03-17 00:00:00+00"),
-            ("correction", "2024-04-02 00:00:00+00"),
-            ("correction", "2024-04-01 00:00:00+00"),
-        ]
-        .map(|(k, b)| (k.to_owned(), b.to_owned()))
-    );
-    // Stating the bound the Contribution already has changes nothing.
-    let err = insert_statement(&tx, &n, c, "2024-04-20", "month")
-        .await
-        .unwrap_err();
-    assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{err:?}");
-}
-
-#[tokio::test]
-async fn a_caller_cannot_empty_a_contributions_valid_time_with_a_bound_statement() {
-    let n = nodes().await;
-    let c = first_contribution(&n).await;
-    // The Contribution's end is open, so give it one first, then try to start
-    // after it.
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-    tx.execute_typed(
-        "insert into gnomon.bound_statement
-           (tenant_id, scope, node_id, episode_id, contribution_id, side, bound_at,
-            bound_precision, episode_reference_time, episode_recorded_at)
-         values ($1, 'support', $2, $3, $4, 'to', '2024-03-01', 'day', $5, $6)",
-        &[
-            (&n.w.t1, Type::UUID),
-            (&n.n1, Type::UUID),
-            (&n.w.t1_support, Type::UUID),
-            (&c.0, Type::INT8),
-            (&c.1, Type::TIMESTAMPTZ),
-            (&c.2, Type::TIMESTAMPTZ),
-        ],
-    )
-    .await
-    .unwrap();
-    let err = insert_statement(&tx, &n, c, "2024-03-01", "day")
-        .await
-        .unwrap_err();
-    assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{err:?}");
-}
+// (ADR-0007, ADR-0008). A bound statement is written only through the Store,
+// its kind is decided by a trigger, and a statement moves no committed row.
 
 #[tokio::test]
 async fn a_caller_cannot_state_a_bound_in_another_tenant_or_scope_or_of_closed_history() {
@@ -2922,13 +2420,7 @@ async fn a_refinement_leaves_committed_history_as_it_was_and_gives_callers_no_ne
             .await
             .unwrap();
         let got: Vec<bool> = (0..11).map(|i| rights[0].get(i)).collect();
-        assert_eq!(
-            got,
-            [
-                false, false, false, true, false, false, false, true, false, false, false
-            ],
-            "{role}"
-        );
+        assert_eq!(got, [false; 11], "{role}");
     }
     // Nor can a caller rewrite a Version's bound by hand.
     for (sql, what) in [
@@ -3037,39 +2529,6 @@ async fn a_write_with_a_precision_that_does_not_fit_its_bound_is_refused() {
     }
 }
 
-#[tokio::test]
-async fn a_caller_cannot_file_a_bound_statement_under_another_nodes_name() {
-    let n = nodes().await;
-    let c = first_contribution(&n).await;
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-    let other: Uuid = tx
-        .query_typed(
-            "select gnomon.create_node($1, 'support', 'node')",
-            &[(&n.w.t1, Type::UUID)],
-        )
-        .await
-        .unwrap()[0]
-        .get(0);
-    let err = tx
-        .execute_typed(
-            INSERT_STATEMENT,
-            &[
-                (&n.w.t1, Type::UUID),
-                (&other, Type::UUID),
-                (&n.w.t1_support, Type::UUID),
-                (&c.0, Type::INT8),
-                (&"2024-03-01", Type::TEXT),
-                (&"month", Type::TEXT),
-                (&c.1, Type::TIMESTAMPTZ),
-                (&c.2, Type::TIMESTAMPTZ),
-            ],
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{err:?}");
-}
-
 // Ranked merge and Authority (ADR-0007). A Kind's merge rule is written only
 // by the definer function that sets it, each Version records the rule of its
 // Node's Kind even when a caller inserts it directly, and a caller gets no
@@ -3169,155 +2628,6 @@ async fn a_caller_cannot_write_the_merge_rule_table_directly() {
     assert_eq!(rows, 1, "only the definer function's row exists");
 }
 
-#[tokio::test]
-async fn a_version_inserted_directly_records_the_rule_of_its_nodes_kind() {
-    let n = nodes().await;
-    n.w.db.grant_kind_registration(USER).await;
-    let ranked_node: Uuid = {
-        let mut client = n.w.db.login().await;
-        let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-        tx.query_typed(
-            "select gnomon.register_kind($1, 'person', 'node', null, '{}', '{}', null, null)",
-            &[(&n.w.t1, Type::UUID)],
-        )
-        .await
-        .unwrap();
-        tx.query_typed(
-            "select gnomon.set_merge_rule($1, 'person', 'ranked')",
-            &[(&n.w.t1, Type::UUID)],
-        )
-        .await
-        .unwrap();
-        let id = tx
-            .query_typed(
-                "select gnomon.create_node($1, 'support', 'person')",
-                &[(&n.w.t1, Type::UUID)],
-            )
-            .await
-            .unwrap()[0]
-            .get(0);
-        tx.commit().await.unwrap();
-        id
-    };
-    let insert = |rule: &str| {
-        format!(
-            "insert into gnomon.version (tenant_id, scope, node_id, props, valid_from,
-               valid_from_precision, valid_to, valid_to_precision, merge_rule)
-             values ($1, 'support', $2, '{{\"name\": \"Ada\"}}', '2030-01-01', 'instant',
-               '2030-01-02', 'instant', '{rule}')"
-        )
-    };
-    let attempts = [
-        (
-            n.n1,
-            "ranked",
-            "a Node of a Kind that does not rank, labelled ranked",
-            "recency",
-        ),
-        (
-            ranked_node,
-            "recency",
-            "a Node of a Kind that ranks, labelled recency",
-            "ranked",
-        ),
-    ];
-    for role in [USER, WORKER] {
-        for (node, label, what, kind_rule) in attempts {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(n.w.t1, &["support"])).await;
-            let err = tx
-                .execute_typed(
-                    &insert(label),
-                    &[(&n.w.t1, Type::UUID), (&node, Type::UUID)],
-                )
-                .await
-                .expect_err(what);
-            assert_eq!(
-                err.code().map(|c| c.code()),
-                Some(gnomon::INVALID_WRITE),
-                "{role}: {what}: {err:?}"
-            );
-            assert_eq!(
-                err.as_db_error().unwrap().message(),
-                format!("a new Version records the merge rule of its Node's Kind, {kind_rule}"),
-                "{role}: {what}"
-            );
-        }
-    }
-    // The rule the Kind has is accepted, and a closed Version of that Node
-    // stays undeletable. The Version cites an Episode, as every Version must
-    // at commit.
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-    let version: Uuid = tx
-        .query_typed(
-            &format!("{} returning id", insert("ranked")),
-            &[(&n.w.t1, Type::UUID), (&ranked_node, Type::UUID)],
-        )
-        .await
-        .unwrap()[0]
-        .get(0);
-    tx.execute_typed(
-        "insert into gnomon.citation (tenant_id, scope, version_id, episode_id, property,
-           episode_reference_time, episode_recorded_at)
-         select $1, 'support', $2, e.id, 'name', e.reference_time, e.recorded_at
-         from gnomon.episode e where e.id = $3",
-        &[
-            (&n.w.t1, Type::UUID),
-            (&version, Type::UUID),
-            (&n.w.t1_support, Type::UUID),
-        ],
-    )
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, USER, &claims(n.w.t1, &["support"])).await;
-    assert_refused(
-        tx.execute_typed(
-            "delete from gnomon.version where node_id = $1",
-            &[(&ranked_node, Type::UUID)],
-        )
-        .await,
-        "deleting a committed Version of a Node that ranks",
-    );
-}
-
-#[tokio::test]
-async fn a_caller_cannot_change_an_episodes_authority() {
-    let w = world().await;
-    let before: Vec<Option<i32>> = {
-        let admin = w.db.admin().await;
-        admin
-            .query_typed("select authority from gnomon.episode order by id", &[])
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| r.get(0))
-            .collect()
-    };
-    for role in [USER, WORKER] {
-        for sql in [
-            "update gnomon.episode set authority = 99",
-            "delete from gnomon.episode",
-        ] {
-            let mut client = w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
-            assert_refused(tx.batch_execute(sql).await, &format!("{role}: {sql}"));
-        }
-    }
-    let after: Vec<Option<i32>> =
-        w.db.admin()
-            .await
-            .query_typed("select authority from gnomon.episode order by id", &[])
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| r.get(0))
-            .collect();
-    assert_eq!(after, before);
-}
-
 /// Every grant on the gnomon schema and on each relation and function in
 /// it, to any role but the object's owner. An object with no ACL holds its
 /// built-in default.
@@ -3395,7 +2705,7 @@ async fn global_default_privileges_give_callers_no_right_the_migrations_do_not()
         .unwrap();
     let t = Uuid::new_v4();
     let EpisodeId(episode) = store
-        .as_worker(TenantId(t), Scope::new("support"))
+        .as_worker(TenantId(t), Scope::new("support"), None)
         .record_episode(&NewEpisode {
             tenant: Some(TenantId(t)),
             scope: Scope::new("support"),
@@ -3457,7 +2767,7 @@ async fn edges() -> Edges {
         (n.w.t2, n.w.t2_support, n.n2),
     ] {
         let (edge, written) = store
-            .as_worker(TenantId(t), Scope::new("support"))
+            .as_worker(TenantId(t), Scope::new("support"), None)
             .create_edge(
                 &gnomon::NewEdge {
                     tenant: Some(TenantId(t)),
@@ -3477,7 +2787,7 @@ async fn edges() -> Edges {
         made.push((edge.0, written.opened[0].0));
     }
     let (billing_node, _) = store
-        .as_worker(TenantId(n.w.t1), Scope::new("billing"))
+        .as_worker(TenantId(n.w.t1), Scope::new("billing"), None)
         .create_node(
             &gnomon::NewNode {
                 tenant: Some(TenantId(n.w.t1)),
@@ -3527,7 +2837,7 @@ async fn a_caller_cannot_join_a_node_in_another_tenant_or_a_scope_it_cannot_see_
     let e = edges().await;
     let (t1, n1, n2) = (e.n.w.t1, e.n.n1, e.n.n2);
     for role in [USER, WORKER] {
-        for sql in [CREATE_EDGE, INSERT_EDGE] {
+        for sql in [CREATE_EDGE] {
             for (source, target, side, other) in [
                 (n1, n2, "target", n2),
                 (n2, n1, "source", n2),
@@ -3559,7 +2869,7 @@ async fn a_caller_cannot_join_a_node_in_another_tenant_or_a_scope_it_cannot_see_
         let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
         let r = tx
             .execute_typed(
-                INSERT_EDGE,
+                CREATE_EDGE,
                 &[
                     (&e.n.w.t2, Type::UUID),
                     (&"edge", Type::TEXT),
@@ -3611,46 +2921,6 @@ async fn a_caller_cannot_join_a_node_in_another_tenant_or_a_scope_it_cannot_see_
             .unwrap()[0]
             .get(0);
     assert_eq!(rows, 2, "only the fixture's Edges exist");
-}
-
-#[tokio::test]
-async fn a_caller_inserting_an_edge_directly_cannot_skip_its_kinds_endpoint_rules() {
-    let e = edges().await;
-    let t1 = e.n.w.t1;
-    e.n.w.db.grant_kind_registration(USER).await;
-    let mut client = e.n.w.db.login().await;
-    let tx = as_caller(&mut client, USER, &claims(t1, &["support"])).await;
-    tx.batch_execute(&format!(
-        "select gnomon.register_kind('{t1}', 'company', 'node', null, '{{}}', '{{}}', null, null);
-         select gnomon.register_kind('{t1}', 'owns', 'edge', null, '{{}}', '{{}}', '{{company}}', '{{company}}')"
-    ))
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-
-    for (kind, message) in [
-        (
-            "owns",
-            "Edge Kind \"owns\" may not start at a Node of Kind \"node\"; it allows company",
-        ),
-        ("company", "\"company\" is not an Edge Kind of the Tenant"),
-        ("node", "\"node\" is not an Edge Kind of the Tenant"),
-    ] {
-        let mut client = e.n.w.db.login().await;
-        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
-        let r = tx
-            .execute_typed(
-                INSERT_EDGE,
-                &[
-                    (&t1, Type::UUID),
-                    (&kind, Type::TEXT),
-                    (&e.n.n1, Type::UUID),
-                    (&e.n.n1, Type::UUID),
-                ],
-            )
-            .await;
-        assert_invalid_write(r, message);
-    }
 }
 
 #[tokio::test]
@@ -3841,79 +3111,6 @@ async fn a_caller_cannot_write_another_tenants_edge_or_change_an_edge() {
     );
 }
 
-#[tokio::test]
-async fn a_caller_inserting_directly_cannot_forge_the_built_in_that_says_an_edge_holds() {
-    let e = edges().await;
-    let t1 = e.n.w.t1;
-    let contribution =
-        "insert into gnomon.contribution (tenant_id, scope, edge_id, episode_id, property,
-           value, valid_from, valid_from_precision, valid_to, valid_to_precision,
-           episode_reference_time, episode_recorded_at)
-         select $1, 'support', $2, $3, 'holds', $4, '-infinity', 'unknown', 'infinity', 'unknown',
-                ep.reference_time, ep.recorded_at
-         from gnomon.episode ep where ep.id = $3";
-    for value in [json!(false), json!("yes"), json!(1)] {
-        let mut client = e.n.w.db.login().await;
-        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
-        let r = tx
-            .execute_typed(
-                contribution,
-                &[
-                    (&t1, Type::UUID),
-                    (&e.e1, Type::UUID),
-                    (&e.n.w.t1_support, Type::UUID),
-                    (&value, Type::JSONB),
-                ],
-            )
-            .await;
-        assert_invalid_write(
-            r,
-            &format!("the value {value} of property \"holds\" does not satisfy Kind \"edge\""),
-        );
-    }
-
-    // A Version inserted directly never holds the built-in among its values,
-    // and names one Node or one Edge.
-    for (node, edge, props, check) in [
-        (None, Some(e.e1), json!({ "holds": true }), None),
-        (
-            Some(e.n.n1),
-            Some(e.e1),
-            json!({ "name": "both" }),
-            Some(SqlState::CHECK_VIOLATION),
-        ),
-        (
-            None,
-            None,
-            json!({ "name": "neither" }),
-            Some(SqlState::CHECK_VIOLATION),
-        ),
-    ] {
-        let mut client = e.n.w.db.login().await;
-        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
-        let r = tx
-            .execute_typed(
-                "insert into gnomon.version (tenant_id, scope, node_id, edge_id, props, valid_from,
-                   valid_from_precision, valid_to, valid_to_precision, merge_rule)
-                 values ($1, 'support', $2, $3, $4, '2030-01-01', 'instant', '2030-01-02', 'instant', 'recency')",
-                &[
-                    (&t1, Type::UUID),
-                    (&node, Type::UUID),
-                    (&edge, Type::UUID),
-                    (&props, Type::JSONB),
-                ],
-            )
-            .await;
-        match check {
-            None => assert_invalid_write(
-                r,
-                "an Edge Version's values never hold the built-in property \"holds\"",
-            ),
-            Some(code) => assert_eq!(r.unwrap_err().code(), Some(&code), "{props}"),
-        }
-    }
-}
-
 // The reserved Edge Kinds `same_as` and `different_from` (ADR-0012). They
 // are ordinary Edges, so the Edge rules hold for them: endpoints of the
 // caller's Tenant that it can see, and nothing of another Tenant or Scope
@@ -3941,7 +3138,7 @@ async fn second_support_node(e: &Edges) -> Uuid {
         .await
         .unwrap();
     store
-        .as_worker(TenantId(e.n.w.t1), Scope::new("support"))
+        .as_worker(TenantId(e.n.w.t1), Scope::new("support"), None)
         .create_node(
             &gnomon::NewNode {
                 tenant: Some(TenantId(e.n.w.t1)),
@@ -3966,7 +3163,7 @@ async fn a_caller_cannot_join_a_node_of_another_tenant_or_hidden_scope_or_a_node
     let e = edges().await;
     let (t1, n1, n2) = (e.n.w.t1, e.n.n1, e.n.n2);
     for role in [USER, WORKER] {
-        for sql in [CREATE_EDGE, INSERT_EDGE] {
+        for sql in [CREATE_EDGE] {
             for kind in RESERVED {
                 for (source, target, message) in [
                     (
@@ -4044,11 +3241,11 @@ async fn a_reserved_edge_is_one_edge_per_pair_and_scope_and_hidden_from_other_te
             let (low, high) = (n1.min(m1), n1.max(m1));
             let mut client = e.n.w.db.login().await;
             let tx = as_caller(&mut client, role, &claims(t1, &["support", "billing"])).await;
-            // A direct insert from the higher ID to the lower is stored the
+            // An Edge created from the higher ID to the lower is stored the
             // other way round.
-            let row = tx
+            let support_edge: Uuid = tx
                 .query_typed(
-                    &format!("{INSERT_EDGE} returning id, source_id, target_id"),
+                    CREATE_EDGE,
                     &[
                         (&t1, Type::UUID),
                         (&kind, Type::TEXT),
@@ -4057,33 +3254,20 @@ async fn a_reserved_edge_is_one_edge_per_pair_and_scope_and_hidden_from_other_te
                     ],
                 )
                 .await
+                .unwrap()[0]
+                .get(0);
+            let row = tx
+                .query_typed(
+                    "select source_id, target_id from gnomon.edge where id = $1",
+                    &[(&support_edge, Type::UUID)],
+                )
+                .await
                 .unwrap();
-            let (support_edge, source, target): (Uuid, Uuid, Uuid) =
-                (row[0].get(0), row[0].get(1), row[0].get(2));
+            let (source, target): (Uuid, Uuid) = (row[0].get(0), row[0].get(1));
             assert_eq!((source, target), (low, high), "{role} {kind}");
-            // A second one in the Scope, in either order, is refused, and the
-            // Store function returns the one there is.
+            // Creating it again in the Scope, in either order, returns the one
+            // there is.
             for (s, t) in [(low, high), (high, low)] {
-                tx.batch_execute("savepoint again").await.unwrap();
-                let r = tx
-                    .execute_typed(
-                        INSERT_EDGE,
-                        &[
-                            (&t1, Type::UUID),
-                            (&kind, Type::TEXT),
-                            (&s, Type::UUID),
-                            (&t, Type::UUID),
-                        ],
-                    )
-                    .await;
-                assert_eq!(
-                    r.unwrap_err().code(),
-                    Some(&SqlState::UNIQUE_VIOLATION),
-                    "{role} inserted a second {kind} Edge"
-                );
-                tx.batch_execute("rollback to savepoint again")
-                    .await
-                    .unwrap();
                 let id: Uuid = tx
                     .query_typed(
                         CREATE_EDGE,
@@ -4314,230 +3498,13 @@ async fn no_caller_can_register_rewrite_or_remove_a_reserved_kind_even_with_the_
 }
 
 // Correction, End of validity and Retraction (ADR-0007, ADR-0009). A
-// statement is held like a Contribution: callers read and insert it, and
-// change or delete nothing. The merge reads a statement only through the
-// Contributions that carry its ID, and each of those is checked against it.
+// statement is held like a Contribution: callers read it and write it only
+// through the Store, and nothing changes or deletes it but Erasure. The merge
+// reads a statement only through the Contributions that carry its ID.
 
 const END_VALIDITY: &str =
     "select status from gnomon.end_validity($1, $2, false, $3, $4::text::timestamptz, 'instant')";
 const RETRACT_VERSION: &str = "select status from gnomon.retract_version($1, $2, false, $3, $4)";
-const INSERT_STATEMENT_ROW: &str = "insert into gnomon.statement
-    (tenant_id, scope, node_id, episode_id, kind, version_id, valid_from, valid_from_precision,
-     valid_to, valid_to_precision, episode_reference_time, episode_recorded_at)
-  select $1, 'support', $2, $3, 'end_of_validity', $4, '2024-03-01', 'instant',
-         'infinity', 'unknown', ep.reference_time, ep.recorded_at
-  from gnomon.episode ep where ep.id = $3 returning id";
-
-#[tokio::test]
-async fn a_caller_cannot_choose_the_recorded_time_of_a_statement_or_change_or_delete_one() {
-    let n = nodes().await;
-    let t1 = n.w.t1;
-    for (role, at) in [(USER, "2024-06-01"), (WORKER, "2024-03-01")] {
-        let mut client = n.w.db.login().await;
-        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-        tx.query_typed(
-            END_VALIDITY,
-            &[
-                (&t1, Type::UUID),
-                (&n.n1, Type::UUID),
-                (&n.w.t1_support, Type::UUID),
-                (&at, Type::TEXT),
-            ],
-        )
-        .await
-        .unwrap();
-        tx.commit().await.unwrap();
-
-        // The Recorded time is not a column a caller may insert.
-        let mut client = n.w.db.login().await;
-        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-        let r = tx
-            .execute_typed(
-                "insert into gnomon.statement
-                   (tenant_id, scope, node_id, episode_id, kind, version_id, valid_from,
-                    valid_from_precision, valid_to, valid_to_precision, episode_reference_time,
-                    episode_recorded_at, recorded_at)
-                 select $1, 'support', $2, $3, 'end_of_validity', $4, '2024-03-01', 'instant',
-                        'infinity', 'unknown', ep.reference_time, ep.recorded_at, '2000-01-01'
-                 from gnomon.episode ep where ep.id = $3",
-                &[
-                    (&t1, Type::UUID),
-                    (&n.n1, Type::UUID),
-                    (&n.w.t1_support, Type::UUID),
-                    (&n.open, Type::UUID),
-                ],
-            )
-            .await;
-        assert_refused(
-            r,
-            &format!("{role}: insert a statement with its Recorded time"),
-        );
-
-        for (sql, what) in [
-            (
-                "update gnomon.statement set kind = 'retraction'",
-                "relabel a statement",
-            ),
-            (
-                "update gnomon.statement set valid_from = '2030-01-01'",
-                "update a statement",
-            ),
-            ("delete from gnomon.statement", "delete a statement"),
-        ] {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-            assert_refused(tx.execute_typed(sql, &[]).await, &format!("{role}: {what}"));
-        }
-    }
-    let rows =
-        n.w.db
-            .admin()
-            .await
-            .query_typed(
-                "select count(*), min(recorded_at) > '2020-01-01' from gnomon.statement",
-                &[],
-            )
-            .await
-            .unwrap();
-    assert_eq!(rows[0].get::<_, i64>(0), 2);
-    assert!(rows[0].get::<_, bool>(1));
-}
-
-#[tokio::test]
-async fn a_statement_row_alone_changes_no_version() {
-    let n = nodes().await;
-    let t1 = n.w.t1;
-    // Callers may insert a statement directly, but the merge reads only the
-    // Contributions that name it, so a bare row ends nothing.
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
-    tx.query_typed(
-        INSERT_STATEMENT_ROW,
-        &[
-            (&t1, Type::UUID),
-            (&n.n1, Type::UUID),
-            (&n.w.t1_support, Type::UUID),
-            (&n.open, Type::UUID),
-        ],
-    )
-    .await
-    .unwrap();
-    let rows = tx
-        .query_typed(
-            "select changed from gnomon.recompute_versions($1, $2, false, '-infinity', 'infinity')",
-            &[(&t1, Type::UUID), (&n.n1, Type::UUID)],
-        )
-        .await
-        .unwrap();
-    assert!(
-        !rows[0].get::<_, bool>(0),
-        "a bare statement changed a Version"
-    );
-    tx.commit().await.unwrap();
-    assert_eq!(
-        version_rows(&n.w.db, n.n1).await.0,
-        2,
-        "no Version was added"
-    );
-}
-
-#[tokio::test]
-async fn a_caller_cannot_forge_a_contribution_that_does_not_belong_to_the_statement_it_names() {
-    let n = nodes().await;
-    let t1 = n.w.t1;
-    let second_episode = {
-        // A second Episode in the same Scope, to name a different one.
-        let store = Store::connect(&n.w.db.login_url(), &support::connect_options())
-            .await
-            .unwrap();
-        store
-            .as_worker(TenantId(t1), Scope::new("support"))
-            .record_episode(&NewEpisode {
-                tenant: Some(TenantId(t1)),
-                scope: Scope::new("support"),
-                content: "another".into(),
-                reference_time: Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap(),
-                authority: None,
-            })
-            .await
-            .unwrap()
-            .0
-    };
-    let contribution = "insert into gnomon.contribution
-        (tenant_id, scope, node_id, episode_id, property, value, valid_from, valid_from_precision,
-         valid_to, valid_to_precision, episode_reference_time, episode_recorded_at, statement_id)
-      select $1, 'support', $2, $3, 'name', $4, $5::text::timestamptz, 'instant', 'infinity',
-             'unknown', ep.reference_time, ep.recorded_at, $6
-      from gnomon.episode ep where ep.id = $3";
-    let message = "a Contribution of a statement is of the statement's Node or Edge, Episode and \
-                   Valid time, and an End of validity or a Retraction states only null";
-    // (the Episode of the Contribution, its value, its start)
-    let forged = [
-        (second_episode, json!(null), "2024-03-01"), // another Episode's
-        (n.w.t1_support, json!("alive"), "2024-03-01"), // an End of validity states only null
-        (n.w.t1_support, json!(null), "2024-04-01"), // another Valid time
-    ];
-    for (episode, value, from) in forged {
-        let mut client = n.w.db.login().await;
-        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
-        let id: i64 = tx
-            .query_typed(
-                INSERT_STATEMENT_ROW,
-                &[
-                    (&t1, Type::UUID),
-                    (&n.n1, Type::UUID),
-                    (&n.w.t1_support, Type::UUID),
-                    (&n.open, Type::UUID),
-                ],
-            )
-            .await
-            .unwrap()[0]
-            .get(0);
-        let r = tx
-            .execute_typed(
-                contribution,
-                &[
-                    (&t1, Type::UUID),
-                    (&n.n1, Type::UUID),
-                    (&episode, Type::UUID),
-                    (&value, Type::JSONB),
-                    (&from, Type::TEXT),
-                    (&id, Type::INT8),
-                ],
-            )
-            .await;
-        assert_invalid_write(r, message);
-    }
-    // The statement's own Contribution is accepted.
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
-    let id: i64 = tx
-        .query_typed(
-            INSERT_STATEMENT_ROW,
-            &[
-                (&t1, Type::UUID),
-                (&n.n1, Type::UUID),
-                (&n.w.t1_support, Type::UUID),
-                (&n.open, Type::UUID),
-            ],
-        )
-        .await
-        .unwrap()[0]
-        .get(0);
-    tx.execute_typed(
-        contribution,
-        &[
-            (&t1, Type::UUID),
-            (&n.n1, Type::UUID),
-            (&n.w.t1_support, Type::UUID),
-            (&json!(null), Type::JSONB),
-            (&"2024-03-01", Type::TEXT),
-            (&id, Type::INT8),
-        ],
-    )
-    .await
-    .unwrap();
-}
 
 #[tokio::test]
 async fn a_caller_cannot_end_or_retract_in_another_tenant_or_scope_or_a_version_that_is_not_current()
@@ -4694,48 +3661,6 @@ async fn a_correction_closes_the_earlier_version_and_no_caller_can_reopen_or_rew
     );
 }
 
-#[tokio::test]
-async fn the_statement_functions_run_as_the_invoker_and_add_no_definer() {
-    let w = world().await;
-    let rows =
-        w.db.admin()
-            .await
-            .query_typed(
-                "select p.proname, p.prosecdef from pg_proc p
-             join pg_namespace s on s.oid = p.pronamespace and s.nspname = 'gnomon'
-             where p.proname in ('write_patch_as', 'correct_node', 'correct_edge', 'write_ending',
-                                 'end_validity', 'retract_version', 'list_statements',
-                                 'statement_check_insert')
-             order by 1",
-                &[],
-            )
-            .await
-            .unwrap();
-    assert_eq!(rows.len(), 8);
-    for r in rows {
-        assert!(
-            !r.get::<_, bool>(1),
-            "{} is SECURITY DEFINER",
-            r.get::<_, String>(0)
-        );
-    }
-    // ADR-0009 names four definer groups: Erasure, Kind registration, the
-    // merge-rule setter and the search index trigger. Erasure is four
-    // functions, of an Episode, a Node, an Edge and a Scope.
-    let definers =
-        w.db.admin()
-            .await
-            .query_typed(
-                "select count(*) from pg_proc p
-             join pg_namespace s on s.oid = p.pronamespace and s.nspname = 'gnomon'
-             where p.prosecdef",
-                &[],
-            )
-            .await
-            .unwrap();
-    assert_eq!(definers[0].get::<_, i64>(0), DEFINERS.len() as i64);
-}
-
 // Retract Episode (ADR-0003, ADR-0007, ADR-0009). It runs as the invoker, so
 // a caller gets no UPDATE or DELETE right from it, deletes no committed
 // history, and cannot retract an Episode outside its Tenant and Scopes. The
@@ -4849,157 +3774,6 @@ async fn a_caller_cannot_retract_an_episode_of_another_tenant_or_a_scope_it_cann
             .await
             .unwrap();
     assert_eq!(rows[0].get::<_, i64>(0), 0);
-}
-
-#[tokio::test]
-async fn a_caller_cannot_mark_an_episode_retracted_without_its_retractions_or_change_or_delete_the_mark()
- {
-    let n = nodes().await;
-    let t1 = n.w.t1;
-    for role in [USER, WORKER] {
-        // The Scope and the Recorded time are not the caller's to give.
-        for (sql, what) in [
-            (
-                "insert into gnomon.episode_retraction (tenant_id, scope, episode_id)
-                 values ($1, 'support', $2)",
-                "name the Scope",
-            ),
-            (
-                "insert into gnomon.episode_retraction (tenant_id, episode_id, recorded_at)
-                 values ($1, $2, '2000-01-01')",
-                "name the Recorded time",
-            ),
-        ] {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-            let r = tx
-                .execute_typed(sql, &[(&t1, Type::UUID), (&n.w.t1_support, Type::UUID)])
-                .await;
-            assert_refused(r, &format!("{role}: {what}"));
-        }
-        // A mark written directly leaves the Version only that Episode cites
-        // current, and the commit is refused.
-        let mut client = n.w.db.login().await;
-        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-        tx.execute_typed(
-            "insert into gnomon.episode_retraction (tenant_id, episode_id) values ($1, $2)",
-            &[(&t1, Type::UUID), (&n.w.t1_support, Type::UUID)],
-        )
-        .await
-        .unwrap();
-        let err = tx.commit().await.unwrap_err();
-        assert_eq!(
-            err.code().map(|c| c.code()),
-            Some("GNW01"),
-            "{role}: {err:?}"
-        );
-        assert!(
-            err.as_db_error()
-                .unwrap()
-                .message()
-                .contains("retract it with gnomon.retract_episode"),
-            "{err:?}"
-        );
-    }
-    // A mark made by the function can be neither changed nor deleted.
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
-    tx.query_typed(
-        RETRACT_EPISODE,
-        &[(&t1, Type::UUID), (&n.w.t1_support, Type::UUID)],
-    )
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-    for role in [USER, WORKER] {
-        for (sql, what) in [
-            (
-                "update gnomon.episode_retraction set episode_id = episode_id",
-                "update the mark",
-            ),
-            ("delete from gnomon.episode_retraction", "delete the mark"),
-        ] {
-            let mut client = n.w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-            assert_refused(tx.execute_typed(sql, &[]).await, &format!("{role}: {what}"));
-        }
-    }
-    let rows =
-        n.w.db
-            .admin()
-            .await
-            .query_typed(
-                "select count(*), min(scope), min(recorded_at) > '2020-01-01'
-             from gnomon.episode_retraction",
-                &[],
-            )
-            .await
-            .unwrap();
-    assert_eq!(rows[0].get::<_, i64>(0), 1);
-    assert_eq!(
-        rows[0].get::<_, String>(1),
-        "support",
-        "the Episode's Scope"
-    );
-    assert!(rows[0].get::<_, bool>(2));
-}
-
-#[tokio::test]
-async fn a_caller_cannot_make_a_statement_that_retracts_its_episode_without_retracting_it() {
-    let n = nodes().await;
-    let t1 = n.w.t1;
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
-    // A Retraction that claims to be Retract Episode's, so that it would
-    // still count after its Episode is retracted.
-    tx.execute_typed(
-        "insert into gnomon.statement
-           (tenant_id, scope, node_id, episode_id, kind, version_id, valid_from,
-            valid_from_precision, valid_to, valid_to_precision, episode_reference_time,
-            episode_recorded_at, retracts_episode)
-         select $1, 'support', $2, $3, 'retraction', $4, '2024-03-01', 'instant',
-                'infinity', 'unknown', ep.reference_time, ep.recorded_at, true
-         from gnomon.episode ep where ep.id = $3",
-        &[
-            (&t1, Type::UUID),
-            (&n.n1, Type::UUID),
-            (&n.w.t1_support, Type::UUID),
-            (&n.open, Type::UUID),
-        ],
-    )
-    .await
-    .unwrap();
-    let err = tx.commit().await.unwrap_err();
-    assert_eq!(err.code().map(|c| c.code()), Some("GNW01"), "{err:?}");
-    assert_eq!(
-        err.as_db_error().unwrap().message(),
-        "only Retract Episode makes a Retraction that retracts its Episode"
-    );
-
-    // Only a Retraction can carry the flag.
-    let mut client = n.w.db.login().await;
-    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
-    let r = tx
-        .execute_typed(
-            "insert into gnomon.statement
-               (tenant_id, scope, node_id, episode_id, kind, version_id, valid_from,
-                valid_from_precision, valid_to, valid_to_precision, episode_reference_time,
-                episode_recorded_at, retracts_episode)
-             select $1, 'support', $2, $3, 'end_of_validity', $4, '2024-03-01', 'instant',
-                    'infinity', 'unknown', ep.reference_time, ep.recorded_at, true
-             from gnomon.episode ep where ep.id = $3",
-            &[
-                (&t1, Type::UUID),
-                (&n.n1, Type::UUID),
-                (&n.w.t1_support, Type::UUID),
-                (&n.open, Type::UUID),
-            ],
-        )
-        .await;
-    match r {
-        Err(e) => assert_eq!(e.code(), Some(&SqlState::CHECK_VIOLATION), "{e:?}"),
-        Ok(v) => panic!("an End of validity carried the flag: {v:?}"),
-    }
 }
 
 // Erase Episode (ADR-0003, ADR-0009). The one definer function that deletes
@@ -5150,7 +3924,7 @@ async fn erasable(n: &Nodes) -> Uuid {
     let store = Store::connect(&n.w.db.login_url(), &support::connect_options())
         .await
         .unwrap();
-    let caller = store.as_worker(TenantId(n.w.t1), Scope::new("support"));
+    let caller = store.as_worker(TenantId(n.w.t1), Scope::new("support"), None);
     let f = caller
         .record_episode(&NewEpisode {
             tenant: Some(TenantId(n.w.t1)),
@@ -5186,24 +3960,30 @@ async fn a_caller_cannot_forge_the_erasure_bypass_or_delete_what_an_erasure_rewr
     erasable(&n).await;
     let t1 = n.w.t1;
 
-    // The bypass is the definer role itself, which no caller can become, and
-    // no setting a caller can change turns it on.
+    // The bypass is the definer role itself, which no caller can become, nor
+    // the writer role. No setting a caller can change turns it on, and no
+    // caller may even ask whether it is on.
     for role in [USER, WORKER] {
-        let mut client = n.w.db.login().await;
-        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-        let r = tx.batch_execute("set local role gnomon_definer").await;
-        assert_refused(r.map(|_| ()), &format!("{role} becoming gnomon_definer"));
+        for definer in ["gnomon_definer", "gnomon_writer"] {
+            let mut client = n.w.db.login().await;
+            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+            let r = tx.batch_execute(&format!("set local role {definer}")).await;
+            assert_refused(r.map(|_| ()), &format!("{role} becoming {definer}"));
+        }
         let mut client = n.w.db.login().await;
         let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
         tx.batch_execute("select set_config('gnomon.running_as_definer', 'on', true)")
             .await
             .unwrap();
-        let erasing: bool = tx
+        let r = tx
             .query_typed("select gnomon.running_as_definer()", &[])
+            .await;
+        assert_refused(r, &format!("{role} asking whether the bypass is on"));
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        tx.batch_execute("select set_config('gnomon.running_as_definer', 'on', true)")
             .await
-            .unwrap()[0]
-            .get(0);
-        assert!(!erasing, "{role} turned the bypass on");
+            .unwrap();
         let r = tx
             .execute_typed(
                 "delete from gnomon.version where id = $1",
@@ -5235,7 +4015,8 @@ async fn a_caller_cannot_forge_the_erasure_bypass_or_delete_what_an_erasure_rewr
             .await;
         assert_refused(r, &format!("calling {what}"));
     }
-    // The shared merge refuses a replay or another Recorded time from a caller.
+    // No caller may run the shared merge, with a replay, another Recorded time
+    // or none.
     for (at, replay, what) in [
         ("now()", true, "a replay"),
         (
@@ -5262,8 +4043,7 @@ async fn a_caller_cannot_forge_the_erasure_bypass_or_delete_what_an_erasure_rewr
         assert_refused(r, &format!("merging {what}"));
     }
 
-    // Called directly as a write, the merge takes the write path's lock and
-    // Tenant check, so it cannot reach another Tenant's Node.
+    // Nor to reach another Tenant's Node.
     let mut client = n.w.db.login().await;
     let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
     let r = tx
@@ -5453,7 +4233,7 @@ async fn graph() -> Graph {
     let billing_edge = edge("billing", billing_node.0, billing_node.0, n.w.t1_billing).await;
     let crossing_edge = edge("billing", billing_node.0, n.n1, n.w.t1_billing).await;
     let t2_edge = store
-        .as_worker(TenantId(n.w.t2), Scope::new("support"))
+        .as_worker(TenantId(n.w.t2), Scope::new("support"), None)
         .create_edge(
             &gnomon::NewEdge {
                 tenant: Some(TenantId(n.w.t2)),
@@ -5774,97 +4554,6 @@ async fn no_caller_reaches_the_erasure_list_or_its_parts_and_an_erasure_widens_n
     );
 }
 
-// No role the migrations create or name may vacuum, reindex or cluster a
-// gnomon table. Postgres's autovacuum and the deployment's operator vacuum
-// them (ADR-0003); gnomon holds no MAINTAIN privilege for it.
-
-/// Every gnomon table, from the catalog, schema-qualified.
-async fn every_gnomon_table(client: &Client) -> Vec<String> {
-    support::erasure::gnomon_tables(client)
-        .await
-        .into_iter()
-        .map(|t| format!("gnomon.{t}"))
-        .collect()
-}
-
-/// The file each table's data lives in, which `VACUUM (FULL)` and `CLUSTER`
-/// change.
-async fn filenodes(admin: &Client, tables: &[String]) -> Vec<i64> {
-    let mut out = Vec::new();
-    for t in tables {
-        let row = admin
-            .query_typed(
-                "select pg_relation_filenode($1::text::regclass)::bigint",
-                &[(t, Type::TEXT)],
-            )
-            .await
-            .unwrap();
-        out.push(row[0].get(0));
-    }
-    out
-}
-
-#[tokio::test]
-async fn no_role_holds_maintain_and_no_caller_can_vacuum_reindex_or_cluster_a_gnomon_table() {
-    let w = world().await;
-    let admin = w.db.admin().await;
-    let tables = every_gnomon_table(&admin).await;
-    let before = filenodes(&admin, &tables).await;
-    for table in &tables {
-        let holders: Vec<String> = admin
-            .query_typed(
-                "select r from unnest(array['public', 'authenticated', 'gnomon_worker',
-                                            'gnomon_definer', $2]) r
-                 where has_table_privilege(r, $1, 'MAINTAIN')",
-                &[(table, Type::TEXT), (&support::LOGIN_ROLE, Type::TEXT)],
-            )
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| r.get(0))
-            .collect();
-        assert!(holders.is_empty(), "{holders:?} hold MAINTAIN on {table}");
-    }
-
-    for role in [USER, WORKER] {
-        let mut client = w.db.login().await;
-        for statement in [
-            "reindex table gnomon.version",
-            "cluster gnomon.version using version_pkey",
-        ] {
-            let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
-            let r = tx.batch_execute(statement).await;
-            match r {
-                Err(e) => assert!(
-                    e.code() == Some(&SqlState::INSUFFICIENT_PRIVILEGE)
-                        || e.code() == Some(&SqlState::UNDEFINED_OBJECT),
-                    "{role}: {statement}: {e:?}"
-                ),
-                Ok(()) => panic!("{role} ran {statement}"),
-            }
-        }
-    }
-    // The login role holds the caller roles without inheriting them, so it
-    // has no USAGE on the schema. `VACUUM` outside a transaction is refused,
-    // or would skip a table it may not vacuum with a warning: either way no
-    // table is rewritten.
-    let login = w.db.login().await;
-    for t in &tables {
-        if let Err(e) = login.batch_execute(&format!("vacuum (full) {t}")).await {
-            assert_eq!(
-                e.code(),
-                Some(&SqlState::INSUFFICIENT_PRIVILEGE),
-                "vacuum {t}: {e:?}"
-            );
-        }
-    }
-    assert_eq!(
-        filenodes(&admin, &tables).await,
-        before,
-        "a caller rewrote a gnomon table"
-    );
-}
-
 /// The stage tables (ADR-0011), which `0001_schema.sql` creates.
 const STAGE_TABLES: &[&str] = &["stage_record", "stage_usage"];
 
@@ -5885,7 +4574,7 @@ async fn staged_world() -> World {
     for row in &episodes {
         let (tenant, scope, episode): (Uuid, String, Uuid) = (row.get(0), row.get(1), row.get(2));
         let (tenant, episode) = (TenantId(tenant), EpisodeId(episode));
-        let caller = store.as_worker(tenant, Scope::new(scope));
+        let caller = store.as_worker(tenant, Scope::new(scope), None);
         caller
             .write_stages(tenant, &[gnomon::StageWrite::pending(episode, "graph")])
             .await
@@ -5969,59 +4658,6 @@ async fn a_caller_cannot_write_another_tenants_or_scopes_stage_records() {
     let mut client = w.db.login().await;
     let caller = claims(w.t1, &["support"]);
 
-    // Direct inserts, naming another Tenant, another Scope, or an Episode of
-    // another Scope under the caller's own.
-    for (tenant, scope, episode, code) in [
-        (
-            w.t2,
-            "support",
-            w.t2_support,
-            SqlState::INSUFFICIENT_PRIVILEGE,
-        ),
-        (
-            w.t1,
-            "billing",
-            w.t1_billing,
-            SqlState::INSUFFICIENT_PRIVILEGE,
-        ),
-        (
-            w.t1,
-            "support",
-            w.t1_billing,
-            SqlState::FOREIGN_KEY_VIOLATION,
-        ),
-        (
-            w.t1,
-            "support",
-            w.t2_support,
-            SqlState::FOREIGN_KEY_VIOLATION,
-        ),
-    ] {
-        for sql in [
-            "insert into gnomon.stage_record (tenant_id, scope, episode_id, stage)
-             values ($1, $2, $3, 'forged')",
-            "insert into gnomon.stage_usage
-               (tenant_id, scope, episode_id, stage, model, calls, input_tokens, output_tokens)
-             values ($1, $2, $3, 'graph', 'forged', 1, 1, 1)",
-        ] {
-            let tx = as_caller(&mut client, WORKER, &caller).await;
-            let refused = tx
-                .execute_typed(
-                    sql,
-                    &[
-                        (&tenant, Type::UUID),
-                        (&scope, Type::TEXT),
-                        (&episode, Type::UUID),
-                    ],
-                )
-                .await;
-            match refused {
-                Err(e) => assert_eq!(e.code(), Some(&code), "{sql} into {scope}: {e:?}"),
-                Ok(n) => panic!("{sql} into {tenant} {scope} was allowed: {n}"),
-            }
-        }
-    }
-
     // The stage functions, for another Tenant's or Scope's Episode.
     for (tenant, episode) in [(w.t1, w.t1_billing), (w.t2, w.t2_support)] {
         for (sql, code) in [
@@ -6046,23 +4682,6 @@ async fn a_caller_cannot_write_another_tenants_or_scopes_stage_records() {
         }
     }
 
-    // Direct updates reach no row of another Tenant or Scope.
-    let tx = as_caller(&mut client, WORKER, &caller).await;
-    for sql in [
-        "update gnomon.stage_record set status = 'succeeded', retry_at = null
-         where episode_id = any($1)",
-        "update gnomon.stage_usage set calls = 0 where episode_id = any($1)",
-    ] {
-        let n = tx
-            .execute_typed(
-                sql,
-                &[(&vec![w.t1_billing, w.t2_support], Type::UUID_ARRAY)],
-            )
-            .await
-            .unwrap();
-        assert_eq!(n, 0, "{sql} changed another Tenant's or Scope's rows");
-    }
-    tx.commit().await.unwrap();
     assert_eq!(stage_rows(&w.db).await, before);
 }
 
@@ -6174,7 +4793,7 @@ async fn searchable_world() -> World {
         let (tenant, scope, episode): (Uuid, String, Uuid) = (row.get(0), row.get(1), row.get(2));
         let name = format!("zebra {scope}");
         store
-            .as_worker(TenantId(tenant), Scope::new(scope.clone()))
+            .as_worker(TenantId(tenant), Scope::new(scope.clone()), None)
             .create_node(
                 &gnomon::NewNode {
                     tenant: Some(TenantId(tenant)),
@@ -6398,7 +5017,6 @@ const EMBEDDING_TABLES: &[&str] = &["embedding", "embedding_bit"];
 /// is embedded.
 struct EmbeddedWorld {
     w: World,
-    support_twin: Uuid,
     billing_twin: Uuid,
     twin_hash: String,
     /// A Version of Tenant 1's `support` with an embedding, and its hash.
@@ -6424,7 +5042,7 @@ async fn embedded_world() -> EmbeddedWorld {
         let (tenant, scope, id, hash): (Uuid, String, Uuid, String) =
             (row.get(0), row.get(1), row.get(2), row.get(3));
         store
-            .as_worker(TenantId(tenant), Scope::new(scope))
+            .as_worker(TenantId(tenant), Scope::new(scope), None)
             .store_embedding(TenantId(tenant), gnomon::VersionId(id), &hash, &rng.unit())
             .await
             .unwrap();
@@ -6438,7 +5056,7 @@ async fn embedded_world() -> EmbeddedWorld {
         .unwrap();
     let mut twins = Vec::new();
     for (scope, episode) in [("support", w.t1_support), ("billing", w.t1_billing)] {
-        let caller = store.as_worker(TenantId(w.t1), Scope::new(scope));
+        let caller = store.as_worker(TenantId(w.t1), Scope::new(scope), None);
         let (node, _) = caller
             .create_node(
                 &gnomon::NewNode {
@@ -6479,7 +5097,6 @@ async fn embedded_world() -> EmbeddedWorld {
         .unwrap();
     drop(billing_caller);
     EmbeddedWorld {
-        support_twin: support_twin.id.0,
         billing_twin: billing_twin.id.0,
         twin_hash: support_twin.text_hash,
         support_version: support_row[0].get(0),
@@ -6577,55 +5194,15 @@ async fn a_caller_cannot_write_an_embedding_of_another_tenant_or_scope_or_attach
     let before = embedding_rows(&w.db).await;
     let (t1, t2) = (w.t1, w.t2);
     let (own, own_hash) = (ew.support_version, &ew.support_hash);
-    let (twin, billing_twin, twin_hash) = (ew.support_twin, ew.billing_twin, &ew.twin_hash);
+    let (billing_twin, twin_hash) = (ew.billing_twin, &ew.twin_hash);
     let v = sql_vector();
+    // Another Scope's Version, another Tenant, and the caller's own Version
+    // moved to a text that is not its own, through the Store's function.
+    // Callers write nothing directly (#81).
     let attempts = [
-        // A full vector or a quantized row in a Scope or Tenant the caller
-        // cannot see: RLS.
-        format!(
-            "insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
-             values ('{t1}', 'billing', '{own_hash}', gnomon.embedding_vector({v}))"
-        ),
-        format!(
-            "insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
-             values ('{t2}', 'support', '{own_hash}', gnomon.embedding_vector({v}))"
-        ),
-        format!(
-            "insert into gnomon.embedding_bit (tenant_id, scope, version_id, text_hash)
-             values ('{t1}', 'billing', '{billing_twin}', '{twin_hash}')"
-        ),
-        // The caller's own Version, attached to billing's full vector of the
-        // same text: no full vector of that text is in the caller's Scope,
-        // and the foreign key carries the Scope.
-        format!(
-            "insert into gnomon.embedding_bit (tenant_id, scope, version_id, text_hash)
-             values ('{t1}', 'support', '{twin}', '{twin_hash}')"
-        ),
-        // Billing's Version, in the caller's Scope.
-        format!(
-            "insert into gnomon.embedding_bit (tenant_id, scope, version_id, text_hash)
-             values ('{t1}', 'support', '{billing_twin}', '{twin_hash}')"
-        ),
-        // The same through the Store's function.
         format!("select gnomon.store_embedding('{t1}', '{billing_twin}', '{twin_hash}', {v})"),
         format!("select gnomon.store_embedding('{t2}', '{own}', '{own_hash}', {v})"),
-        // The caller's own Version moved to a text that is not its own.
-        format!(
-            "update gnomon.embedding_bit set text_hash = '{twin_hash}' where version_id = '{own}'"
-        ),
         format!("select gnomon.store_embedding('{t1}', '{own}', '{twin_hash}', {v})"),
-        // What only the Store derives, and what only Erasure deletes.
-        format!(
-            "update gnomon.embedding_bit set recorded_to = 'infinity' where version_id = '{own}'"
-        ),
-        format!("update gnomon.embedding_bit set q = ~q where version_id = '{own}'"),
-        format!(
-            "update gnomon.embedding_bit set valid_from = '-infinity' where version_id = '{own}'"
-        ),
-        format!("update gnomon.embedding set embedding = gnomon.embedding_vector({v})"),
-        "delete from gnomon.embedding_bit".to_owned(),
-        "delete from gnomon.embedding".to_owned(),
-        "truncate gnomon.embedding_bit".to_owned(),
     ];
     for role in [USER, WORKER] {
         for sql in &attempts {
@@ -6633,80 +5210,22 @@ async fn a_caller_cannot_write_an_embedding_of_another_tenant_or_scope_or_attach
             let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
             assert_refused_write(tx.batch_execute(sql).await, &format!("{role}: {sql}"));
         }
-        // A full vector of the caller's own Scope that no quantized row uses
-        // fails at commit, so none is stored for a text no Version has.
-        let mut client = w.db.login().await;
-        let tx = as_caller(&mut client, role, &claims(w.t1, &["support"])).await;
-        tx.batch_execute(&format!(
-            "insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
-             values ('{t1}', 'support', repeat('ab', 32), gnomon.embedding_vector({v}))"
-        ))
-        .await
-        .unwrap();
-        assert_refused_write(
-            tx.commit().await,
-            &format!("{role}: a full vector no row uses"),
-        );
     }
     assert_eq!(embedding_rows(&w.db).await, before);
 }
 
 #[tokio::test]
-async fn a_quantized_row_holds_what_the_store_derives_whatever_a_caller_inserts() {
-    let ew = embedded_world().await;
-    let w = &ew.w;
-    let (t1, twin, twin_hash) = (w.t1, ew.support_twin, &ew.twin_hash);
-    let v = sql_vector();
-    let mut client = w.db.login().await;
-    let tx = as_caller(&mut client, WORKER, &claims(w.t1, &["support"])).await;
-    tx.batch_execute(&format!(
-        "insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
-         values ('{t1}', 'support', '{twin_hash}', gnomon.embedding_vector({v}));
-         insert into gnomon.embedding_bit (tenant_id, scope, version_id, text_hash, q,
-                                           valid_from, valid_to, recorded_from, recorded_to)
-         values ('{t1}', 'support', '{twin}', '{twin_hash}',
-                 ~(repeat('0', gnomon.embedding_dimension())::bit varying)::bit({d}),
-                 '2001-01-01', '2002-01-01', '2001-01-01', '2002-01-01')",
-        d = support::DEFAULT_DIMENSION
-    ))
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-    let admin = w.db.admin().await;
-    let pgvector: String = admin
-        .query_typed(
-            "select quote_ident(extnamespace::regnamespace::text) from pg_extension
-             where extname = 'vector'",
-            &[],
-        )
-        .await
-        .unwrap()[0]
-        .get(0);
-    let derived = admin
-        .query_typed(
-            &format!(
-                "select b.q = {pgvector}.binary_quantize(e.embedding)::bit varying,
-                    (b.valid_from, b.valid_to, b.recorded_from, b.recorded_to)
-                      = (x.valid_from, x.valid_to, x.recorded_from, x.recorded_to)
-             from gnomon.embedding_bit b
-             join gnomon.embedding e using (tenant_id, scope, text_hash)
-             join gnomon.version x on x.tenant_id = b.tenant_id and x.id = b.version_id
-             where b.version_id = $1"
-            ),
-            &[(&twin, Type::UUID)],
-        )
-        .await
-        .unwrap();
-    let (bits, times): (bool, bool) = (derived[0].get(0), derived[0].get(1));
-    assert!(bits, "the bits are those of the stored full vector");
-    assert!(times, "the time columns are the Version's");
-}
-
-#[tokio::test]
-async fn callers_hold_only_select_insert_and_a_text_hash_update_on_the_embedding_tables() {
+async fn callers_hold_only_select_on_the_embedding_tables_and_the_writer_insert_and_a_text_hash_update()
+ {
     let w = world().await;
     let admin = w.db.admin().await;
-    for role in [USER, WORKER, support::LOGIN_ROLE, "gnomon_definer"] {
+    for role in [
+        USER,
+        WORKER,
+        support::LOGIN_ROLE,
+        "gnomon_writer",
+        "gnomon_definer",
+    ] {
         for table in EMBEDDING_TABLES {
             let privileges: Vec<String> = admin
                 .query_typed(
@@ -6729,8 +5248,9 @@ async fn callers_hold_only_select_insert_and_a_text_hash_update_on_the_embedding
             let expected: Vec<&str> = match (role, *table) {
                 (r, _) if r == support::LOGIN_ROLE => vec![],
                 ("gnomon_definer", _) => vec!["SELECT", "DELETE"],
-                (_, "embedding") => vec!["SELECT", "INSERT"],
-                _ => vec!["SELECT", "INSERT", "UPDATE (text_hash)"],
+                ("gnomon_writer", "embedding") => vec!["SELECT", "INSERT"],
+                ("gnomon_writer", _) => vec!["SELECT", "INSERT", "UPDATE (text_hash)"],
+                _ => vec!["SELECT"],
             };
             assert_eq!(privileges, expected, "{role} on gnomon.{table}");
         }
@@ -6789,7 +5309,7 @@ async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_c
         .await
         .unwrap();
     let t = TenantId(Uuid::new_v4());
-    let caller = store.as_worker(t, Scope::new("support"));
+    let caller = store.as_worker(t, Scope::new("support"), None);
     let episode = caller
         .record_episode(&NewEpisode {
             tenant: Some(t),
@@ -7003,287 +5523,143 @@ async fn summary_and_community_rows(db: &TestDb) -> Vec<i64> {
 }
 
 #[tokio::test]
-async fn a_caller_cannot_rewrite_or_delete_a_committed_summary_or_community_or_what_it_cites_or_holds()
+async fn no_function_commits_a_summary_or_community_without_a_citation_or_a_community_without_a_node()
  {
-    let d = summarized().await;
-    let t1 = d.g.n.w.t1;
-    let before = summary_and_community_rows(&d.g.n.w.db).await;
-    let s = d.support_summary;
-    let k = d.community;
+    // #75: a commit check that a Summary or Community is cited skipped a row
+    // the claims at commit no longer showed. Callers now write only through
+    // the functions, which refuse what has no Citation or no Node as they
+    // run, so no check at commit is left to skip.
+    let n = nodes().await;
+    let t1 = n.w.t1;
+    let before = summary_and_community_rows(&n.w.db).await;
+    let summary = "select gnomon.write_summary($1, 'support', $2, 'prose', '2024-06-01', $3,
+                     null, null)";
+    let community = "select gnomon.write_community($1, 'support', '{}', $2, 'prose',
+                       '2024-06-01', $3, null, null)";
     for role in [USER, WORKER] {
-        for (sql, what) in [
+        for (sql, members, episodes, message) in [
             (
-                "update gnomon.summary set content = 'rewritten' where id = $1",
-                "rewriting a Summary",
+                summary,
+                None,
+                Some(vec![]),
+                "a Summary or Community cites at least one Episode",
             ),
             (
-                "update gnomon.summary set node_id = node_id where id = $1",
-                "moving a Summary",
+                summary,
+                None,
+                None,
+                "a Summary or Community cites at least one Episode",
             ),
             (
-                "update gnomon.summary set recorded_to = '2000-01-01' where id = $1",
-                "closing a Summary in the past",
+                community,
+                Some(vec![n.n1]),
+                Some(vec![]),
+                "a Summary or Community cites at least one Episode",
             ),
             (
-                "update gnomon.summary set recorded_to = 'infinity' where id = $1",
-                "touching a Summary's open end",
+                community,
+                Some(vec![]),
+                Some(vec![n.w.t1_support]),
+                "a Community holds at least one Node, and names each",
             ),
             (
-                "delete from gnomon.summary where id = $1",
-                "deleting a Summary",
-            ),
-            (
-                "delete from gnomon.summary_citation where summary_id = $1",
-                "deleting a Summary's Citation",
-            ),
-            (
-                "update gnomon.community set content = 'rewritten' where id = $1",
-                "rewriting a Community",
-            ),
-            (
-                "update gnomon.community set recorded_to = '2000-01-01' where id = $1",
-                "closing a Community in the past",
-            ),
-            (
-                "delete from gnomon.community where id = $1",
-                "deleting a Community",
-            ),
-            (
-                "delete from gnomon.community_member where community_id = $1",
-                "deleting a Community's Node",
-            ),
-            (
-                "delete from gnomon.community_citation where community_id = $1",
-                "deleting a Community's Citation",
-            ),
-            (
-                "update gnomon.summary_citation set place = 'forged' where summary_id = $1",
-                "rewriting a Summary's Citation",
+                community,
+                None,
+                Some(vec![n.w.t1_support]),
+                "a Community holds at least one Node, and names each",
             ),
         ] {
-            let id = if sql.contains("community") { k } else { s };
-            let mut client = d.g.n.w.db.login().await;
+            let mut client = n.w.db.login().await;
             let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-            let r = tx.query_typed(sql, &[(&id, Type::UUID)]).await;
-            assert_refused(r, &format!("{role} {what}"));
+            let r = if sql == summary {
+                tx.query_typed(
+                    sql,
+                    &[
+                        (&t1, Type::UUID),
+                        (&n.n1, Type::UUID),
+                        (&episodes, Type::UUID_ARRAY),
+                    ],
+                )
+                .await
+            } else {
+                tx.query_typed(
+                    sql,
+                    &[
+                        (&t1, Type::UUID),
+                        (&members, Type::UUID_ARRAY),
+                        (&episodes, Type::UUID_ARRAY),
+                    ],
+                )
+                .await
+            };
+            assert_invalid_write(r, message);
         }
-    }
-    assert_eq!(summary_and_community_rows(&d.g.n.w.db).await, before);
-}
-
-#[tokio::test]
-async fn a_caller_inserting_directly_cannot_choose_the_recorded_time_or_skip_the_scope_and_citation_checks()
- {
-    let d = summarized().await;
-    let w = &d.g.n.w;
-    let (t1, n1) = (w.t1, d.g.n.n1);
-    let before = summary_and_community_rows(&w.db).await;
-    let insert_summary =
-        "insert into gnomon.summary (tenant_id, scope, node_id, content, as_of_valid)
-                          values ($1, $2, $3, 'direct', '2024-06-01') returning id";
-
-    // Gnomon assigns the ID, the Recorded time and the transaction mark.
-    for column in ["id", "recorded_from", "recorded_to", "written_in"] {
-        let mut client = w.db.login().await;
-        let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
-        let r = tx
+        // Written with its Citations and Nodes, then the claims change before
+        // the commit: what commits is cited and holds its Node, and the
+        // caller cannot delete either in between.
+        let mut client = n.w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
+        let s: Uuid = tx
             .query_typed(
-                &format!(
-                    "insert into gnomon.summary (tenant_id, scope, node_id, content, as_of_valid, {column})
-                     select $1, 'support', $2, 'direct', '2024-06-01', {column} from gnomon.summary
-                     where id = $3"
-                ),
-                &[(&t1, Type::UUID), (&n1, Type::UUID), (&d.support_summary, Type::UUID)],
-            )
-            .await;
-        assert_refused(r, &format!("choosing a Summary's {column}"));
-    }
-
-    let mut client = w.db.login().await;
-    let mut tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
-    // A Summary of a Node of billing, which this caller cannot see, or of
-    // another Tenant's Node.
-    for node in [d.g.billing_node, d.g.n.n2] {
-        let sp = tx.savepoint("node").await.unwrap();
-        let r = sp
-            .query_typed(
-                insert_summary,
+                summary,
                 &[
                     (&t1, Type::UUID),
-                    (&"support", Type::TEXT),
-                    (&node, Type::UUID),
+                    (&n.n1, Type::UUID),
+                    (&vec![n.w.t1_support], Type::UUID_ARRAY),
                 ],
             )
-            .await;
-        assert_invalid_write(r, &format!("Node {node} is not visible to the caller"));
-        sp.rollback().await.unwrap();
-    }
-    // A Summary in a Scope the caller cannot see.
-    let sp = tx.savepoint("scope").await.unwrap();
-    let r = sp
-        .query_typed(
-            insert_summary,
-            &[
-                (&t1, Type::UUID),
-                (&"billing", Type::TEXT),
-                (&n1, Type::UUID),
-            ],
-        )
-        .await;
-    assert_refused(r, "a Summary in billing");
-    sp.rollback().await.unwrap();
-    // A second current Summary of n1 in support.
-    let sp = tx.savepoint("second").await.unwrap();
-    let r = sp
-        .query_typed(
-            insert_summary,
-            &[
-                (&t1, Type::UUID),
-                (&"support", Type::TEXT),
-                (&n1, Type::UUID),
-            ],
-        )
-        .await;
-    assert_invalid_write(
-        r,
-        &format!(
-            "Node {n1} has a Summary in Scope support whose Recorded time a new one would \
-             overlap; close it first"
-        ),
-    );
-    sp.rollback().await.unwrap();
-    // A Citation added to the committed Summary.
-    let sp = tx.savepoint("cite").await.unwrap();
-    let r = sp
-        .query_typed(
-            "insert into gnomon.summary_citation
-               (tenant_id, scope, summary_id, episode_id, episode_reference_time, episode_recorded_at)
-             select e.tenant_id, e.scope, $2, e.id, e.reference_time, e.recorded_at
-             from gnomon.episode e where e.id = $1",
-            &[(&w.t1_support, Type::UUID), (&d.support_summary, Type::UUID)],
-        )
-        .await;
-    assert_invalid_write(
-        r,
-        &format!(
-            "a Summary's Citations and Nodes are written with it, and {} was written earlier",
-            d.support_summary
-        ),
-    );
-    sp.rollback().await.unwrap();
-    tx.rollback().await.unwrap();
-
-    // A new Summary of billing's Node, written by a caller of both Scopes,
-    // citing an Episode of support: the foreign key carries billing.
-    let both = claims(t1, &["support", "billing"]);
-    let mut client = w.db.login().await;
-    let tx = as_caller(&mut client, WORKER, &both).await;
-    let id: Uuid = tx
-        .query_typed(
-            insert_summary,
-            &[
-                (&t1, Type::UUID),
-                (&"support", Type::TEXT),
-                (&d.g.billing_node, Type::UUID),
-            ],
+            .await
+            .unwrap()[0]
+            .get(0);
+        let k: Uuid = tx
+            .query_typed(
+                community,
+                &[
+                    (&t1, Type::UUID),
+                    (&vec![n.n1], Type::UUID_ARRAY),
+                    (&vec![n.w.t1_support], Type::UUID_ARRAY),
+                ],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        for sql in [
+            "delete from gnomon.summary_citation",
+            "delete from gnomon.community_citation",
+            "delete from gnomon.community_member",
+        ] {
+            tx.batch_execute("savepoint attempt").await.unwrap();
+            assert_refused(tx.batch_execute(sql).await, &format!("{role}: {sql}"));
+            tx.batch_execute("rollback to savepoint attempt")
+                .await
+                .unwrap();
+        }
+        tx.query_typed(
+            "select set_config('request.jwt.claims', $1, true)",
+            &[(&claims(t1, &[]), Type::TEXT)],
         )
         .await
-        .unwrap()[0]
-        .get(0);
-    let r = tx
-        .query_typed(
-            "insert into gnomon.summary_citation
-               (tenant_id, scope, summary_id, episode_id, episode_reference_time, episode_recorded_at)
-             select e.tenant_id, 'support', $2, e.id, e.reference_time, e.recorded_at
-             from gnomon.episode e where e.id = $1",
-            &[(&w.t1_billing, Type::UUID), (&id, Type::UUID)],
-        )
-        .await;
-    match r {
-        Err(e) => assert_eq!(e.code(), Some(&SqlState::FOREIGN_KEY_VIOLATION), "{e:?}"),
-        Ok(v) => panic!("a Summary of support cited billing's Episode: {v:?}"),
+        .unwrap();
+        tx.commit().await.unwrap();
+        let held =
+            n.w.db
+                .admin()
+                .await
+                .query_typed(
+                    "select (select count(*) from gnomon.summary_citation where summary_id = $1),
+                        (select count(*) from gnomon.community_citation where community_id = $2),
+                        (select count(*) from gnomon.community_member where community_id = $2)",
+                    &[(&s, Type::UUID), (&k, Type::UUID)],
+                )
+                .await
+                .unwrap();
+        let counts: (i64, i64, i64) = (held[0].get(0), held[0].get(1), held[0].get(2));
+        assert_eq!(counts, (1, 1, 1), "{role}");
     }
-    tx.rollback().await.unwrap();
-
-    // A Summary that cites nothing does not commit.
-    let mut client = w.db.login().await;
-    let tx = as_caller(&mut client, WORKER, &both).await;
-    let id: Uuid = tx
-        .query_typed(
-            insert_summary,
-            &[
-                (&t1, Type::UUID),
-                (&"support", Type::TEXT),
-                (&d.g.billing_node, Type::UUID),
-            ],
-        )
-        .await
-        .unwrap()[0]
-        .get(0);
-    let e = tx.commit().await.unwrap_err();
-    assert_eq!(
-        e.code().map(|c| c.code()),
-        Some(gnomon::INVALID_WRITE),
-        "{e:?}"
-    );
-    assert_eq!(
-        e.as_db_error().unwrap().message(),
-        format!("Summary {id} cites no Episode")
-    );
-
-    // A Community of support that holds billing's Node, which its caller
-    // sees: the foreign key carries support (ADR-0014).
-    let mut client = w.db.login().await;
-    let tx = as_caller(&mut client, WORKER, &both).await;
-    let k: Uuid = tx
-        .query_typed(
-            "insert into gnomon.community (tenant_id, scope, content, as_of_valid)
-             values ($1, 'support', 'direct', '2024-06-01') returning id",
-            &[(&t1, Type::UUID)],
-        )
-        .await
-        .unwrap()[0]
-        .get(0);
-    let r = tx
-        .query_typed(
-            "insert into gnomon.community_member (tenant_id, scope, community_id, node_id)
-             values ($1, 'support', $2, $3)",
-            &[
-                (&t1, Type::UUID),
-                (&k, Type::UUID),
-                (&d.g.billing_node, Type::UUID),
-            ],
-        )
-        .await;
-    match r {
-        Err(e) => assert_eq!(e.code(), Some(&SqlState::FOREIGN_KEY_VIOLATION), "{e:?}"),
-        Ok(v) => panic!("a Community of support held billing's Node: {v:?}"),
-    }
-    tx.rollback().await.unwrap();
-    // A Node added to the committed Community.
-    let mut client = w.db.login().await;
-    let tx = as_caller(&mut client, WORKER, &both).await;
-    let r = tx
-        .query_typed(
-            "insert into gnomon.community_member (tenant_id, scope, community_id, node_id)
-             values ($1, 'support', $2, $3)",
-            &[
-                (&t1, Type::UUID),
-                (&d.community, Type::UUID),
-                (&n1, Type::UUID),
-            ],
-        )
-        .await;
-    assert_invalid_write(
-        r,
-        &format!(
-            "a Community's Citations and Nodes are written with it, and {} was written earlier",
-            d.community
-        ),
-    );
-    tx.rollback().await.unwrap();
-
-    assert_eq!(summary_and_community_rows(&w.db).await, before);
+    // Each caller committed one row of each table and nothing more.
+    let after = summary_and_community_rows(&n.w.db).await;
+    let added: Vec<i64> = after.iter().zip(&before).map(|(a, b)| a - b).collect();
+    assert_eq!(added, [2, 2, 2, 2, 2]);
 }
 
 #[tokio::test]
@@ -7534,13 +5910,13 @@ async fn named_world() -> World {
         let (tenant, scope, node, name): (Uuid, String, Uuid, String) =
             (row.get(0), row.get(1), row.get(2), row.get(3));
         store
-            .as_worker(TenantId(tenant), Scope::new(scope))
+            .as_worker(TenantId(tenant), Scope::new(scope), None)
             .store_name_embedding(TenantId(tenant), gnomon::NodeId(node), &name, &rng.unit())
             .await
             .unwrap();
     }
     store
-        .as_worker(TenantId(w.t1), Scope::new("support"))
+        .as_worker(TenantId(w.t1), Scope::new("support"), None)
         .create_node(
             &gnomon::NewNode {
                 tenant: Some(TenantId(w.t1)),
@@ -7626,7 +6002,7 @@ async fn a_caller_cannot_write_the_name_rows_directly_with_another_scopes_data_o
         }
     };
     let (t1, t2) = (w.t1, w.t2);
-    let (own_version, own_node, own_hash) = id_of("support", t1).await;
+    let (own_version, own_node, _) = id_of("support", t1).await;
     let (_, billing_node, billing_hash) = id_of("billing", t1).await;
     let (_, other_tenant_node, _) = id_of("support", t2).await;
     let v = sql_vector();
@@ -7701,47 +6077,22 @@ async fn a_caller_cannot_write_the_name_rows_directly_with_another_scopes_data_o
                 );
             }
         }
-        // Another Scope's and Tenant's rows are not the caller's to update:
-        // RLS shows it none.
-        let mut client = w.db.login().await;
-        let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-        for (sql, what) in [
-            (
-                "update gnomon.node_name set q = null where scope = 'billing'",
-                "billing",
-            ),
-            (
-                "update gnomon.node_name set q = null where tenant_id <> gnomon.tenant_id()",
-                "Tenant 2",
-            ),
-        ] {
-            assert_eq!(
-                tx.execute_typed(sql, &[]).await.unwrap(),
-                0,
-                "{role} updated {what}"
-            );
-        }
-        // Forged bits on the caller's own row are replaced by the bits of
-        // the stored full vector.
-        let updated = tx
-            .execute_typed(
-                "update gnomon.node_name set q = ~q where text_hash = $1",
-                &[(&own_hash, Type::TEXT)],
-            )
-            .await
-            .unwrap();
-        assert_eq!(updated, 1);
-        tx.commit().await.unwrap();
     }
     assert_eq!(name_rows(&w.db).await, before);
 }
 
 #[tokio::test]
-async fn callers_hold_only_select_and_a_bits_update_on_the_name_table_and_the_definer_no_more_than_it_needs()
+async fn callers_hold_only_select_on_the_name_table_and_the_writer_a_bits_update_and_the_definer_no_more_than_it_needs()
  {
     let w = world().await;
     let admin = w.db.admin().await;
-    for role in [USER, WORKER, support::LOGIN_ROLE, "gnomon_definer"] {
+    for role in [
+        USER,
+        WORKER,
+        support::LOGIN_ROLE,
+        "gnomon_writer",
+        "gnomon_definer",
+    ] {
         let privileges: Vec<String> = admin
             .query_typed(
                 "select p from unnest(array['SELECT', 'INSERT', 'UPDATE', 'DELETE',
@@ -7763,7 +6114,8 @@ async fn callers_hold_only_select_and_a_bits_update_on_the_name_table_and_the_de
         let expected: Vec<&str> = match role {
             r if r == support::LOGIN_ROLE => vec![],
             "gnomon_definer" => vec!["SELECT", "INSERT", "DELETE"],
-            _ => vec!["SELECT", "UPDATE (q)"],
+            "gnomon_writer" => vec!["SELECT", "UPDATE (q)"],
+            _ => vec!["SELECT"],
         };
         assert_eq!(privileges, expected, "{role} on gnomon.node_name");
     }
@@ -7802,9 +6154,10 @@ async fn callers_hold_only_select_and_a_bits_update_on_the_name_table_and_the_de
             assert_eq!(may, callers_may, "{role} may execute {function}");
         }
     }
-    // The caller roles' only policy is their Tenant and Scopes. The
-    // definer's reach is a read of the names that share a text with an Edge
-    // the running Erasure listed.
+    // The caller roles' only policy is a read of their Tenant and Scopes,
+    // which the writer shares, and the writer updates only rows of a Scope
+    // it may write. The definer's reach is a read of the names that share a
+    // text with an Edge the running Erasure listed.
     let policies: Vec<(String, Vec<String>, String)> = admin
         .query_typed(
             "select policyname::text, array(select r::text from unnest(roles) r order by 1), cmd::text
@@ -7821,6 +6174,11 @@ async fn callers_hold_only_select_and_a_bits_update_on_the_name_table_and_the_de
         policies,
         vec![
             (
+                "node_name_definer".to_owned(),
+                vec!["gnomon_definer".to_owned()],
+                "ALL".to_owned()
+            ),
+            (
                 "node_name_erasure_reach_read".to_owned(),
                 vec!["gnomon_definer".to_owned()],
                 "SELECT".to_owned()
@@ -7829,10 +6187,15 @@ async fn callers_hold_only_select_and_a_bits_update_on_the_name_table_and_the_de
                 "node_name_tenant_scope".to_owned(),
                 vec![
                     "authenticated".to_owned(),
-                    "gnomon_definer".to_owned(),
-                    "gnomon_worker".to_owned()
+                    "gnomon_worker".to_owned(),
+                    "gnomon_writer".to_owned()
                 ],
-                "ALL".to_owned()
+                "SELECT".to_owned()
+            ),
+            (
+                "node_name_writer_update".to_owned(),
+                vec!["gnomon_writer".to_owned()],
+                "UPDATE".to_owned()
             ),
         ]
     );
@@ -7883,7 +6246,7 @@ async fn derived_world() -> DerivedWorld {
     {
         let (tenant, scope, node, episode): (Uuid, String, Uuid, Uuid) =
             (row.get(0), row.get(1), row.get(2), row.get(3));
-        let caller = store.as_worker(TenantId(tenant), Scope::new(scope.clone()));
+        let caller = store.as_worker(TenantId(tenant), Scope::new(scope.clone()), None);
         let at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
         let summary = caller
             .write_summary(
@@ -7927,7 +6290,7 @@ async fn derived_world() -> DerivedWorld {
     let support_node = nodes[&(w.t1, "support".to_owned())];
     // A second Node in Tenant 1's `support`, with a Summary and no embedding.
     let (other, _) = store
-        .as_worker(TenantId(w.t1), Scope::new("support"))
+        .as_worker(TenantId(w.t1), Scope::new("support"), None)
         .create_node(
             &gnomon::NewNode {
                 tenant: Some(TenantId(w.t1)),
@@ -7943,7 +6306,7 @@ async fn derived_world() -> DerivedWorld {
         .await
         .unwrap();
     let unembedded = store
-        .as_worker(TenantId(w.t1), Scope::new("support"))
+        .as_worker(TenantId(w.t1), Scope::new("support"), None)
         .write_summary(
             TenantId(w.t1),
             &gnomon::NewSummary {
@@ -8123,10 +6486,11 @@ async fn a_caller_cannot_write_the_summary_search_rows_or_forge_an_embedding_of_
     }
     assert_eq!(derived_search_rows(&w.db).await, before);
 
-    // An embedding row a caller inserts for its own Summary holds the bits
-    // of its own vector and the Summary's time columns, whatever it supplied.
-    let mut client = w.db.login().await;
-    let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
+    // An embedding row the writer role inserts for a Summary holds the bits
+    // of its own vector and the Summary's time columns, whatever the insert
+    // supplied.
+    let mut client = w.db.admin().await;
+    let tx = as_writer(&mut client, &claims(t1, &["support"])).await;
     tx.batch_execute(&embedding_row(t1, "support", dw.unembedded_summary))
         .await
         .unwrap();
@@ -8164,14 +6528,14 @@ async fn a_caller_cannot_write_the_summary_search_rows_or_forge_an_embedding_of_
 }
 
 #[tokio::test]
-async fn callers_hold_only_select_on_the_summary_token_rows_and_select_and_insert_on_their_embeddings()
+async fn callers_hold_only_select_on_the_summary_token_rows_and_their_embeddings_and_the_writer_inserts_embeddings()
  {
     let w = world().await;
     let admin = w.db.admin().await;
-    for (table, caller, definer) in [
+    for (table, writer, definer) in [
         (
             "gnomon.derived_search_token",
-            vec!["SELECT"],
+            vec![],
             vec!["SELECT", "INSERT", "DELETE"],
         ),
         (
@@ -8180,7 +6544,13 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_select_and_inser
             vec!["SELECT", "DELETE"],
         ),
     ] {
-        for role in [USER, WORKER, support::LOGIN_ROLE, "gnomon_definer"] {
+        for role in [
+            USER,
+            WORKER,
+            support::LOGIN_ROLE,
+            "gnomon_writer",
+            "gnomon_definer",
+        ] {
             let privileges: Vec<String> = admin
                 .query_typed(
                     "select p from unnest(array['SELECT', 'INSERT', 'UPDATE', 'DELETE',
@@ -8201,7 +6571,8 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_select_and_inser
             let expected = match role {
                 r if r == support::LOGIN_ROLE => vec![],
                 "gnomon_definer" => definer.clone(),
-                _ => caller.clone(),
+                "gnomon_writer" => writer.clone(),
+                _ => vec!["SELECT"],
             };
             assert_eq!(privileges, expected, "{role} on {table}");
         }
@@ -8249,7 +6620,8 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_select_and_inser
         .unwrap()[0]
         .get(0);
     assert_eq!(owner, "gnomon_definer");
-    // The callers' only policy is their Tenant and Scopes. The definer's
+    // The callers' only policy is a read of their Tenant and Scopes, and the
+    // writer inserts embeddings only in a Scope it may write. The definer's
     // reach reads and deletes the rows of a Summary the running Erasure
     // reaches.
     for table in DERIVED_SEARCH_TABLES {
@@ -8267,31 +6639,41 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_select_and_inser
             .map(|r| (r.get(0), r.get(1), r.get(2)))
             .collect();
         let definer = vec!["gnomon_definer".to_owned()];
-        assert_eq!(
-            policies,
-            vec![
-                (
-                    format!("{table}_erasure_reach_delete"),
-                    definer.clone(),
-                    "DELETE".to_owned()
-                ),
-                (
-                    format!("{table}_erasure_reach_read"),
-                    definer,
-                    "SELECT".to_owned()
-                ),
-                (
-                    format!("{table}_tenant_scope"),
-                    vec![
-                        "authenticated".to_owned(),
-                        "gnomon_definer".to_owned(),
-                        "gnomon_worker".to_owned()
-                    ],
-                    "ALL".to_owned()
-                ),
-            ],
-            "gnomon.{table}"
-        );
+        let embeddings = *table == "derived_embedding";
+        let mut readers = vec!["authenticated".to_owned(), "gnomon_worker".to_owned()];
+        if embeddings {
+            readers.push("gnomon_writer".to_owned());
+        }
+        let mut expected = vec![
+            (
+                format!("{table}_definer"),
+                definer.clone(),
+                "ALL".to_owned(),
+            ),
+            (
+                format!("{table}_erasure_reach_delete"),
+                definer.clone(),
+                "DELETE".to_owned(),
+            ),
+            (
+                format!("{table}_erasure_reach_read"),
+                definer,
+                "SELECT".to_owned(),
+            ),
+            (
+                format!("{table}_tenant_scope"),
+                readers,
+                "SELECT".to_owned(),
+            ),
+        ];
+        if embeddings {
+            expected.push((
+                format!("{table}_writer_insert"),
+                vec!["gnomon_writer".to_owned()],
+                "INSERT".to_owned(),
+            ));
+        }
+        assert_eq!(policies, expected, "gnomon.{table}");
     }
 }
 
@@ -8429,7 +6811,7 @@ async fn sentenced() -> Sentenced {
         .await
         .unwrap();
     let (_, written) = store
-        .as_worker(TenantId(e.n.w.t1), Scope::new("billing"))
+        .as_worker(TenantId(e.n.w.t1), Scope::new("billing"), None)
         .create_edge(
             &gnomon::NewEdge {
                 tenant: Some(TenantId(e.n.w.t1)),
@@ -8464,7 +6846,7 @@ async fn sentenced() -> Sentenced {
         (e.n.w.t1, "billing", billing_open.0),
     ] {
         store
-            .as_worker(TenantId(t), Scope::new(scope))
+            .as_worker(TenantId(t), Scope::new(scope), None)
             .store_sentence(TenantId(t), gnomon::VersionId(version), "Its own Sentence.")
             .await
             .unwrap();
@@ -8512,13 +6894,11 @@ fn assert_refused_sentence(
 }
 
 #[tokio::test]
-async fn a_caller_stores_a_sentence_only_of_an_edge_version_it_sees_by_the_function_or_directly() {
+async fn a_caller_stores_a_sentence_only_of_an_edge_version_it_sees() {
     let s = sentenced().await;
     let w = &s.e.n.w;
     let (t1, t2) = (w.t1, w.t2);
     let before = versions_and_sentences(&w.db).await;
-    let insert = "insert into gnomon.sentence (tenant_id, scope, version_id, sentence)
-                  values ($1, $2, $3, $4)";
     for role in [USER, WORKER] {
         let calls: [(Uuid, Uuid, &str, &str); 6] = [
             (
@@ -8558,145 +6938,16 @@ async fn a_caller_stores_a_sentence_only_of_an_edge_version_it_sees_by_the_funct
                 .await;
             assert_refused_sentence(r, &format!("{role} storing through the function {what}"));
         }
-        let inserts: [(Uuid, &str, Uuid, &str, &str); 6] = [
-            (
-                t2,
-                "support",
-                s.e2_open,
-                "A forged Sentence.",
-                "in another Tenant",
-            ),
-            (
-                t1,
-                "billing",
-                s.billing_open,
-                "A forged Sentence.",
-                "in a Scope it cannot see",
-            ),
-            (
-                t1,
-                "support",
-                s.billing_open,
-                "A forged Sentence.",
-                "of another Scope's Version",
-            ),
-            (
-                t1,
-                "support",
-                s.e2_open,
-                "A forged Sentence.",
-                "of another Tenant's Version",
-            ),
-            (
-                t1,
-                "support",
-                s.e.n.open,
-                "A forged Sentence.",
-                "of a Node Version",
-            ),
-            (t1, "support", s.e.e1_open, "   ", "with no word"),
-        ];
-        for (tenant, scope, version, sentence, what) in inserts {
-            let mut client = w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-            let r = tx
-                .execute_typed(
-                    insert,
-                    &[
-                        (&tenant, Type::UUID),
-                        (&scope, Type::TEXT),
-                        (&version, Type::UUID),
-                        (&sentence, Type::TEXT),
-                    ],
-                )
-                .await;
-            assert_refused_sentence(r, &format!("{role} inserting a Sentence {what}"));
-        }
-
-        // Its own Sentence it may store and replace, and change nothing else
-        // about it: not its Tenant, Scope or Version, and not by a delete.
-        let own: [(&str, &str); 6] = [
-            (
-                "update gnomon.sentence set tenant_id = $2 where version_id = $1",
-                "its Tenant",
-            ),
-            (
-                "update gnomon.sentence set scope = 'billing' where version_id = $1 and $2::uuid is not null",
-                "its Scope",
-            ),
-            (
-                "update gnomon.sentence set version_id = $2 where version_id = $1",
-                "its Version",
-            ),
-            (
-                "delete from gnomon.sentence where version_id = $1 and $2::uuid is not null",
-                "a delete",
-            ),
-            ("truncate gnomon.sentence", "a truncate"),
-            (
-                "update gnomon.sentence set sentence = '' where version_id = $1 and $2::uuid is not null",
-                "an empty text",
-            ),
-        ];
-        for (sql, what) in own {
-            let mut client = w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-            tx.execute_typed(
-                STORE_SENTENCE,
-                &[
-                    (&t1, Type::UUID),
-                    (&s.e.e1_open, Type::UUID),
-                    (&"Its own Sentence.", Type::TEXT),
-                ],
-            )
-            .await
-            .unwrap();
-            let r = if sql.starts_with("truncate") {
-                tx.execute_typed(sql, &[]).await
-            } else {
-                let other = if what == "its Tenant" { t2 } else { s.e.n.open };
-                tx.execute_typed(sql, &[(&s.e.e1_open, Type::UUID), (&other, Type::UUID)])
-                    .await
-            };
-            assert_refused_sentence(r, &format!("{role} changing its own Sentence by {what}"));
-        }
-
         // Another Tenant's and another Scope's Sentences are not there to
-        // change.
+        // read.
         let mut client = w.db.login().await;
         let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-        for version in [s.e2_open, s.billing_open] {
-            let changed = tx
-                .execute_typed(
-                    "update gnomon.sentence set sentence = 'A forged Sentence.'
-                     where version_id = $1",
-                    &[(&version, Type::UUID)],
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                changed, 0,
-                "{role} changed another Scope's or Tenant's Sentence"
-            );
-        }
         let seen: i64 = tx
             .query_typed("select count(*) from gnomon.sentence", &[])
             .await
             .unwrap()[0]
             .get(0);
         assert_eq!(seen, 0, "{role} saw another Scope's or Tenant's Sentences");
-        // A direct insert of its own, as the function's.
-        tx.execute_typed(
-            insert,
-            &[
-                (&t1, Type::UUID),
-                (&"support", Type::TEXT),
-                (&s.e.e1_open, Type::UUID),
-                (&"Its own Sentence.", Type::TEXT),
-            ],
-        )
-        .await
-        .unwrap();
         tx.rollback().await.unwrap();
     }
     assert_eq!(
@@ -8804,7 +7055,7 @@ async fn a_replaced_sentence_leaves_no_embedding_of_its_old_text_and_touches_no_
         (w.t1, "billing", s.billing_open),
         (w.t2, "support", s.e2_open),
     ] {
-        let caller = store.as_worker(TenantId(t), Scope::new(scope));
+        let caller = store.as_worker(TenantId(t), Scope::new(scope), None);
         caller
             .store_sentence(TenantId(t), gnomon::VersionId(version), text)
             .await
@@ -8870,7 +7121,7 @@ async fn a_replaced_sentence_leaves_no_embedding_of_its_old_text_and_touches_no_
 
     // Committed by the Store, as the Pipeline would.
     store
-        .as_worker(TenantId(w.t1), Scope::new("support"))
+        .as_worker(TenantId(w.t1), Scope::new("support"), None)
         .store_sentence(
             TenantId(w.t1),
             gnomon::VersionId(s.e.e1_open),
@@ -8931,7 +7182,7 @@ async fn the_gap_listing_names_only_the_callers_tenant_and_scope() {
         .await
         .unwrap();
     let (_, unsentenced) = store
-        .as_worker(TenantId(t1), Scope::new("billing"))
+        .as_worker(TenantId(t1), Scope::new("billing"), None)
         .create_edge(
             &gnomon::NewEdge {
                 tenant: Some(TenantId(t1)),
@@ -8949,7 +7200,7 @@ async fn the_gap_listing_names_only_the_callers_tenant_and_scope() {
         .await
         .unwrap();
     let billing_gaps: Vec<String> = store
-        .as_worker(TenantId(t1), Scope::new("billing"))
+        .as_worker(TenantId(t1), Scope::new("billing"), None)
         .list_gaps(TenantId(t1), &Scope::new("billing"), None, 1000)
         .await
         .unwrap()
@@ -9060,10 +7311,11 @@ async fn the_gap_listing_names_only_the_callers_tenant_and_scope() {
 }
 
 #[tokio::test]
-async fn callers_insert_a_sentence_and_change_only_its_text_and_both_functions_are_invokers() {
+async fn the_writer_inserts_a_sentence_and_changes_only_its_text_and_store_sentence_is_its_definer()
+{
     let w = world().await;
     let admin = w.db.admin().await;
-    for role in [USER, WORKER] {
+    for role in ["gnomon_writer"] {
         let table: Vec<String> = admin
             .query_typed(
                 "select p from unnest(array['SELECT', 'INSERT', 'UPDATE', 'DELETE',
@@ -9133,7 +7385,13 @@ async fn callers_insert_a_sentence_and_change_only_its_text_and_both_functions_a
     for f in functions {
         let (name, definer, config, grantees): (String, bool, Vec<String>, Vec<String>) =
             (f.get(0), f.get(1), f.get(2), f.get(3));
-        assert!(!definer, "{name} is a definer");
+        // Storing a Sentence is a write, so it runs as `gnomon_writer`; the
+        // gap listing is a read, and runs as the caller.
+        assert_eq!(
+            definer,
+            name.starts_with("gnomon.store_sentence("),
+            "{name}"
+        );
         assert_eq!(config, ["search_path=pg_catalog, pg_temp"], "{name}");
         assert_eq!(grantees, ["authenticated", "gnomon_worker"], "{name}");
     }

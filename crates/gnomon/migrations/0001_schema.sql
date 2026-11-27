@@ -93,35 +93,58 @@ begin
 end
 $$;
 
--- The definer role. It owns the definer functions and nothing else, never
--- logs in, and stays under RLS, so the Tenant policies below still apply
--- inside the definer functions. A role of that name that already exists must
--- hold no more than this.
+-- The definer roles. Each owns definer functions and nothing else, never
+-- logs in, and stays under RLS, so the policies below still apply inside
+-- the definer functions: a role that owns no table and cannot bypass RLS is
+-- held to the policies that name it (ADR-0009).
+--
+--   gnomon_definer  Erasure, Kind registration, the merge-rule setter and
+--                   the search index trigger.
+--   gnomon_writer   every function a caller writes through (#81). Its
+--                   policies read the caller's Scopes and write only those
+--                   that are writable as well.
+--
+-- A role of either name that already exists must hold no more than this.
+-- No caller role is a member of either.
 do $$
+declare
+  r text;
 begin
-  if not exists (select from pg_roles where rolname = 'gnomon_definer') then
-    create role gnomon_definer nologin noinherit nobypassrls;
-  end if;
-  if exists (
-    select from pg_roles
-    where rolname = 'gnomon_definer'
-      and (rolcanlogin or rolsuper or rolbypassrls or rolcreaterole or rolcreatedb or rolreplication)
-  ) then
-    raise exception 'the gnomon role gnomon_definer must be NOLOGIN, must not bypass RLS, '
-      'and must not create roles or databases or replicate';
-  end if;
-  if exists (
-    select from pg_auth_members m join pg_roles r on r.oid = m.member
-    where r.rolname = 'gnomon_definer'
-  ) then
-    raise exception 'the gnomon role gnomon_definer must not be a member of another role';
-  end if;
+  foreach r in array array['gnomon_definer', 'gnomon_writer'] loop
+    if not exists (select from pg_roles where rolname = r) then
+      execute format('create role %I nologin noinherit nobypassrls', r);
+    end if;
+    if exists (
+      select from pg_roles
+      where rolname = r
+        and (rolcanlogin or rolinherit or rolsuper or rolbypassrls or rolcreaterole
+             or rolcreatedb or rolreplication)
+    ) then
+      raise exception 'the gnomon role % must be NOLOGIN and NOINHERIT, must not bypass RLS, '
+        'and must not create roles or databases or replicate', r;
+    end if;
+    if exists (
+      select from pg_auth_members m join pg_roles x on x.oid = m.member
+      where x.rolname = r
+    ) then
+      raise exception 'the gnomon role % must not be a member of another role', r;
+    end if;
+    if exists (
+      select from pg_auth_members m
+      join pg_roles g on g.oid = m.roleid
+      join pg_roles x on x.oid = m.member
+      where g.rolname = r and x.rolname in ('authenticated', 'gnomon_worker')
+    ) then
+      raise exception 'the caller roles must not be members of the gnomon role %', r;
+    end if;
+  end loop;
 end
 $$;
 
--- pgvector's schema. The Store's functions run as the caller, so the caller
--- roles need to reach pgvector's types and functions, and the definer role
--- needs them for the search index trigger. `public` and Supabase's
+-- pgvector's schema. The Store's read functions run as the caller, so the
+-- caller roles need to reach pgvector's types and functions, the writer role
+-- needs them to store embeddings, and the definer role needs them for the
+-- search index trigger. `public` and Supabase's
 -- `extensions` already let them. A role that neither owns the schema nor
 -- holds the grant option is only warned and grants nothing, so the check
 -- after each grant fails the migration instead.
@@ -132,6 +155,7 @@ declare
     from pg_catalog.pg_extension e
     join pg_catalog.pg_namespace n on n.oid = e.extnamespace
     where e.extname = 'vector');
+  r text;
 begin
   if not (has_schema_privilege('authenticated', ext, 'USAGE')
           and has_schema_privilege('gnomon_worker', ext, 'USAGE')) then
@@ -142,13 +166,15 @@ begin
         'where pgvector is; grant it as the schema''s owner and apply this migration again', ext;
     end if;
   end if;
-  if not has_schema_privilege('gnomon_definer', ext, 'USAGE') then
-    execute format('grant usage on schema %I to gnomon_definer', ext);
-    if not has_schema_privilege('gnomon_definer', ext, 'USAGE') then
-      raise exception 'the role gnomon_definer needs USAGE on schema %, where pgvector is; '
-        'grant it as the schema''s owner and apply this migration again', ext;
+  foreach r in array array['gnomon_definer', 'gnomon_writer'] loop
+    if not has_schema_privilege(r, ext, 'USAGE') then
+      execute format('grant usage on schema %I to %I', ext, r);
+      if not has_schema_privilege(r, ext, 'USAGE') then
+        raise exception 'the role % needs USAGE on schema %, where pgvector is; '
+          'grant it as the schema''s owner and apply this migration again', r, ext;
+      end if;
     end if;
-  end if;
+  end loop;
 end
 $$;
 
@@ -235,53 +261,15 @@ create table gnomon.tenancy (
 
 insert into gnomon.tenancy (mode, default_tenant_id) values ('single', gnomon.uuid_v7());
 
--- The row changes once, from single-tenant to multi-tenant mode, and never
--- back. Guard triggers refuse every other update, every delete and a
--- truncate, whoever runs them, the table's owner included. The switch's
--- time is the transaction's, whatever the update says.
-create function gnomon.tenancy_guard_update() returns trigger
-  language plpgsql security invoker set search_path = pg_catalog, pg_temp
-  as $$
-  begin
-    if old.mode = 'single' and new.mode = 'multi'
-       and new.singleton = old.singleton
-       and new.default_tenant_id = old.default_tenant_id then
-      new.switched_at := transaction_timestamp();
-      return new;
-    end if;
-    if old.mode = 'multi' and new.mode = 'single' then
-      raise exception using errcode = 'GNT03',
-        message = 'a multi-tenant deployment cannot switch back to single-tenant mode';
-    end if;
-    raise exception using errcode = 'GNT03',
-      message = 'the tenancy row changes only by switching from single-tenant to multi-tenant mode';
-  end
-  $$;
-
-create function gnomon.tenancy_guard_remove() returns trigger
-  language plpgsql security invoker set search_path = pg_catalog, pg_temp
-  as $$
-  begin
-    raise exception using errcode = 'GNT03',
-      message = 'the tenancy row cannot be removed';
-  end
-  $$;
-
-create trigger tenancy_guard_update before update on gnomon.tenancy
-  for each row execute function gnomon.tenancy_guard_update();
-
-create trigger tenancy_guard_delete before delete on gnomon.tenancy
-  for each row execute function gnomon.tenancy_guard_remove();
-
-create trigger tenancy_guard_truncate before truncate on gnomon.tenancy
-  for each statement execute function gnomon.tenancy_guard_remove();
-
 -- Grants decide who reads and who switches; the policies apply to every
--- role. The callers and the definer role get SELECT, because
+-- role but the owner. The callers and the definer roles get SELECT, because
 -- `gnomon.tenant_id()` reads the row as whichever of them is calling. No
--- caller role gets UPDATE. The update policy admits only the switch, so a
--- role a deployment grants UPDATE can do nothing else to the row, and the
--- guard triggers refuse anything else from the owner too.
+-- caller role gets UPDATE. The update policy admits only the switch, from
+-- single-tenant to multi-tenant mode, so a role a deployment grants UPDATE
+-- can do nothing else to the row, and the check constraint holds the time
+-- of the switch to the mode. The row changes once and never back. Only the
+-- schema's owner could change it otherwise, and gnomon offers no defence
+-- against its owner (ADR-0024).
 --
 -- The row holds no secret. The first Tenant's ID is readable to every
 -- caller in multi-tenant mode, as any Tenant's ID is to whoever holds its
@@ -293,23 +281,43 @@ create policy tenancy_read on gnomon.tenancy for select using (true);
 create policy tenancy_switch on gnomon.tenancy for update
   using (mode = 'single') with check (mode = 'multi');
 
--- The Tenant and the Scopes of the current call (ADR-0005). Every RLS policy
--- is `tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes())`.
+-- The Tenant, the Scopes and the user of the current call (ADR-0005). Every
+-- read policy is `tenant_id = gnomon.tenant_id() and scope =
+-- any(gnomon.allowed_scopes())`, and every write policy also needs `scope =
+-- any(gnomon.writable_scopes())`.
+--
+--   gnomon.tenant_id()        the Tenant
+--   gnomon.allowed_scopes()   the Scope keys the caller may read
+--   gnomon.writable_scopes()  the Scope keys the caller may write. A write
+--                             needs its Scope in both lists.
+--   gnomon.user_id()          the user who records an Episode or its
+--                             Retraction, kept in `recorded_by`, or null
 --
 -- These are reference implementations. A deployment replaces them with
--- `create or replace function` to resolve Tenant and Scope its own way, and
--- keeps the same signatures. They read `request.jwt.claims`, which the Rust
--- core sets for each transaction:
+-- `create or replace function` to resolve them its own way, and keeps the
+-- same signatures. They read `request.jwt.claims`, which the Rust core sets
+-- for each transaction:
 --
---   as_user(jwt)               the end user's verified claims, unchanged
---   as_worker(tenant, scope)   {"role": "gnomon_worker",
---                               "app_metadata": {"tenant_id": <tenant>, "scopes": [<scope>]}}
+--   as_user(jwt)                     the end user's verified claims, unchanged
+--   as_worker(tenant, scope, user)   {"role": "gnomon_worker", "sub": <user, when given>,
+--                                     "app_metadata": {"tenant_id": <tenant>, "scopes": [<scope>]}}
 --
--- so a replacement must also resolve the worker's claims. With no claims the
--- Tenant is null and the Scope set is empty, so every policy denies. In
--- single-tenant mode claims that bind no Tenant resolve to the default
--- Tenant, and a replacement must return `coalesce(<its Tenant>,
+-- so a replacement must also answer for the worker's claims. It tells a
+-- worker call by the `role` claim, because a worker call may carry `sub`.
+-- With no claims the Tenant is null and the Scope sets are empty, so every
+-- policy denies. In single-tenant mode claims that bind no Tenant resolve to
+-- the default Tenant, and a replacement must return `coalesce(<its Tenant>,
 -- gnomon.default_tenant())`.
+--
+-- The four run as the caller during a read, as `gnomon_writer` during a
+-- write, and as `gnomon_definer` during an Erasure, Kind registration, the
+-- merge-rule setter and the search index trigger (ADR-0009). So a
+-- replacement reads only the claims, or reaches other data through a
+-- `SECURITY DEFINER` function of its own, such as one that reads a
+-- membership table. It does not depend on `current_user`. Anything outside
+-- gnomon that it calls must be usable by every one of these roles. Its
+-- `search_path`, and that of every function it calls, ends in `pg_temp`
+-- (see Search paths above).
 create function gnomon.tenant_id() returns uuid
   language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $fn$
@@ -337,6 +345,20 @@ create function gnomon.allowed_scopes() returns text[]
       ),
       '{}'
     )
+  $$;
+
+-- By default a caller may write every Scope it may read.
+create function gnomon.writable_scopes() returns text[]
+  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  as $$ select gnomon.allowed_scopes() $$;
+
+-- By default the `sub` claim, or null when it is missing or empty.
+create function gnomon.user_id() returns text
+  language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
+  as $$
+    select nullif(
+      nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub',
+      '')
   $$;
 
 -- The default Tenant in single-tenant mode, and null in multi-tenant mode,
@@ -396,12 +418,12 @@ create function gnomon.call_tenant(p_tenant_id uuid) returns uuid
 -- again changes nothing and returns the same Tenant.
 --
 -- This is an invoker function granted to no caller role, not a definer
--- (ADR-0009). It runs with the privileges of whoever calls it. The role
--- that applied the migrations owns the tenancy row and may always switch.
--- A deployment that wants another role to switch grants it EXECUTE on this
--- function, SELECT on gnomon.tenancy and UPDATE (mode) on gnomon.tenancy.
--- A role that the update cannot reach gets an error, never a silent
--- single-tenant deployment.
+-- (ADR-0009). It runs with the privileges of whoever calls it, and sets the
+-- time of the switch itself. The role that applied the migrations owns the
+-- tenancy row and may always switch. A deployment that wants another role
+-- to switch grants it EXECUTE on this function, SELECT on gnomon.tenancy and
+-- UPDATE (mode, switched_at) on gnomon.tenancy. A role that the update
+-- cannot reach gets an error, never a silent single-tenant deployment.
 create function gnomon.switch_to_multi_tenant() returns uuid
   language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
   as $$
@@ -409,7 +431,8 @@ create function gnomon.switch_to_multi_tenant() returns uuid
     v_mode text;
     v_first uuid;
   begin
-    update gnomon.tenancy set mode = 'multi' where mode = 'single';
+    update gnomon.tenancy set mode = 'multi', switched_at = transaction_timestamp()
+      where mode = 'single';
     select t.mode, t.default_tenant_id into v_mode, v_first from gnomon.tenancy t;
     if v_mode is distinct from 'multi' then
       raise exception using errcode = 'insufficient_privilege',
@@ -427,6 +450,9 @@ create table gnomon.episode (
   reference_time timestamptz not null,
   authority integer,
   recorded_at timestamptz not null default transaction_timestamp(),
+  -- Who recorded the Episode, as `gnomon.user_id()` names them, or null. No
+  -- role but the owner may insert a value, so it is always the default.
+  recorded_by text default gnomon.user_id(),
   -- The Tenant leads the key, so a later table's foreign key to an Episode
   -- names the Tenant too and cannot cite another Tenant's Episode.
   primary key (tenant_id, id),
@@ -438,11 +464,6 @@ create table gnomon.episode (
 create index episode_tenant_scope on gnomon.episode (tenant_id, scope, reference_time);
 
 alter table gnomon.episode enable row level security;
-
-create policy episode_tenant_scope on gnomon.episode
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
 
 -- One row per registered Kind, flattened with its ancestors.
 create table gnomon.kind (
@@ -494,7 +515,7 @@ alter table gnomon.kind enable row level security;
 alter table gnomon.kind_rule enable row level security;
 
 create policy kind_tenant on gnomon.kind
-  for select to authenticated, gnomon_worker, gnomon_definer
+  for select to authenticated, gnomon_worker, gnomon_writer, gnomon_definer
   using (tenant_id = gnomon.tenant_id());
 
 create policy kind_tenant_register on gnomon.kind
@@ -502,7 +523,7 @@ create policy kind_tenant_register on gnomon.kind
   with check (tenant_id = gnomon.tenant_id());
 
 create policy kind_rule_tenant on gnomon.kind_rule
-  for select to authenticated, gnomon_worker, gnomon_definer
+  for select to authenticated, gnomon_worker, gnomon_writer, gnomon_definer
   using (tenant_id = gnomon.tenant_id());
 
 create policy kind_rule_tenant_register on gnomon.kind_rule
@@ -564,11 +585,6 @@ create index edge_target on gnomon.edge (tenant_id, target_id, scope);
 
 alter table gnomon.edge enable row level security;
 
-create policy edge_tenant_scope on gnomon.edge
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
-
 -- A statement of an Episode about a Node or an Edge.
 create table gnomon.statement (
   tenant_id uuid not null,
@@ -610,11 +626,6 @@ create index statement_versioned on gnomon.statement (tenant_id, scope, versione
 create index statement_episode on gnomon.statement (tenant_id, episode_id);
 
 alter table gnomon.statement enable row level security;
-
-create policy statement_tenant_scope on gnomon.statement
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
 
 -- A Contribution: one Episode's value for one property of a Node over a Valid
 -- time. A JSON null ends the property over that Valid time. Contributions are
@@ -746,7 +757,7 @@ create index citation_episode on gnomon.citation (tenant_id, episode_id);
 create index citation_tenant_scope on gnomon.citation (tenant_id, scope, version_id);
 
 -- RLS: the Tenant and the Scopes of the call, exactly as on Episodes
--- (ADR-0005).
+-- (ADR-0005). The policies are at the end of this file.
 alter table gnomon.node enable row level security;
 
 alter table gnomon.contribution enable row level security;
@@ -754,26 +765,6 @@ alter table gnomon.contribution enable row level security;
 alter table gnomon.version enable row level security;
 
 alter table gnomon.citation enable row level security;
-
-create policy node_tenant_scope on gnomon.node
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
-
-create policy contribution_tenant_scope on gnomon.contribution
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
-
-create policy version_tenant_scope on gnomon.version
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
-
-create policy citation_tenant_scope on gnomon.citation
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
 
 -- A bound statement: an Episode's statement of one Valid-time bound of one
 -- Contribution.
@@ -815,11 +806,6 @@ create index bound_statement_episode on gnomon.bound_statement (tenant_id, episo
 
 alter table gnomon.bound_statement enable row level security;
 
-create policy bound_statement_tenant_scope on gnomon.bound_statement
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
-
 -- Each change of a Kind's own merge rule. The latest row of a Kind holds.
 create table gnomon.kind_merge (
   tenant_id uuid not null,
@@ -836,7 +822,7 @@ create index kind_merge_kind on gnomon.kind_merge (tenant_id, kind, id desc);
 alter table gnomon.kind_merge enable row level security;
 
 create policy kind_merge_tenant on gnomon.kind_merge
-  for select to authenticated, gnomon_worker, gnomon_definer
+  for select to authenticated, gnomon_worker, gnomon_writer, gnomon_definer
   using (tenant_id = gnomon.tenant_id());
 
 create policy kind_merge_tenant_set on gnomon.kind_merge
@@ -871,11 +857,6 @@ create table gnomon.sentence (
 
 alter table gnomon.sentence enable row level security;
 
-create policy sentence_tenant_scope on gnomon.sentence
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
-
 create index contribution_statement on gnomon.contribution (tenant_id, statement_id)
   where statement_id is not null;
 
@@ -884,17 +865,14 @@ create table gnomon.episode_retraction (
   scope text not null,
   episode_id uuid not null,
   recorded_at timestamptz not null default transaction_timestamp(),
+  -- Who retracted the Episode, as for an Episode's `recorded_by`.
+  recorded_by text default gnomon.user_id(),
   primary key (tenant_id, episode_id),
   foreign key (tenant_id, episode_id) references gnomon.episode (tenant_id, id)
     on delete cascade
 );
 
 alter table gnomon.episode_retraction enable row level security;
-
-create policy episode_retraction_tenant_scope on gnomon.episode_retraction
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
 
 -- What the running Erasure of a Node, an Edge or a Scope may reach outside
 -- the caller's Scopes: the Nodes it erases and the Edges that join them.
@@ -968,17 +946,7 @@ create index stage_usage_tenant_scope on gnomon.stage_usage (tenant_id, scope, e
 
 alter table gnomon.stage_record enable row level security;
 
-create policy stage_record_tenant_scope on gnomon.stage_record
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
-
 alter table gnomon.stage_usage enable row level security;
-
-create policy stage_usage_tenant_scope on gnomon.stage_usage
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
 
 -- The token table: one row per word of each Version's searchable text.
 create table gnomon.search_token (
@@ -1042,11 +1010,6 @@ alter table gnomon.search_count_delta enable row level security;
 -- Callers read the rows of their own Tenant and Scopes. The changes another
 -- transaction recorded are never visible to a caller: they are uncommitted,
 -- and the commit deletes them.
-create policy search_token_tenant_scope on gnomon.search_token
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
-
 create policy search_token_frequency_tenant_scope on gnomon.search_token_frequency
   for select to authenticated, gnomon_worker
   using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
@@ -1154,16 +1117,6 @@ create index embedding_bit_text on gnomon.embedding_bit (tenant_id, scope, text_
 alter table gnomon.embedding enable row level security;
 
 alter table gnomon.embedding_bit enable row level security;
-
-create policy embedding_tenant_scope on gnomon.embedding
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
-
-create policy embedding_bit_tenant_scope on gnomon.embedding_bit
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
 
 create table gnomon.summary (
   tenant_id uuid not null,
@@ -1279,8 +1232,7 @@ create index community_citation_episode on gnomon.community_citation (tenant_id,
 create index community_citation_tenant_scope on gnomon.community_citation
   (tenant_id, scope, community_id);
 
--- RLS: the Tenant and the Scopes of the call, for the callers and for the
--- definer, as on every other table (ADR-0005).
+-- RLS, with the policies at the end of this file.
 do $$
 declare
   t text;
@@ -1288,11 +1240,6 @@ begin
   foreach t in array array['summary', 'summary_citation', 'community', 'community_member',
                            'community_citation'] loop
     execute format('alter table gnomon.%I enable row level security', t);
-    execute format(
-      'create policy %1$s_tenant_scope on gnomon.%1$I
-         for all to authenticated, gnomon_worker, gnomon_definer
-         using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-         with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))', t);
   end loop;
 end
 $$;
@@ -1337,11 +1284,6 @@ create index node_name_text on gnomon.node_name (tenant_id, scope, text_hash);
 
 alter table gnomon.node_name enable row level security;
 
-create policy node_name_tenant_scope on gnomon.node_name
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
-
 -- The token table of Summaries and Communities.
 create table gnomon.derived_search_token (
   tenant_id uuid not null,
@@ -1368,11 +1310,6 @@ create index derived_search_token_community on gnomon.derived_search_token
   (tenant_id, scope, community_id) where community_id is not null;
 
 alter table gnomon.derived_search_token enable row level security;
-
-create policy derived_search_token_tenant_scope on gnomon.derived_search_token
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
 
 -- The keys of the embedding rows' foreign keys, which carry the Recorded-time
 -- end.
@@ -1432,10 +1369,107 @@ create index derived_embedding_community on gnomon.derived_embedding
 
 alter table gnomon.derived_embedding enable row level security;
 
-create policy derived_embedding_tenant_scope on gnomon.derived_embedding
-  for all to authenticated, gnomon_worker, gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()))
-  with check (tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes()));
+-- The Tenant and Scope policies of the graph tables (ADR-0005, ADR-0009).
+--
+--   <table>_tenant_scope   callers, and `gnomon_writer` on the tables it
+--                          writes, read the rows of the caller's Tenant and
+--                          allowed Scopes. Callers hold no write privilege
+--                          on any table (#81).
+--   <table>_definer        `gnomon_definer` reads, and writes what its
+--                          grants allow, in the same rows, as Erasure, Kind
+--                          registration and the search index trigger need.
+--   <table>_writer_insert  `gnomon_writer` inserts rows of a Scope the
+--                          caller may both read and write.
+--   <table>_writer_update  `gnomon_writer` changes such rows, only in the
+--                          ways listed below.
+--   <table>_writer_delete  `gnomon_writer` deletes such rows only when its
+--                          own transaction wrote them, which is how a second
+--                          write in one transaction replaces the first
+--                          (ADR-0008). Committed history goes only by Erasure.
+--
+-- The writer's grants decide which columns it may set (0006). Its update
+-- policies decide how a row may change:
+--
+--   version     closing an open row at the start of the current
+--               transaction, or reopening a row this transaction closed. A
+--               trigger records the closing transaction in `closed_in`.
+--   summary,    closing an open row at the start of the current
+--   community   transaction.
+--   the others  any change to the columns its grants allow.
+--
+-- The writer reads no search table: only the search index trigger writes
+-- them, as `gnomon_definer`.
+do $$
+declare
+  t record;
+  v_read constant text :=
+    'tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes())';
+  v_write constant text :=
+    'tenant_id = gnomon.tenant_id() and scope = any(gnomon.allowed_scopes())'
+    ' and scope = any(gnomon.writable_scopes())';
+begin
+  for t in
+    select * from (values
+      -- table, the writer reads it, inserts, update (old row), update (new row), deletes
+      ('episode',              true,  true,  null, null, false),
+      ('node',                 true,  true,  null, null, false),
+      ('edge',                 true,  true,  null, null, false),
+      ('statement',            true,  true,  null, null, false),
+      ('contribution',         true,  true,  null, null, false),
+      ('version',              true,  true,
+         'recorded_to = ''infinity'' or closed_in = pg_current_xact_id()',
+         '(recorded_to = transaction_timestamp() and closed_in = pg_current_xact_id())'
+         ' or (recorded_to = ''infinity'' and closed_in is null)',
+         true),
+      ('citation',             true,  true,  null, null, true),
+      ('bound_statement',      true,  true,  null, null, false),
+      ('sentence',             true,  true,  'true', 'true', false),
+      ('episode_retraction',   true,  true,  null, null, false),
+      ('stage_record',         true,  true,  'true', 'true', false),
+      ('stage_usage',          true,  true,  'true', 'true', false),
+      ('search_token',         false, false, null, null, false),
+      ('embedding',            true,  true,  null, null, false),
+      ('embedding_bit',        true,  true,  'true', 'true', false),
+      ('summary',              true,  true,
+         'recorded_to = ''infinity''', 'recorded_to = transaction_timestamp()', true),
+      ('summary_citation',     true,  true,  null, null, true),
+      ('community',            true,  true,
+         'recorded_to = ''infinity''', 'recorded_to = transaction_timestamp()', true),
+      ('community_member',     true,  true,  null, null, true),
+      ('community_citation',   true,  true,  null, null, true),
+      ('node_name',            true,  false, 'true', 'true', false),
+      ('derived_search_token', false, false, null, null, false),
+      ('derived_embedding',    true,  true,  null, null, false)
+    ) x(name, reads, inserts, update_using, update_check, deletes)
+  loop
+    execute format(
+      'create policy %1$s_tenant_scope on gnomon.%1$I for select to %2$s using (%3$s)',
+      t.name,
+      case when t.reads then 'authenticated, gnomon_worker, gnomon_writer'
+           else 'authenticated, gnomon_worker' end,
+      v_read);
+    execute format(
+      'create policy %1$s_definer on gnomon.%1$I for all to gnomon_definer
+         using (%2$s) with check (%2$s)', t.name, v_read);
+    if t.inserts then
+      execute format(
+        'create policy %1$s_writer_insert on gnomon.%1$I for insert to gnomon_writer
+           with check (%2$s)', t.name, v_write);
+    end if;
+    if t.update_using is not null then
+      execute format(
+        'create policy %1$s_writer_update on gnomon.%1$I for update to gnomon_writer
+           using (%2$s and (%3$s)) with check (%2$s and (%4$s))',
+        t.name, v_write, t.update_using, t.update_check);
+    end if;
+    if t.deletes then
+      execute format(
+        'create policy %1$s_writer_delete on gnomon.%1$I for delete to gnomon_writer
+           using (%2$s and written_in = pg_current_xact_id())', t.name, v_write);
+    end if;
+  end loop;
+end
+$$;
 
 -- The runner's own search path again (see pgvector's names above).
 do $$

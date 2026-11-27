@@ -351,7 +351,7 @@ async fn concurrent_claimers_never_get_the_same_record() {
             let store = Store::connect(&url, &support::connect_options())
                 .await
                 .unwrap();
-            let caller = store.as_worker(tenant, Scope::new(support::erasure::SCOPE));
+            let caller = store.as_worker(tenant, Scope::new(support::erasure::SCOPE), None);
             barrier.wait().await;
             let mut mine = Vec::new();
             while let Some(c) = caller.claim_stage(tenant, None, HOUR).await.unwrap() {
@@ -405,7 +405,7 @@ async fn a_claim_skips_the_record_another_claimer_holds_and_never_waits_for_it()
             .await
             .unwrap();
         store
-            .as_worker(tenant, Scope::new(support::erasure::SCOPE))
+            .as_worker(tenant, Scope::new(support::erasure::SCOPE), None)
             .claim_stage(tenant, None, HOUR)
             .await
             .unwrap()

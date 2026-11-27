@@ -81,7 +81,7 @@ impl World {
     }
 
     fn caller(&self) -> gnomon::Caller<'_> {
-        self.store.as_worker(self.tenant, Scope::new(SCOPE))
+        self.store.as_worker(self.tenant, Scope::new(SCOPE), None)
     }
 
     async fn set_rule(&self, kind: &str, rule: MergeRule) {
