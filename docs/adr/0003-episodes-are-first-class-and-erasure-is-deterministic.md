@@ -17,7 +17,7 @@ An Episode is an immutable record of its own, not a Node. A Version, Summary, Co
 - After an Erasure, a Summary or Community that drew on the erased Episode is missing until the Pipeline regenerates it from the remaining Episodes.
 - Erasure deletes Search's derived rows in the same transaction (ADR-0010):
   - the full and quantized embeddings of every Version it deletes or recomputes;
-  - the token rows and the BM25 counts they feed;
+  - the token rows and the BM25 totals they feed;
   - the name and Alias rows.
 
   The Pipeline re-embeds recomputed text afterwards. There is no adjacency table to delete from: the neighbourhood branch of Search reads `gnomon.edge` and `gnomon.version` under RLS, through the `edge_source` and `edge_target` indexes, and meets the Search budgets that way (ADR-0010).

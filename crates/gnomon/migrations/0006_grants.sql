@@ -128,9 +128,6 @@ grant select on gnomon.search_token to authenticated, gnomon_worker;
 grant select, insert, delete on gnomon.search_token to gnomon_definer;
 grant select, delete on gnomon.search_token to gnomon_eraser;
 
-grant select on gnomon.search_token_frequency to authenticated, gnomon_worker;
-grant select, insert, delete, update on gnomon.search_token_frequency to gnomon_definer;
-
 grant select on gnomon.search_scope_length to authenticated, gnomon_worker;
 grant select, insert, delete, update on gnomon.search_scope_length to gnomon_definer;
 

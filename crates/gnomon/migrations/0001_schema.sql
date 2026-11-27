@@ -103,7 +103,7 @@ $$;
 --                   that are writable as well.
 --   gnomon_definer  Kind registration, the merge-rule setter and the search
 --                   index trigger. Its policies read the caller's Scopes,
---                   apart from the BM25 counts of its own transaction.
+--                   apart from the BM25 totals of its own transaction.
 --   gnomon_eraser   Erasure (#83). Its policies check the Tenant only, so an
 --                   Erasure removes what depends on what it erases in every
 --                   Scope of the Tenant. The Erasure functions check the
@@ -990,16 +990,10 @@ create table gnomon.search_token (
 -- Writing, re-indexing and deleting a Version's rows, and the foreign key.
 create index search_token_version on gnomon.search_token (tenant_id, scope, version_id);
 
--- The BM25 counts of a Scope: how many Versions' texts hold each word, and
--- how many Versions and words the Scope holds.
-create table gnomon.search_token_frequency (
-  tenant_id uuid not null,
-  scope text not null,
-  token text not null,
-  versions bigint not null check (versions > 0),
-  primary key (tenant_id, scope, token)
-);
-
+-- The BM25 totals of a Scope: how many texts it holds and how many words
+-- they hold together. Search counts how many texts hold a word from the
+-- token rows, when it runs (#85, ADR-0010), so no table stores a word's
+-- frequency.
 create table gnomon.search_scope_length (
   tenant_id uuid not null,
   scope text not null,
@@ -1008,24 +1002,19 @@ create table gnomon.search_scope_length (
   primary key (tenant_id, scope)
 );
 
--- The changes one transaction made to the counts, which its commit applies
--- and deletes. A row with a word changes that word's count, and the row with
--- no word changes the Scope's totals. Each transaction writes only rows of
--- its own, so no other transaction ever waits on them.
+-- The changes one transaction made to a Scope's totals, one row for each
+-- Scope, which its commit applies and deletes. Each transaction writes only
+-- rows of its own, so no other transaction ever waits on them.
 create table gnomon.search_count_delta (
   tenant_id uuid not null,
   scope text not null,
-  token text,
   written_in xid8 not null default pg_current_xact_id(),
   versions bigint not null,
   words bigint not null,
-  constraint search_count_delta_once unique nulls not distinct
-    (tenant_id, written_in, scope, token)
+  constraint search_count_delta_once unique (tenant_id, written_in, scope)
 );
 
 alter table gnomon.search_token enable row level security;
-
-alter table gnomon.search_token_frequency enable row level security;
 
 alter table gnomon.search_scope_length enable row level security;
 
@@ -1034,10 +1023,6 @@ alter table gnomon.search_count_delta enable row level security;
 -- Callers read the rows of their own Tenant and Scopes. The changes another
 -- transaction recorded are never visible to a caller: they are uncommitted,
 -- and the commit deletes them.
-create policy search_token_frequency_tenant_scope on gnomon.search_token_frequency
-  for select to authenticated, gnomon_worker
-  using (tenant_id = (select gnomon.tenant_id()) and scope = any ((select gnomon.allowed_scopes())::text[]));
-
 create policy search_scope_length_tenant_scope on gnomon.search_scope_length
   for select to authenticated, gnomon_worker
   using (tenant_id = (select gnomon.tenant_id()) and scope = any ((select gnomon.allowed_scopes())::text[]));
@@ -1054,23 +1039,10 @@ create policy search_count_delta_own on gnomon.search_count_delta
   using (tenant_id = (select gnomon.tenant_id()) and written_in = pg_current_xact_id_if_assigned())
   with check (tenant_id = (select gnomon.tenant_id()) and written_in = pg_current_xact_id());
 
--- The definer changes the counts only of a Scope whose changes its own
+-- The definer changes the totals only of a Scope whose changes its own
 -- transaction recorded. The condition is a subquery, not a function call,
 -- because a function with a pinned search path costs a setting change on
 -- every row the policy checks.
-create policy search_token_frequency_pending on gnomon.search_token_frequency
-  for all to gnomon_definer
-  using (tenant_id = (select gnomon.tenant_id())
-         and exists (select from gnomon.search_count_delta d
-                     where d.tenant_id = search_token_frequency.tenant_id
-                       and d.written_in = pg_current_xact_id_if_assigned()
-                       and d.scope = search_token_frequency.scope))
-  with check (tenant_id = (select gnomon.tenant_id())
-              and exists (select from gnomon.search_count_delta d
-                          where d.tenant_id = search_token_frequency.tenant_id
-                            and d.written_in = pg_current_xact_id_if_assigned()
-                            and d.scope = search_token_frequency.scope));
-
 create policy search_scope_length_pending on gnomon.search_scope_length
   for all to gnomon_definer
   using (tenant_id = (select gnomon.tenant_id())
@@ -1428,7 +1400,7 @@ alter table gnomon.derived_embedding enable row level security;
 --   the others  any change to the columns its grants allow.
 --
 -- The writer reads none of the token tables of Search and none of the BM25
--- count tables (the latter have policies of their own above): only the
+-- totals tables (the latter have policies of their own above): only the
 -- search index trigger writes them, as `gnomon_definer`. It reads and writes
 -- the embedding tables, and updates the bits of a name row, as the table
 -- above says.

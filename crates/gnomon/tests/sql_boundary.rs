@@ -11,7 +11,7 @@ use chrono::{TimeZone, Utc};
 use gnomon::{EpisodeId, NewEpisode, Scope, Store, TenantId};
 use serde_json::json;
 use support::TestDb;
-use support::erasure::BM25_COUNT_TABLES;
+use support::erasure::BM25_TOTALS_TABLES;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Transaction};
@@ -356,11 +356,11 @@ async fn every_gnomon_table_has_rls_and_every_policy_but_the_erasers_and_the_cou
                 assert_eq!(check, tenant, "gnomon.{name}: the eraser's CHECK");
                 continue;
             }
-            // The search index function, a definer, changes the BM25 counts
+            // The search index function, a definer, changes the BM25 totals
             // only of a Scope whose changes its own transaction recorded,
-            // and records only its own transaction's changes (migration
-            // 0016). No caller writes either table.
-            if BM25_COUNT_TABLES.contains(&name.as_str()) && roles == ["gnomon_definer"] {
+            // and records only its own transaction's changes
+            // (`0001_schema.sql`). No caller writes either table.
+            if BM25_TOTALS_TABLES.contains(&name.as_str()) && roles == ["gnomon_definer"] {
                 let pending = format!(
                     "({TENANT_CONDITION} AND (EXISTS ( SELECT\n   \
                      FROM gnomon.search_count_delta d\n  \
@@ -4856,15 +4856,10 @@ async fn a_caller_cannot_delete_a_stage_record_or_change_what_it_names() {
     assert_eq!(stage_rows(&w.db).await, before);
 }
 
-/// The token table of full-text Search, the BM25 counts of each Scope and
+/// The token table of full-text Search, the BM25 totals of each Scope and
 /// each transaction's changes to them (ADR-0010), which `0001_schema.sql`
 /// creates.
-const SEARCH_TABLES: &[&str] = &[
-    "search_token",
-    "search_token_frequency",
-    "search_scope_length",
-    "search_count_delta",
-];
+const SEARCH_TABLES: &[&str] = &["search_token", "search_scope_length", "search_count_delta"];
 
 /// The one trigger function that writes them, a definer (ADR-0009).
 const SEARCH_INDEX_FUNCTION: &str = "gnomon.maintain_search_index()";
@@ -4948,6 +4943,33 @@ async fn a_caller_reads_only_its_own_tenants_and_scopes_token_rows_and_counts() 
                 .collect();
             assert_eq!(scopes, expected, "{role} searched {tenant}");
         }
+        // The word frequencies a caller's Search counts are its own Scope's:
+        // one text, "zebra support", holds "zebra" and "support", and no text
+        // it sees holds "billing", which another Scope and Tenant say. Each
+        // word then has the idf ln(1 + 0.5 / 1.5) = ln(4 / 3).
+        let words: Vec<(String, f64)> = tx
+            .query_typed(
+                "select token, idf from gnomon.search_query_words($1, 'zebra billing support')
+                 order by token",
+                &[(&w.t1, Type::UUID)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        let tokens: Vec<&str> = words.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            tokens,
+            ["support", "zebra"],
+            "{role} counted words of another Scope"
+        );
+        for (token, idf) in &words {
+            assert!(
+                (idf - (4.0_f64 / 3.0).ln()).abs() < 1e-12,
+                "{role}: the idf of {token} is {idf}, not ln(4/3)"
+            );
+        }
         // The counts a caller reads are its own Scope's: one document, which
         // says "zebra" and "support".
         let documents: i64 = tx
@@ -4959,6 +4981,63 @@ async fn a_caller_reads_only_its_own_tenants_and_scopes_token_rows_and_counts() 
             .unwrap()[0]
             .get(0);
         assert_eq!(documents, 1, "{role} counted documents of another Scope");
+    }
+}
+
+/// Search counts a word's frequency at query time, from the token rows the
+/// caller's allowed Scopes hold (#85, ADR-0010). The two token tables hold a
+/// row for each word of each text, and no other table has a column for a
+/// word.
+#[tokio::test]
+async fn no_table_stores_a_word_frequency() {
+    let db = TestDb::migrated().await;
+    let tables: Vec<String> = db
+        .admin()
+        .await
+        .query_typed(
+            "select c.relname::text
+             from pg_catalog.pg_attribute a
+             join pg_catalog.pg_class c on c.oid = a.attrelid
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+             where n.nspname = 'gnomon' and c.relkind in ('r', 'p', 'v', 'm')
+               and a.attname = 'token' and a.attnum > 0 and not a.attisdropped
+             order by 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(tables, ["derived_search_token", "search_token"]);
+    // The tables of the totals hold a Scope's texts and words, and nothing
+    // for a word.
+    for (table, expected) in [
+        (
+            "search_scope_length",
+            &["tenant_id", "scope", "versions", "words"][..],
+        ),
+        (
+            "search_count_delta",
+            &["tenant_id", "scope", "written_in", "versions", "words"][..],
+        ),
+    ] {
+        let columns: Vec<String> = db
+            .admin()
+            .await
+            .query_typed(
+                "select attname::text from pg_catalog.pg_attribute
+                 where attrelid = ('gnomon.' || $1)::regclass and attnum > 0
+                   and not attisdropped
+                 order by attnum",
+                &[(&table, Type::TEXT)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        assert_eq!(columns, expected, "the columns of gnomon.{table}");
     }
 }
 
@@ -4987,14 +5066,6 @@ async fn a_caller_cannot_write_the_token_rows_or_the_counts_directly_even_in_its
             format!("update gnomon.search_token set tf = 99 where scope = '{scope}'"),
             format!("delete from gnomon.search_token where scope = '{scope}'"),
             format!(
-                "insert into gnomon.search_token_frequency (tenant_id, scope, token, versions)
-                 values ('{t}', '{scope}', 'forged', 1000)"
-            ),
-            format!(
-                "update gnomon.search_token_frequency set versions = 1000 where scope = '{scope}'"
-            ),
-            format!("delete from gnomon.search_token_frequency where scope = '{scope}'"),
-            format!(
                 "insert into gnomon.search_scope_length (tenant_id, scope, versions, words)
                  values ('{t}', 'elsewhere', 1000, 1000)"
             ),
@@ -5003,8 +5074,8 @@ async fn a_caller_cannot_write_the_token_rows_or_the_counts_directly_even_in_its
             ),
             format!("delete from gnomon.search_scope_length where scope = '{scope}'"),
             format!(
-                "insert into gnomon.search_count_delta (tenant_id, scope, token, versions, words)
-                 values ('{t}', '{scope}', null, 1000, 1000)"
+                "insert into gnomon.search_count_delta (tenant_id, scope, versions, words)
+                 values ('{t}', '{scope}', 1000, 1000)"
             ),
             // The functions that write the token rows, called directly.
             format!("select gnomon.index_search_text('{t}', array['{own_version}'::uuid], true)"),

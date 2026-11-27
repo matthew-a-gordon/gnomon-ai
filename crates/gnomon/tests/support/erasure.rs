@@ -795,14 +795,11 @@ async fn assert_names_derived_anew(admin: &Client, residue: &Residue<'_>) {
     );
 }
 
-/// The BM25 counts of each Scope, which an Erasure lowers rather than
-/// deletes while the Scope holds other Versions, and the table of each
-/// transaction's changes to them, which its commit empties.
-pub const BM25_COUNT_TABLES: &[&str] = &[
-    "search_token_frequency",
-    "search_scope_length",
-    "search_count_delta",
-];
+/// The BM25 totals of each Scope, which an Erasure lowers rather than
+/// deletes while the Scope holds other texts, and the table of each
+/// transaction's changes to them, which its commit empties. Search counts a
+/// word's frequency from the token rows, so no table stores it (#85).
+pub const BM25_TOTALS_TABLES: &[&str] = &["search_scope_length", "search_count_delta"];
 
 /// The token rows an Erasure leaves: none of a Version it deleted, and for
 /// each recomputed Version that survives, exactly the rows its text as it
@@ -846,57 +843,47 @@ async fn assert_tokens_derived_anew(admin: &Client, residue: &Residue<'_>) {
     );
 }
 
-/// Checks that the BM25 counts, read past RLS, are those the token rows give
-/// when counted again: each Scope's texts per word, and its texts and words.
-/// The texts are Versions' and, Summaries' and
-/// Communities'. No committed transaction leaves a change to them behind.
+/// Checks that the BM25 totals, read past RLS, are those the token rows give
+/// when counted again: each Scope's texts and their words. The texts are
+/// Versions', Summaries' and Communities'. No committed transaction leaves a
+/// change to them behind.
 pub async fn assert_search_counts_match_the_token_rows(admin: &Client) {
     let left: i64 = admin
         .query_typed("select count(*) from gnomon.search_count_delta", &[])
         .await
         .unwrap()[0]
         .get(0);
-    assert_eq!(left, 0, "committed changes to the counts are left");
-    for (stored, recounted, what) in [
-        (
-            "select scope, token, versions from gnomon.search_token_frequency",
-            "select scope, token, count(*)
-             from (select scope, token from gnomon.search_token
-                   union all
-                   select scope, token from gnomon.derived_search_token) t
-             group by 1, 2",
-            "the document frequencies",
-        ),
-        (
-            "select scope, versions::text, words from gnomon.search_scope_length",
+    assert_eq!(left, 0, "committed changes to the totals are left");
+    let read = |sql: &'static str| async move {
+        let mut rows: Vec<String> = admin
+            .query_typed(
+                &format!("select format('%s %s %s', x.a, x.b, x.c) from ({sql}) x(a, b, c)"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        rows.sort();
+        rows
+    };
+    assert_eq!(
+        read("select scope, versions::text, words from gnomon.search_scope_length").await,
+        read(
             "select scope, count(*)::text, sum(dl)::bigint
              from (select distinct scope, version_id, dl from gnomon.search_token
                    union all
                    select distinct scope, derived_id, dl from gnomon.derived_search_token) d
-             group by 1",
-            "the Scope totals",
-        ),
-    ] {
-        let read = |sql: &'static str| async move {
-            let mut rows: Vec<String> = admin
-                .query_typed(
-                    &format!("select format('%s %s %s', x.a, x.b, x.c) from ({sql}) x(a, b, c)"),
-                    &[],
-                )
-                .await
-                .unwrap()
-                .iter()
-                .map(|r| r.get(0))
-                .collect();
-            rows.sort();
-            rows
-        };
-        assert_eq!(read(stored).await, read(recounted).await, "{what}");
-    }
+             group by 1"
+        )
+        .await,
+        "the Scope totals"
+    );
 }
 
 /// Every row of every gnomon table, read past RLS, as text, but for the two
-/// tables no Erasure touches, the BM25 counts, which [`assert_only_removed`]
+/// tables no Erasure touches, the BM25 totals, which [`assert_only_removed`]
 /// checks against the token rows instead, and the full vectors, which it
 /// checks with [`assert_no_unused_full_vector`].
 pub async fn every_row(admin: &Client) -> Vec<String> {
@@ -912,14 +899,14 @@ pub async fn every_row_tables(admin: &Client) -> Vec<String> {
             t != "schema_version"
                 && t != "tenancy"
                 && t != FULL_VECTORS
-                && !BM25_COUNT_TABLES.contains(&t.as_str())
+                && !BM25_TOTALS_TABLES.contains(&t.as_str())
         })
         .collect()
 }
 
 /// Checks that an Erasure removed exactly the rows that name one of `ids` in
 /// their text, from `before`, a read of [`every_row`] taken before it, and
-/// changed nothing else, that the BM25 counts went down with the token rows
+/// changed nothing else, that the BM25 totals went down with the token rows
 /// it removed, and that it left no full vector of text no row uses.
 pub async fn assert_only_removed(admin: &Client, before: &[String], ids: &[Uuid]) {
     assert_search_counts_match_the_token_rows(admin).await;

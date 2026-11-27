@@ -10,7 +10,7 @@ The Store's Search returns candidates from three branches, each an invoker funct
   - Each Version has a `bit` row from `binary_quantize`, carrying the four time columns, in a covering B-tree on `(tenant_id, scope)`.
   - The full vector is stored once per distinct text, keyed by a hash of that text.
   - The top 400 by bit distance are re-ranked at full precision.
-- The full-text branch reads a token table maintained by trigger in the write's transaction, through a B-tree on leakproof equality. Its BM25 counts are kept per Scope and summed over the caller's allowed Scopes.
+- The full-text branch reads a token table maintained by trigger in the write's transaction, through a B-tree on leakproof equality. The number of texts and their total length are kept for each Scope and summed over the caller's allowed Scopes. Word frequency is counted at query time from the token rows that row-level security shows (#85). See the amendment below.
 - The full-text branch bounds the work it spends on common words. This is planned, not built (#87).
   - It prunes by max-score first. A word's BM25 contribution is at most its idf times (k1 + 1), so a text that holds only common words is skipped when that bound is below the k-th score so far. The top k is identical to unpruned BM25.
   - Before scoring, it sums the document frequencies of the query words over the caller's allowed Scopes. If more than M token rows would be read, it falls back to a cutoff: it drops each word that is in more than X% of the caller's visible texts. If every query word is above X, it keeps the rarest one.
@@ -55,7 +55,7 @@ We chose this because, under RLS, only a leakproof condition can be an index con
   - They only reorder candidates the other branches found, so a hub cannot enter on popularity alone.
   - Their weights are set per query.
 - Under RLS the planner estimates one row for every scan, so join shapes flip on small differences. The re-rank is pinned to primary-key probes. Unpinned, it scanned every full vector in the visible set: 660 ms against 96 ms.
-- Summing BM25 counts over the allowed Scopes costs more for a caller who holds many Scopes.
+- BM25 costs more for a caller who holds many Scopes. Summing the totals reads one row for each allowed Scope. Counting a word's frequency scans the word's token rows in each allowed Scope, by key, and the scorer reads those rows anyway.
 
 ## Amendment: the vector columns and a change of model (#80)
 
@@ -68,3 +68,11 @@ A change of embedding model is a migration the consumer writes by hand: add a co
 
 These two points come from reading the schema. Nobody has tried them yet. #86 moves the vectors and rewrites this part of the ADR.
 
+## Amendment: word frequency counted at query time (#85)
+
+The number of texts and their total length are kept for each Scope. A word's frequency is counted at query time from the token rows that row-level security shows: one index scan of each token table on its key, apart from the rows the scorer materializes. The count covers Versions, Summaries and Communities together, and a transaction's own token rows count in its own Searches. No table stores a word's frequency. This replaces the per-word counts in the Search decisions of #1.
+
+- Why the frequencies go: each write changed one count row for each distinct word of its texts, and held each row's lock until the commit. A transaction that created 25 Nodes with long texts took 528 ms to commit, against under 6 ms without the counts. With 16 writers of long texts in one Scope, commits per second rose from 86 to 767.
+- Why the totals stay: counting them at query time added about 10 ms at 98,000 texts and 44 ms at 394,000 texts. That cost grows with history, and the budgets are set in visible rows.
+- Known limit: commits in one Scope run one at a time while they apply the totals. With 16 writers and short texts on disk, this was about 1,300 commits per second.
+- In #85's measurement, over 123 queries with realistic word frequencies, the counted form gave the same rows, scores and order as the stored counts, and the full-text branch's p95 stayed within a few percent. The performance suite's own comparison and its timings before and after are recorded on #85.

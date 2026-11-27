@@ -1084,7 +1084,7 @@ impl Caller<'_> {
     /// no Version and changes no Recorded time. The Version may be closed: a
     /// Search at an earlier known-at instant finds it by its Sentence.
     ///
-    /// The Sentence's words and BM25 counts are written in the same
+    /// The Sentence's token rows and BM25 totals are written in the same
     /// transaction, so full-text Search finds the Version by them once this
     /// call returns, before any embedding exists. The Pipeline then embeds
     /// it with [`store_embedding`](Self::store_embedding) and the hash

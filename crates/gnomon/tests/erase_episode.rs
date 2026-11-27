@@ -807,7 +807,7 @@ async fn the_same_erasure_on_the_same_starting_data_always_removes_the_same_rows
         .filter(|t| t != "schema_version" && t != "tenancy")
         // The BM25 counts change when the Erasure commits, not inside it.
         // `assert_only_removed` checks them against the token rows.
-        .filter(|t| !support::erasure::BM25_COUNT_TABLES.contains(&t.as_str()))
+        .filter(|t| !support::erasure::BM25_TOTALS_TABLES.contains(&t.as_str()))
         .collect();
 
     let mut runs = Vec::new();

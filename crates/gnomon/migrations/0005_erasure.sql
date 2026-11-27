@@ -159,7 +159,7 @@
 --                                records and usage counts, and Summaries and
 --                                Communities with their Citations.
 --   `gnomon.erase_version_text`  every row derived from a Version's text:
---                                token rows and BM25 counts, name rows, full
+--                                token rows and BM25 totals, name rows, full
 --                                and quantized embeddings, and Sentences.
 --
 -- Erase a Node, an Edge or a Scope. Erasure physically deletes what it names

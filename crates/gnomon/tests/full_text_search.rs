@@ -6,7 +6,10 @@
 mod support;
 
 use gnomon::{AsOf, Caller, FullTextCandidate, KindOf, NewKind, ValidTime, Versioned};
-use gnomon::{NewEdge, NewNode, Patch, Scope};
+use gnomon::{
+    CommunityId, DerivedCitation, EpisodeId, Mention, NewCommunity, NewEdge, NewNode, NewSummary,
+    NodeId, Patch, Scope, SearchHit, SearchRequest, SearchResult, SummaryId,
+};
 use serde_json::json;
 use support::erasure::{SCOPE, World, assert_search_counts_match_the_token_rows, at, values};
 use tokio_postgres::Client;
@@ -564,12 +567,299 @@ async fn ranking_does_not_change_when_a_scope_outside_the_callers_set_gains_the_
     assert_search_counts_match_the_token_rows(&w.db.admin().await).await;
 }
 
-/// The BM25 counts as stored, read past RLS.
+/// A Scope of four texts of two words each, three of them saying "alpha": a
+/// Node's name, a Summary and a Community. The fourth is another Node's name.
+/// Every text is of the mean length, so a text that holds "alpha" once
+/// scores its idf, ln(1 + (N - df + 0.5) / (df + 0.5)): ln(10 / 7) here.
+struct AlphaScope {
+    w: World,
+    episode: EpisodeId,
+    alpha: NodeId,
+    summary: SummaryId,
+    community: CommunityId,
+}
+
+fn idf(texts: f64, holding: f64) -> f64 {
+    (1.0 + (texts - holding + 0.5) / (holding + 0.5)).ln()
+}
+
+fn summary_of(node: NodeId, scope: &str, content: &str, cites: EpisodeId) -> NewSummary {
+    NewSummary {
+        scope: Scope::new(scope),
+        node,
+        content: content.into(),
+        as_of_valid: at(2024, 6, 1),
+        citations: vec![DerivedCitation::of(cites)],
+    }
+}
+
+/// A valid-at instant after the `as_of_valid` of every Summary and Community
+/// these tests write.
+fn later() -> AsOf {
+    AsOf::current(at(2025, 1, 1))
+}
+
+impl AlphaScope {
+    async fn new() -> AlphaScope {
+        let w = World::new().await;
+        let episode = w.episode(at(2024, 1, 1), None).await;
+        let alpha = w
+            .node(
+                "company",
+                episode,
+                ValidTime::UNKNOWN,
+                json!({ "name": "alpha one" }),
+            )
+            .await;
+        let beta = w
+            .node(
+                "company",
+                episode,
+                ValidTime::UNKNOWN,
+                json!({ "name": "beta two" }),
+            )
+            .await;
+        let summary = w
+            .caller()
+            .write_summary(w.tenant, &summary_of(beta, SCOPE, "alpha three", episode))
+            .await
+            .unwrap();
+        let community = w
+            .caller()
+            .write_community(
+                w.tenant,
+                &NewCommunity {
+                    scope: Scope::new(SCOPE),
+                    replaces: vec![],
+                    members: vec![alpha, beta],
+                    content: "alpha four".into(),
+                    as_of_valid: at(2024, 6, 1),
+                    citations: vec![DerivedCitation::of(episode)],
+                },
+            )
+            .await
+            .unwrap();
+        AlphaScope {
+            w,
+            episode,
+            alpha,
+            summary,
+            community,
+        }
+    }
+}
+
+/// The full-text scores of a fused Search for "alpha": of the Node's
+/// Version, the Summary and the Community, in that order.
+fn alpha_scores(s: &AlphaScope, results: &[SearchResult]) -> [Option<f64>; 3] {
+    let score = |hit: &dyn Fn(&SearchHit) -> bool| {
+        results
+            .iter()
+            .find(|r| hit(&r.hit))
+            .and_then(|r| r.full_text.as_ref())
+            .map(|b| b.value)
+    };
+    [
+        score(&|h| matches!(h, SearchHit::Version { of, .. } if *of == Versioned::Node(s.alpha))),
+        score(&|h| matches!(h, SearchHit::Summary { summary, .. } if *summary == s.summary)),
+        score(&|h| matches!(h, SearchHit::Community(c) if *c == s.community)),
+    ]
+}
+
+fn assert_scores(scores: &[Option<f64>], expected: f64, what: &str) {
+    for (i, score) in scores.iter().enumerate() {
+        let score = score.unwrap_or_else(|| panic!("{what}: result {i} was not found"));
+        assert!(
+            (score - expected).abs() < 1e-12,
+            "{what}: result {i} scored {score}, not {expected}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_words_frequency_counts_the_versions_summaries_and_communities_of_the_callers_scopes() {
+    let s = AlphaScope::new().await;
+    let w = &s.w;
+    let caller = w.caller();
+    let expected = idf(4.0, 3.0);
+
+    let fused = fused_by(&caller, w).await;
+    assert_scores(&alpha_scores(&s, &fused), expected, "fused Search");
+    let versions = candidates(&caller, w, "alpha", later()).await;
+    assert_eq!(versions.len(), 1);
+    assert_scores(&[Some(versions[0].score)], expected, "the full-text branch");
+    let resolved = caller
+        .resolve(w.tenant, &Mention::text("alpha"), 10)
+        .await
+        .unwrap();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].node, s.alpha);
+    assert_scores(
+        &[resolved[0].full_text.as_ref().map(|m| m.score)],
+        expected,
+        "Resolution",
+    );
+
+    // Another Scope of the Tenant gains texts that say "alpha", a Node's
+    // name and a Summary, which would change every count if they were
+    // counted.
+    let g = w
+        .episode_in("billing", at(2024, 1, 1), "billing notes")
+        .await;
+    let mut billing = vec![];
+    for name in ["alpha", "alpha alpha alpha and more words here", "gamma"] {
+        billing.push(
+            w.node_in("billing", "company", g, json!({ "name": name }))
+                .await,
+        );
+    }
+    w.worker_in("billing")
+        .write_summary(
+            w.tenant,
+            &summary_of(billing[2], "billing", "alpha alpha", g),
+        )
+        .await
+        .unwrap();
+
+    let fused_after = fused_by(&caller, w).await;
+    assert_eq!(
+        alpha_scores(&s, &fused_after),
+        alpha_scores(&s, &fused),
+        "every score is unchanged"
+    );
+    assert_eq!(candidates(&caller, w, "alpha", later()).await, versions);
+    let resolved_after = caller
+        .resolve(w.tenant, &Mention::text("alpha"), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved_after[0].full_text.as_ref().map(|m| m.score),
+        resolved[0].full_text.as_ref().map(|m| m.score)
+    );
+
+    // A caller who sees both Scopes counts eight texts, five of which say
+    // "alpha", and the two texts of more than two words change the mean
+    // length, so its scores differ.
+    let both = w.seeing(&[SCOPE, "billing"]);
+    let wider = fused_by(&both, w).await;
+    for (one, two) in alpha_scores(&s, &fused)
+        .iter()
+        .zip(alpha_scores(&s, &wider))
+    {
+        assert!(two.unwrap() < one.unwrap(), "{two:?} is not below {one:?}");
+    }
+}
+
+/// A fused Search for "alpha" by `caller`.
+async fn fused_by(caller: &Caller<'_>, w: &World) -> Vec<SearchResult> {
+    caller
+        .search(w.tenant, &SearchRequest::text("alpha", later()), 10)
+        .await
+        .unwrap()
+}
+
+/// A fused Search for "alpha" in `tx`.
+async fn fused_in(tx: &mut gnomon::Transaction) -> Vec<SearchResult> {
+    tx.search(&SearchRequest::text("alpha", later()), 10)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_search_in_a_transaction_counts_the_transactions_own_writes() {
+    let s = AlphaScope::new().await;
+    let w = &s.w;
+    // The transaction creates a Node and writes a Summary that say "alpha":
+    // six texts, five of which hold it.
+    let mut tx = w.caller().transaction(w.tenant).await.unwrap();
+    tx.create_node(
+        &NewNode {
+            tenant: Some(w.tenant),
+            scope: Scope::new(SCOPE),
+            kind: "company".into(),
+        },
+        &Patch::new(
+            s.episode,
+            ValidTime::UNKNOWN,
+            values(json!({ "name": "alpha five" })),
+        ),
+    )
+    .await
+    .unwrap();
+    let after_the_node = alpha_scores(&s, &fused_in(&mut tx).await);
+    assert_scores(
+        &after_the_node,
+        idf(5.0, 4.0),
+        "after the transaction's Node",
+    );
+    tx.write_summary(&summary_of(s.alpha, SCOPE, "alpha six", s.episode))
+        .await
+        .unwrap();
+    let own = idf(6.0, 5.0);
+    assert_scores(
+        &alpha_scores(&s, &fused_in(&mut tx).await),
+        own,
+        "after the transaction's Summary",
+    );
+    let versions = tx.search_full_text("alpha", later(), 10).await.unwrap();
+    let alpha = versions
+        .iter()
+        .find(|c| c.of == Versioned::Node(s.alpha))
+        .unwrap();
+    assert_scores(
+        &[Some(alpha.score)],
+        own,
+        "the full-text branch in the transaction",
+    );
+    let resolved = tx.resolve(&Mention::text("alpha"), 10).await.unwrap();
+    let alpha = resolved.iter().find(|c| c.node == s.alpha).unwrap();
+    assert_scores(
+        &[alpha.full_text.as_ref().map(|m| m.score)],
+        own,
+        "Resolution in the transaction",
+    );
+
+    // Another caller counts none of them before the commit.
+    let outside = fused_by(&w.caller(), w).await;
+    assert_scores(
+        &alpha_scores(&s, &outside),
+        idf(4.0, 3.0),
+        "outside the transaction",
+    );
+
+    // After a rollback no one counts them, and after a commit everyone does.
+    tx.rollback().await.unwrap();
+    let rolled_back = fused_by(&w.caller(), w).await;
+    assert_scores(
+        &alpha_scores(&s, &rolled_back),
+        idf(4.0, 3.0),
+        "after the rollback",
+    );
+    let mut tx = w.caller().transaction(w.tenant).await.unwrap();
+    tx.write_summary(&summary_of(s.alpha, SCOPE, "alpha six", s.episode))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let committed = fused_by(&w.caller(), w).await;
+    assert_scores(
+        &alpha_scores(&s, &committed),
+        idf(5.0, 4.0),
+        "after the commit",
+    );
+    assert_search_counts_match_the_token_rows(&w.db.admin().await).await;
+}
+
+/// The BM25 counts, read past RLS: how many texts of each Scope hold each
+/// word, from the token rows Search counts them from, and each Scope's
+/// totals as stored.
 async fn counts(admin: &Client) -> (Vec<String>, Vec<String>) {
     let frequencies = admin
         .query_typed(
-            "select format('%s %s %s', scope, token, versions)
-             from gnomon.search_token_frequency order by 1",
+            "select format('%s %s %s', scope, token, count(*))
+             from (select scope, token from gnomon.search_token
+                   union all
+                   select scope, token from gnomon.derived_search_token) t
+             group by scope, token order by 1",
             &[],
         )
         .await
@@ -699,10 +989,10 @@ async fn erasing_a_node_lowers_the_counts_of_a_scope_the_caller_cannot_see_and_a
 #[tokio::test]
 async fn writers_in_one_scope_sharing_words_all_commit_and_the_counts_stay_exact() {
     // Four Stores, each on its own connection, write Nodes in the same Scope
-    // at once. Every name shares words with the others, in a different
-    // order, so their counts' rows are the same rows. The counts lock them in
-    // the order of their keys, so the writers wait for each other and none
-    // deadlocks. Nothing here measures time.
+    // at once, and every name shares words with the others, in a different
+    // order. Every commit changes the same row, the Scope's totals, so the
+    // writers wait for each other's commits and none deadlocks. Nothing here
+    // measures time.
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
     let words = ["amber", "basalt", "cobalt", "dolomite", "ember"];
@@ -802,10 +1092,10 @@ async fn without_waiting<T>(
 async fn two_writers_of_several_statements_in_one_scope_never_wait_on_each_others_counts() {
     // Each transaction writes two Nodes, one statement each, in the same
     // Scope, and the second Node of each says the first word of the other.
-    // Counts changed statement by statement would lock the word's row and the
-    // Scope's row until commit, so the two transactions would wait on each
-    // other: a deadlock. The counts change at commit instead, in key order,
-    // and no writer waits on the other.
+    // Totals changed statement by statement would lock the Scope's row until
+    // commit, so each transaction's second write would wait on the other's
+    // first. The totals change at commit instead, and no writer waits on the
+    // other.
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
     let mut nodes = Vec::new();

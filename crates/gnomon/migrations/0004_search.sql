@@ -28,15 +28,26 @@
 -- The counts. Each Version's text is scored as a whole. Its token rows hold
 -- each word, how often the word occurs in the text (`tf`), and the text's
 -- length in words (`dl`). Closed Versions keep their rows, so a past As-of
--- read finds them. The BM25 counts are kept per Scope: how many Versions'
--- texts hold each word, and how many Versions and words the Scope holds.
--- Search sums them over the caller's allowed Scopes, which RLS selects, so
--- the ranking reveals nothing about a Scope the caller cannot read
--- (ADR-0010). The counts cover every Version of those Scopes whatever its
--- time. The As-of instants decide only which Versions are returned.
+-- read finds them. A word's frequency, how many texts hold it, is counted
+-- when Search runs, from the token rows of the caller's allowed Scopes,
+-- which RLS selects, by one index scan of each token table on its key (#85).
+-- The totals are kept per Scope: how many texts and words the Scope holds.
+-- Search sums them over the same Scopes. So the ranking reveals nothing
+-- about a Scope the caller cannot read (ADR-0010). The counts cover every
+-- Version of those Scopes whatever its time. The As-of instants decide only
+-- which Versions are returned.
+--
+-- Why the totals are kept and the frequencies are not. A word's token rows
+-- are read by key, and the scorer reads them anyway, so counting them adds
+-- little. Counting the totals would read every token row of the Scopes,
+-- which grows with history while the budgets are set in visible rows: it
+-- added about 10 ms at 98,000 texts and 44 ms at 394,000. A stored count for
+-- each word made every write change one row for each distinct word of its
+-- texts. Each of those rows stayed locked until the commit, and a
+-- transaction that created 25 Nodes with long texts took 528 ms to commit.
 --
 -- Who writes. One trigger function, `gnomon.maintain_search_index`, writes
--- the token rows and the counts. It is a definer owned by the NOLOGIN
+-- the token rows and the totals. It is a definer owned by the NOLOGIN
 -- `gnomon_definer` (ADR-0009), and it is granted to no
 -- role. No caller can execute it or attach it to a table of its own, because
 -- both need EXECUTE. Callers hold SELECT on the search tables and no write
@@ -50,31 +61,34 @@
 --                          the Sentence.
 --   An Erasure reopening   the Version's token rows again (see Erasure).
 --   a Version
---   Token rows written     the count changes of their Scopes, kept for the
---   or deleted             transaction in `gnomon.search_count_delta`.
---   Commit                 the transaction's count changes, applied to the
---                          counts in key order, and a count that reaches zero
---                          is deleted, so an erased Scope leaves no count row.
+--   Token rows written     the changes to their Scopes' totals, kept for the
+--   or deleted             transaction in `gnomon.search_count_delta`, one
+--                          row for each Scope.
+--   Commit                 the transaction's changes, applied to the totals
+--                          in key order, and a Scope whose texts reach zero
+--                          loses its row, so an erased Scope leaves none.
 --
 -- A deleted Version's token rows go by the foreign key, which only the
 -- transaction that wrote the Version, or an Erasure, can set off. Every row is
 -- written in the write's own transaction, so a Version is findable when the
 -- write commits, before its embedding exists (ADR-0010). Within the
--- transaction, Search adds the transaction's own count changes to the counts.
+-- transaction, Search counts the transaction's own token rows with the rest
+-- and adds its own changes to the totals.
 --
--- Why the counts change at commit. Every write in a Scope changes the
--- Scope's row, and most change some word's row. A row changed statement by
--- statement stays locked until commit. Two transactions that each write
--- several Nodes of a Scope would then wait on each other's rows, a deadlock.
--- Each transaction instead records its changes in rows of its own, which no
--- other transaction touches. A deferred trigger applies them once at commit,
--- every word's row in key order and then every Scope's row, so two committing
--- transactions take the rows in one order and wait at most for each other's
--- commit.
+-- Why the totals change at commit. Every write in a Scope changes the
+-- Scope's row. A row changed statement by statement stays locked until
+-- commit. Two transactions that each write Nodes of the same two Scopes would
+-- then wait on each other's rows, a deadlock. Each transaction instead
+-- records its changes in rows of its own, which no other transaction
+-- touches. A deferred trigger applies them once at commit, in key order, so
+-- two committing transactions take the rows in one order and wait at most
+-- for each other's commit. Known limit: commits in one Scope run one at a
+-- time while they apply the totals. With 16 writers of short texts in one
+-- Scope, on disk, that was about 1,300 commits per second (#85).
 --
 -- Erasure (ADR-0003). `gnomon.erase_version_text` deletes the token rows of
 -- every Version an Erasure deletes or recomputes, besides its Sentence.
--- The counts go down at commit. Erase Episode inserts the Versions it
+-- The totals go down at commit. Erase Episode inserts the Versions it
 -- replays, so they are indexed from their recomputed text. A Version it
 -- reopens is the one that stood just before the Episode first touched its
 -- Node or Edge, so its text owes nothing to the erased Episode. It is indexed
@@ -83,11 +97,11 @@
 -- token rows as `gnomon_eraser`, in every Scope of the Tenant. Some belong
 -- to an erased Edge of a Scope the caller cannot see (see 0005). The search
 -- index trigger then runs as its own owner, `gnomon_definer`, and needs no
--- more than its usual rights for that: it records the count changes of its
--- own transaction in any Scope of the Tenant, and changes the counts only
--- of a Scope whose changes its own transaction recorded. Everything else it
--- reads and writes, it reads and writes in the caller's Scopes, which hold
--- every Version an Erasure inserts or reopens.
+-- more than its usual rights for that: it records the changes to the totals
+-- of its own transaction in any Scope of the Tenant, and changes the totals
+-- only of a Scope whose changes its own transaction recorded. Everything
+-- else it reads and writes, it reads and writes in the caller's Scopes,
+-- which hold every Version an Erasure inserts or reopens.
 --
 -- The vector branch. The Pipeline stores an embedding of a Version's search text after the
 -- write commits. A consumer searches with a query embedding at a valid-at
@@ -230,11 +244,12 @@
 -- of the mention include every Node whose name or Alias does. Each such
 -- Version's current name rows are then read by key, and each name or Alias
 -- is scored on its own, by BM25 with k1 = 1.2 and b = 0.75. A word's
--- frequency, the number of texts and their mean length are the counts of
--- the caller's allowed Scopes and the transaction's own changes to them, as
--- `gnomon.search_full_text` reads them. Those counts are of whole Version
--- texts, closed ones and Sentences among them, so the scores rank names
--- against each other and are not BM25 over the names alone. The length is
+-- frequency, the number of texts and their mean length are counted over the
+-- caller's allowed Scopes, the transaction's own writes among them, as
+-- `gnomon.search_full_text` counts them. Those counts are of whole texts,
+-- closed Versions, Sentences, Summaries and Communities among them, so the
+-- scores rank names against each other and are not BM25 over the names
+-- alone. The length is
 -- that of the name or Alias in words. The token lookup reaches closed
 -- Versions and Edge Versions too, and the probe of their name rows drops
 -- them, so its cost grows with a word's history in the Scope. That is the
@@ -367,11 +382,12 @@
 --                                  The search index trigger writes the rows
 --                                  when the row is inserted, in the write's
 --                                  transaction, and they go with the row.
---                                  Their words join the Scope's BM25 counts,
---                                  which count every text Search scores,
---                                  so a Version's score and a Summary's are
---                                  on one scale. The counts' `versions`
---                                  columns count those texts.
+--                                  Search counts their words with the
+--                                  Versions' in a word's frequency and in
+--                                  the Scope's totals, so a Version's score
+--                                  and a Summary's are on one scale. The
+--                                  totals' `versions` column counts every
+--                                  text Search scores.
 --   `gnomon.derived_embedding`     the full vector of each Summary's or
 --                                  Community's text, stored by the Pipeline
 --                                  with `gnomon.store_summary_embedding` or
@@ -389,8 +405,9 @@
 --
 -- Who writes them (ADR-0009). The search index trigger,
 -- `gnomon.maintain_search_index`, also fires when a Summary or a Community is inserted and when its token rows are written or
--- deleted, and writes those rows and their count changes as it writes a
--- Version's. Callers hold SELECT on the token rows and no write privilege.
+-- deleted, and writes those rows and their changes to the totals as it
+-- writes a Version's. Callers hold SELECT on the token rows and no write
+-- privilege.
 -- The embedding functions run as `gnomon_writer` and check the call's
 -- Tenant and Scope. The writer role may insert an embedding row and nothing
 -- more, and a trigger sets its bits and time columns from the stored row,
@@ -400,7 +417,7 @@
 --
 -- Erasure (ADR-0003). `gnomon.erase_summaries_and_communities`, which every
 -- Erasure that removes a Summary or Community calls, deletes their token
--- rows and embedding rows first, and the counts go down at commit. The
+-- rows and embedding rows first, and the totals go down at commit. The
 -- eraser reads and deletes them in every Scope of the Tenant.
 -- A row the transaction that wrote it deletes takes them
 -- with it through the foreign keys.
@@ -423,8 +440,8 @@
 --
 -- Its words. The search index trigger writes the Version's
 -- token rows again on the insert or the update, with the Sentence's words, in
--- the store's own transaction, and its BM25 count changes are applied at
--- commit. So full-text Search finds the Edge Version by its Sentence when the
+-- the store's own transaction, and its changes to the BM25 totals are
+-- applied at commit. So full-text Search finds the Edge Version by its Sentence when the
 -- store commits, before any embedding exists (ADR-0010).
 --
 -- Its embedding. The Pipeline then calls `gnomon.store_embedding` with
@@ -620,36 +637,23 @@ create function gnomon.maintain_search_index() returns trigger
     v_scopes text[];
     v_hashes text[];
   begin
-    -- At commit: the transaction's changes to the counts of the Tenant that
-    -- fired it, one row at a time, every word's row in key order and then
-    -- every Scope's row. Each statement reaches one row by its key. A change
-    -- that empties a row deletes it. Then the changes go.
+    -- At commit: the transaction's changes to the totals of the Tenant that
+    -- fired it, one Scope's row at a time in key order. Each statement
+    -- reaches one row by its key. A change that leaves a Scope no text
+    -- deletes its row. Then the changes go.
     if tg_level = 'ROW' then
       for d in
         select x.* from gnomon.search_count_delta x
         where x.tenant_id = new.tenant_id and x.written_in = new.written_in
-        order by x.token is null, x.scope, x.token
+        order by x.scope
       loop
-        if d.token is not null and d.versions > 0 then
-          insert into gnomon.search_token_frequency as f (tenant_id, scope, token, versions)
-            values (d.tenant_id, d.scope, d.token, d.versions)
-            on conflict (tenant_id, scope, token)
-              do update set versions = f.versions + excluded.versions;
-        elsif d.token is not null and d.versions < 0 then
-          update gnomon.search_token_frequency f set versions = f.versions + d.versions
-            where f.tenant_id = d.tenant_id and f.scope = d.scope and f.token = d.token
-              and f.versions + d.versions > 0;
-          if not found then
-            delete from gnomon.search_token_frequency f
-              where f.tenant_id = d.tenant_id and f.scope = d.scope and f.token = d.token;
-          end if;
-        elsif d.token is null and d.versions > 0 then
+        if d.versions > 0 then
           insert into gnomon.search_scope_length as l (tenant_id, scope, versions, words)
             values (d.tenant_id, d.scope, d.versions, d.words)
             on conflict (tenant_id, scope)
               do update set versions = l.versions + excluded.versions,
                             words = l.words + excluded.words;
-        elsif d.token is null and (d.versions < 0 or d.words <> 0) then
+        elsif d.versions < 0 or d.words <> 0 then
           update gnomon.search_scope_length l
             set versions = l.versions + d.versions, words = l.words + d.words
             where l.tenant_id = d.tenant_id and l.scope = d.scope
@@ -665,32 +669,27 @@ create function gnomon.maintain_search_index() returns trigger
       return null;
     end if;
 
-    -- Token rows written or deleted: the changes to their Scopes' counts.
-    -- A text's rows are always written and deleted together.
+    -- Token rows written or deleted: the changes to their Scopes' totals,
+    -- one row for each Scope. A text's rows are always written and deleted
+    -- together.
     if tg_table_name = 'search_token' then
       v_sign := case when tg_op = 'INSERT' then 1 else -1 end;
-      insert into gnomon.search_count_delta as x (tenant_id, scope, token, versions, words)
-        select c.tenant_id, c.scope, c.token, v_sign * pg_catalog.count(*), 0
-        from changed c group by c.tenant_id, c.scope, c.token
-        union all
-        select c.tenant_id, c.scope, null, v_sign * pg_catalog.count(distinct c.version_id),
+      insert into gnomon.search_count_delta as x (tenant_id, scope, versions, words)
+        select c.tenant_id, c.scope, v_sign * pg_catalog.count(distinct c.version_id),
                v_sign * pg_catalog.sum(c.tf)
         from changed c group by c.tenant_id, c.scope
-        on conflict (tenant_id, written_in, scope, token)
+        on conflict (tenant_id, written_in, scope)
           do update set versions = x.versions + excluded.versions,
                         words = x.words + excluded.words;
       return null;
     end if;
     if tg_table_name = 'derived_search_token' then
       v_sign := case when tg_op = 'INSERT' then 1 else -1 end;
-      insert into gnomon.search_count_delta as x (tenant_id, scope, token, versions, words)
-        select c.tenant_id, c.scope, c.token, v_sign * pg_catalog.count(*), 0
-        from changed c group by c.tenant_id, c.scope, c.token
-        union all
-        select c.tenant_id, c.scope, null, v_sign * pg_catalog.count(distinct c.derived_id),
+      insert into gnomon.search_count_delta as x (tenant_id, scope, versions, words)
+        select c.tenant_id, c.scope, v_sign * pg_catalog.count(distinct c.derived_id),
                v_sign * pg_catalog.sum(c.tf)
         from changed c group by c.tenant_id, c.scope
-        on conflict (tenant_id, written_in, scope, token)
+        on conflict (tenant_id, written_in, scope)
           do update set versions = x.versions + excluded.versions,
                         words = x.words + excluded.words;
       return null;
@@ -806,17 +805,19 @@ create trigger search_token_count_deleted after delete on gnomon.search_token
 -- every change of the transaction in its Tenant, and the rest find none left.
 create constraint trigger search_count_delta_apply after insert on gnomon.search_count_delta
   deferrable initially deferred
-  for each row when (new.token is null)
+  for each row
   execute function gnomon.maintain_search_index();
 
 -- The full-text branch of Search: the Versions whose searchable text holds
 -- a word of `p_query`, As-of the valid-at and known-at instants (a null
 -- known-at reads the current belief), best first, at most `p_limit`.
 --
--- BM25 with k1 = 1.2 and b = 0.75. The number of Versions, their mean length
--- and each word's frequency are the sums of the counts of the caller's
--- allowed Scopes, which RLS selects, with the changes the caller's own
--- transaction has recorded. Every Version of those Scopes is scored from its
+-- BM25 with k1 = 1.2 and b = 0.75. The number of texts and their mean
+-- length are the sums of the totals of the caller's allowed Scopes, which
+-- RLS selects, with the changes the caller's own transaction has recorded.
+-- Each word's frequency is counted from the token rows of those Scopes, the
+-- transaction's own among them, of Versions, Summaries and Communities
+-- together. Every Version of those Scopes is scored from its
 -- token rows, and the As-of instants are then checked on each scored
 -- Version, so the result is exact. Ties go to the lower Version ID.
 create function gnomon.search_full_text(
@@ -859,7 +860,7 @@ create function gnomon.search_full_text(
           where s.tenant_id = p_tenant_id
           union all
           select d.versions, d.words from gnomon.search_count_delta d
-          where d.tenant_id = p_tenant_id and d.token is null
+          where d.tenant_id = p_tenant_id
         ) x
       ),
       idf as materialized (
@@ -868,14 +869,12 @@ create function gnomon.search_full_text(
         from query q
         cross join totals t
         cross join lateral (
-          select pg_catalog.sum(x.versions)::float8 as versions
-          from (
-            select c.versions from gnomon.search_token_frequency c
-            where c.tenant_id = p_tenant_id and c.token = q.token
-            union all
-            select d.versions from gnomon.search_count_delta d
-            where d.tenant_id = p_tenant_id and d.token = q.token
-          ) x
+          -- How many texts hold the word: its token rows in the caller's allowed
+          -- Scopes, the transaction's own among them, each counted by key.
+          select ((select pg_catalog.count(*) from gnomon.search_token c
+                   where c.tenant_id = p_tenant_id and c.token = q.token)
+                  + (select pg_catalog.count(*) from gnomon.derived_search_token c
+                     where c.tenant_id = p_tenant_id and c.token = q.token))::float8 as versions
         ) f
         where f.versions > 0
       ),
@@ -1202,7 +1201,7 @@ create function gnomon.resolve_full_text(
         where s.tenant_id = p_tenant_id
         union all
         select d.versions, d.words from gnomon.search_count_delta d
-        where d.tenant_id = p_tenant_id and d.token is null
+        where d.tenant_id = p_tenant_id
       ) x
     ),
     idf as materialized (
@@ -1211,14 +1210,12 @@ create function gnomon.resolve_full_text(
       from query q
       cross join totals t
       cross join lateral (
-        select pg_catalog.sum(x.versions)::float8 as versions
-        from (
-          select c.versions from gnomon.search_token_frequency c
-          where c.tenant_id = p_tenant_id and c.token = q.token
-          union all
-          select d.versions from gnomon.search_count_delta d
-          where d.tenant_id = p_tenant_id and d.token = q.token
-        ) x
+        -- How many texts hold the word: its token rows in the caller's allowed
+        -- Scopes, the transaction's own among them, each counted by key.
+        select ((select pg_catalog.count(*) from gnomon.search_token c
+                 where c.tenant_id = p_tenant_id and c.token = q.token)
+                + (select pg_catalog.count(*) from gnomon.derived_search_token c
+                   where c.tenant_id = p_tenant_id and c.token = q.token))::float8 as versions
       ) f
       where f.versions > 0
     ),
@@ -1536,9 +1533,9 @@ create trigger derived_search_token_count_deleted after delete on gnomon.derived
   for each statement execute function gnomon.maintain_search_index();
 
 -- The words of `p_query`, each with its BM25 inverse document frequency,
--- and the mean length of a text, from the counts of the caller's allowed
--- Scopes and the changes the caller's own transaction recorded, as
--- `gnomon.search_full_text` computes them.
+-- and the mean length of a text, counted over the caller's allowed Scopes
+-- and the caller's own transaction, as `gnomon.search_full_text` counts
+-- them.
 create function gnomon.search_query_words(p_tenant_id uuid, p_query text)
   returns table (token text, idf double precision, mean_length double precision)
   language sql stable security invoker set search_path = pg_catalog, pg_temp
@@ -1556,7 +1553,7 @@ create function gnomon.search_query_words(p_tenant_id uuid, p_query text)
         where s.tenant_id = p_tenant_id
         union all
         select d.versions, d.words from gnomon.search_count_delta d
-        where d.tenant_id = p_tenant_id and d.token is null
+        where d.tenant_id = p_tenant_id
       ) x
     )
     select q.token,
@@ -1565,14 +1562,12 @@ create function gnomon.search_query_words(p_tenant_id uuid, p_query text)
     from query q
     cross join totals t
     cross join lateral (
-      select pg_catalog.sum(x.versions)::float8 as versions
-      from (
-        select c.versions from gnomon.search_token_frequency c
-        where c.tenant_id = p_tenant_id and c.token = q.token
-        union all
-        select d.versions from gnomon.search_count_delta d
-        where d.tenant_id = p_tenant_id and d.token = q.token
-      ) x
+      -- How many texts hold the word: its token rows in the caller's allowed
+      -- Scopes, the transaction's own among them, each counted by key.
+      select ((select pg_catalog.count(*) from gnomon.search_token c
+               where c.tenant_id = p_tenant_id and c.token = q.token)
+              + (select pg_catalog.count(*) from gnomon.derived_search_token c
+                 where c.tenant_id = p_tenant_id and c.token = q.token))::float8 as versions
     ) f
     where f.versions > 0
   $$;
