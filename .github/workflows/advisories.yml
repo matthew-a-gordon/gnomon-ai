@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+# One run at a time, so two failing runs cannot each open an issue.
+concurrency:
+  group: weekly-advisories
+
 jobs:
   advisories:
     runs-on: ubuntu-24.04
@@ -29,8 +33,8 @@ jobs:
 
   report:
     needs: advisories
-    # A job that runs out of time counts as cancelled, not failed. Only a
-    # cancelled run reports nothing.
+    # Not `failure()`, so that an advisories job that ran out of time is
+    # reported too. Nothing is reported when someone cancels the whole run.
     if: ${{ !cancelled() && needs.advisories.result != 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
