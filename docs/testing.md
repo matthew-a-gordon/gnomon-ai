@@ -15,7 +15,7 @@ The suite runs with plain `cargo test` or with `cargo nextest run`, and every te
 
 The names `test-pg17`, `test-supabase` and `lint` are the required status checks of the ruleset on `main`. A change to one of them changes the ruleset too. `advisories` is not required.
 
-To run the dependency checks on your machine, install the version CI runs, `cargo install cargo-deny --version 0.21.0 --locked`, then run `cargo deny check`. Version 0.22 needs a newer Rust than the pinned toolchain to build. `deny.toml` holds the rules. The weekly workflow runs the advisory check again, and when it does not succeed it opens an issue, or comments on the open one.
+To run the dependency checks on your machine, install the version CI runs, `cargo install cargo-deny --version 0.21.0 --locked`, then run `cargo deny check`. Version 0.22 needs a newer Rust than the pinned toolchain to build. `deny.toml` holds the rules. When the advisory check in the weekly workflow does not succeed, the workflow opens an issue, or comments on the open one.
 
 Both test jobs install the pinned Supabase CLI with Supabase's `setup-cli` action and pull their database image before the tests start, so neither download counts against a test's time limit. They set `GNOMON_TEST_SUPABASE_CLI=supabase`, so the suite runs the installed CLI. The workflow names each image itself, so a new image tag in `tests/support/server.rs` goes into `ci.yml` too. Builds leave out debug information (`CARGO_PROFILE_DEV_DEBUG=0`).
 
