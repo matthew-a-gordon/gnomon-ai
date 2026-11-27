@@ -1,0 +1,59 @@
+# Checks Cargo.lock against the RustSec database once a week, so an advisory
+# published while no pull request is open is still seen (ADR-0020). A check that
+# does not succeed opens an issue, or comments on the one already open.
+#
+# Only the report job can write issues, and it runs no third-party action.
+name: Weekly advisories
+
+on:
+  schedule:
+    - cron: "23 6 * * 1" # Mondays, 06:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2, cargo-deny 0.21.0
+        with:
+          arguments: --all-features --locked
+          command: check advisories
+
+  report:
+    needs: advisories
+    # A job that runs out of time counts as cancelled, not failed. Only a
+    # cancelled run reports nothing.
+    if: ${{ !cancelled() && needs.advisories.result != 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open an issue, or comment on the open one
+        # bash sets pipefail, so a failed listing stops the step instead of
+        # opening a second issue.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: The weekly advisory check failed
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="\`cargo deny check advisories\` did not pass in $RUN_URL. The log of its advisories job names the advisory, or the error that stopped the check."
+          # Matching the author too keeps an issue that someone else opened
+          # under the same title from collecting the reports.
+          number=$(gh api --paginate "repos/$GH_REPO/issues?state=open&creator=github-actions%5Bbot%5D&per_page=100" \
+            --jq '.[] | select(.title == env.TITLE and .pull_request == null) | .number' | sed -n 1p)
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$TITLE" --body "$body" --label needs-triage
+          fi

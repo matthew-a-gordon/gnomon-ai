@@ -4,19 +4,22 @@ The suite runs with plain `cargo test` or with `cargo nextest run`, and every te
 
 ## What CI runs
 
-`.github/workflows/ci.yml` runs on each pull request, and on demand through `workflow_dispatch`. It does not run on pushes to `main`, and it caches no build. ADR-0020 records why.
+`.github/workflows/ci.yml` runs on each pull request, and on demand through `workflow_dispatch`. It does not run on pushes to `main`, and it caches no build. `.github/workflows/advisories.yml` runs weekly. ADR-0020 records why.
 
 | Job | Runs |
 |---|---|
 | `test-pg17` | `cargo nextest run --workspace` on `pgvector/pgvector:pg17` |
 | `test-supabase` | The same on `supabase/postgres` 17.x (`GNOMON_TEST_IMAGE=supabase`) |
-| `lint` | `cargo fmt --all --check`, and `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| `lint` | `cargo fmt --all --check`, `cargo deny check bans licenses sources`, and `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| `advisories` | `cargo deny check advisories` |
 
-The three names are the required status checks of the ruleset on `main`. A change to a job's name changes the ruleset too.
+The names `test-pg17`, `test-supabase` and `lint` are the required status checks of the ruleset on `main`. A change to one of them changes the ruleset too. `advisories` is not required.
+
+To run the dependency checks on your machine, install the version CI runs, `cargo install cargo-deny --version 0.21.0 --locked`, then run `cargo deny check`. Version 0.22 needs a newer Rust than the pinned toolchain to build. `deny.toml` holds the rules. The weekly workflow runs the advisory check again, and when it does not succeed it opens an issue, or comments on the open one.
 
 Both test jobs install the pinned Supabase CLI with Supabase's `setup-cli` action and pull their database image before the tests start, so neither download counts against a test's time limit. They set `GNOMON_TEST_SUPABASE_CLI=supabase`, so the suite runs the installed CLI. The workflow names each image itself, so a new image tag in `tests/support/server.rs` goes into `ci.yml` too. Builds leave out debug information (`CARGO_PROFILE_DEV_DEBUG=0`).
 
-`rust-toolchain.toml` pins the Rust version, and rustup installs it on your machine as it does in CI. It is also the minimum supported Rust version: change `rust-version` in `Cargo.toml` with it. `ci.yml` sets the versions of cargo-nextest and uv on the steps that install them.
+`rust-toolchain.toml` pins the Rust version, and rustup installs it on your machine as it does in CI. It is also the minimum supported Rust version: change `rust-version` in `Cargo.toml` with it. `ci.yml` sets the versions of cargo-nextest and uv on the steps that install them. The commit of `cargo-deny-action` pins the version of cargo-deny, so a new version changes that commit in `ci.yml` and `advisories.yml`, and the command above.
 
 Lanes 3 and 4 and the performance suite run on demand. Only the performance suite asserts a time budget.
 
