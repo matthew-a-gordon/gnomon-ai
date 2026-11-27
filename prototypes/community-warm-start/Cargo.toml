@@ -1,0 +1,15 @@
+[package]
+name = "community-warm-start-proto"
+version = "0.0.0"
+edition = "2024"
+publish = false
+# PROTOTYPE, throwaway. Answers: does warm-starting Leiden from the previous
+# partition regenerate at least a third fewer Communities than a cold run?
+# Do not build on this.
+
+[workspace]
+
+[dependencies]
+# Default features off: no rayon, so the detector takes its sequential path.
+leiden-rs = { version = "=0.8.1", default-features = false }
+rand = "0.9"
