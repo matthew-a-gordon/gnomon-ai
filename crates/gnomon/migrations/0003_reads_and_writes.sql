@@ -441,16 +441,6 @@ create function gnomon.check_node_value(p_tenant_id uuid, p_kind text, p_propert
   end
   $$;
 
--- The precision of a bound a write names without one: an instant, or
--- unknown for an open bound.
-create function gnomon.instant_or_unknown(p_bound timestamptz)
-  returns gnomon.time_precision
-  language sql immutable parallel safe security invoker set search_path = pg_catalog, pg_temp
-  as $$
-    select case when p_bound in ('-infinity', 'infinity') then 'unknown' else 'instant' end
-      ::gnomon.time_precision
-  $$;
-
 -- Checks a new Node's Kind: the root Kind `node`, or a Node Kind the Tenant
 -- registered.
 create function gnomon.node_check_kind() returns trigger
@@ -2318,17 +2308,13 @@ create function gnomon.merge_versions(
       -- Version's that does, else instant or unknown. An open Version's
       -- bounds give a precision and no instant.
       select array_agg(p.at order by p.at) as at,
-             array_agg(coalesce(p.fp, p.version_fp,
-                                case when p.at in ('-infinity', 'infinity') then 'unknown'
-                                     else 'instant' end::gnomon.time_precision)
-                       order by p.at) as fp,
-             array_agg(coalesce(p.tp, p.version_tp,
-                                case when p.at in ('-infinity', 'infinity') then 'unknown'
-                                     else 'instant' end::gnomon.time_precision)
-                       order by p.at) as tp
+             array_agg(coalesce(p.fp, p.version_fp, p.plain) order by p.at) as fp,
+             array_agg(coalesce(p.tp, p.version_tp, p.plain) order by p.at) as tp
       from (
         select b.at, max(b.fp) as fp, max(b.tp) as tp,
-               max(b.version_fp) as version_fp, max(b.version_tp) as version_tp
+               max(b.version_fp) as version_fp, max(b.version_tp) as version_tp,
+               case when b.at in ('-infinity', 'infinity') then 'unknown'
+                    else 'instant' end::gnomon.time_precision as plain
         from (
           select c.vf as at, c.vfp as fp, null::gnomon.time_precision as tp,
                  null::gnomon.time_precision as version_fp,
@@ -2341,13 +2327,10 @@ create function gnomon.merge_versions(
           union all
           select w1, null, null, null, null, true
           union all
-          select x.valid_from, null, null, x.valid_from_precision, null, false
+          select e.at, null, null, e.fp, e.tp, false
             from gnomon.version x
-            where x.tenant_id = p_tenant_id and x.scope = v_scope and x.versioned_id = p_id
-              and x.recorded_to = 'infinity' and x.valid_from <= w1 and x.valid_to >= w0
-          union all
-          select x.valid_to, null, null, null, x.valid_to_precision, false
-            from gnomon.version x
+            cross join lateral (values (x.valid_from, x.valid_from_precision, null),
+                                       (x.valid_to, null, x.valid_to_precision)) e(at, fp, tp)
             where x.tenant_id = p_tenant_id and x.scope = v_scope and x.versioned_id = p_id
               and x.recorded_to = 'infinity' and x.valid_from <= w1 and x.valid_to >= w0
         ) b
@@ -2363,7 +2346,8 @@ create function gnomon.merge_versions(
         pg_catalog.width_bucket(c.vf, i.at), pg_catalog.width_bucket(c.vt, i.at) - 1) g(ord)
     ), ranked as materialized (
       -- In each segment, the Contributions of each property in merge order:
-      -- the first wins, and every one stating its value supports it.
+      -- the first wins, and the Version cites every one that states its
+      -- value.
       select k.ord, k.property, k.value, k.episode_id, k.place, k.ref, k.episode_rec, k.rec,
              row_number() over w = 1 as wins,
              first_value(k.value) over w as winning
@@ -2443,7 +2427,10 @@ create function gnomon.merge_versions(
     --   opening   the fresh candidates and those that reopen a Version
     --   kept      a candidate an open Version already holds
     -- A composite is null only when every field is, so each row says what
-    -- it is with `is_candidate`.
+    -- it is with `is_candidate`. A group holds at most one open Version and
+    -- one closed at the step: open Versions do not overlap in Valid time,
+    -- and two closed at the step with the same Valid time would overlap in
+    -- Recorded time, which `version_no_overlap` refuses.
     select coalesce(array_agg(g.open_id) filter (where not g.wanted and g.open_id is not null),
                     '{}'),
            coalesce(array_agg(g.closed_id) filter (where g.wanted and g.closed_id is not null),

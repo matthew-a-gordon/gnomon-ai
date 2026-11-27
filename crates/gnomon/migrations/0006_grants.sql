@@ -244,8 +244,6 @@ grant execute on function gnomon.read_episode(uuid, uuid)
   to authenticated, gnomon_worker;
 grant execute on function gnomon.check_node_value(uuid, text, text, jsonb)
   to gnomon_writer;
-grant execute on function gnomon.instant_or_unknown(timestamptz)
-  to gnomon_writer, gnomon_eraser;
 grant execute on function gnomon.node_lock_key(uuid, uuid)
   to gnomon_writer, gnomon_eraser;
 grant execute on function gnomon.create_node(uuid, text, text)
