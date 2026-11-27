@@ -80,7 +80,7 @@ A file never changes once it is released. A later release adds files with higher
 
 - The floor is PostgreSQL 17, pgvector 0.7.0 or later, and btree_gist (ADR-0023). The first file creates each extension when it is missing, in the `extensions` schema when that schema exists and in the migrating role's default schema otherwise. btree_gist is a trusted extension, so a role with CREATE on the database may create it. On Azure Flexible Server, add `vector` and `btree_gist` to `azure.extensions` first.
 - The functions that use pgvector keep a search path of `pg_catalog`, pgvector's schema and `pg_temp`, set when the files run. So no untrusted role may have CREATE on pgvector's schema, and moving the extension to another schema later breaks those functions.
-- The role that applies the files needs CREATE on the database, the right to create pgvector, and CREATEROLE when the gnomon roles `authenticated`, `gnomon_worker`, `gnomon_definer` and `gnomon_writer` do not exist yet. `gnomon_definer` and `gnomon_writer` are NOLOGIN and NOINHERIT, cannot bypass row-level security and are members of no role, and no caller role may be a member of either. The first file refuses a role of either name that holds more, and neither may own a table, so that row-level security holds it to its policies. When the callers or the definer roles lack USAGE on pgvector's schema, the first file grants it, so the role must be able to. The last file hands Erasure, Kind registration, the merge-rule setter and the search index trigger to `gnomon_definer`, and every write function to `gnomon_writer`, which needs the role to act as each for that step. A role that created them holds ADMIN on each and grants itself that for the step. When another role created the gnomon roles, for example for another database on the same cluster, the last file fails with `permission denied to grant role "gnomon_definer"` (or `"gnomon_writer"`) until a role with ADMIN on both runs `grant gnomon_definer, gnomon_writer to <migrating role> with admin option, inherit false, set false`. `tests/install.rs` shows both.
+- The role that applies the files needs CREATE on the database, the right to create pgvector, and CREATEROLE when the gnomon roles `authenticated`, `gnomon_worker`, `gnomon_writer`, `gnomon_definer` and `gnomon_eraser` do not exist yet. `gnomon_writer`, `gnomon_definer` and `gnomon_eraser` are NOLOGIN and NOINHERIT, cannot bypass row-level security and are members of no role, and no caller role may be a member of any of them. The first file refuses a role of these names that holds more, and none may own a table, so that row-level security holds each to its policies. When the callers or these roles lack USAGE on pgvector's schema, the first file grants it, so the role must be able to. The last file hands every write function to `gnomon_writer`, Kind registration, the merge-rule setter and the search index trigger to `gnomon_definer`, and Erasure to `gnomon_eraser`, which needs the role to act as each for that step. A role that created them holds ADMIN on each and grants itself that for the step. When another role created the gnomon roles, for example for another database on the same cluster, the last file fails with `permission denied to grant role "gnomon_definer"` (or `"gnomon_writer"` or `"gnomon_eraser"`) until a role with ADMIN on all three runs `grant gnomon_definer, gnomon_writer, gnomon_eraser to <migrating role> with admin option, inherit false, set false`. `tests/install.rs` shows both.
 - Grant `authenticated` and `gnomon_worker` to the role the Store logs in as. The files grant Kind registration (`gnomon.register_kind`, `gnomon.set_merge_rule`) and Erasure (`gnomon.erase_episode`, `gnomon.erase_node`, `gnomon.erase_edge`, `gnomon.erase_scope`) to no role. Grant EXECUTE on them to the roles you choose.
 - An Erasure holds one advisory lock for each Node and Edge it touches, in the server's shared lock table of `max_locks_per_transaction * (max_connections + max_prepared_transactions)` entries. In a test on PostgreSQL 17 with `max_connections` 100 and the default `max_locks_per_transaction`, one transaction held 5,000 advisory locks and failed at 20,000. Raise the setting before you erase Episodes cited across many thousands of Nodes.
 - A large Erasure can outlast a statement time limit on the login role: a prototype measured 24 to 35 seconds for an Episode across 500 Nodes. Set the limit to allow for it.
@@ -99,17 +99,17 @@ Callers hold no write privilege on any gnomon table. Every write goes through a 
 | `gnomon.writable_scopes()` | the Scopes the caller may write | the same Scopes as `gnomon.allowed_scopes()` |
 | `gnomon.user_id()` | who records an Episode or its Retraction | `sub`, or null when it is missing or empty |
 
-A token without `app_metadata.tenant_id` and `app_metadata.scopes` therefore reaches nothing until you add those claims or replace the functions. A write needs its Scope in both lists, so a caller may read a Scope it may not write: every write to it is refused with `insufficient_privilege` and the message "Scope ... is read-only for the caller". A row in a writable Scope may still refer to one there, such as an Edge to a Node of a read-only Scope or a Summary of it. Erasure needs the named Episode's, Node's or Edge's Scope, or the named Scope, to be writable, and still removes what depends on it in every Scope.
+A token without `app_metadata.tenant_id` and `app_metadata.scopes` therefore reaches nothing until you add those claims or replace the functions. A write needs its Scope in both lists, so a caller may read a Scope it may not write: every write to it is refused with `insufficient_privilege` and the message "Scope ... is read-only for the caller". A row in a writable Scope may still refer to one there, such as an Edge to a Node of a read-only Scope or a Summary of it. Erasure needs the named Episode's, Node's or Edge's Scope, or the named Scope, to be readable and writable, and a hidden one fails as an absent one does. It still removes what depends on it in every Scope of the Tenant, and its result names only what the caller can read (see Data protection below).
 
 A background job acts as a worker for one Tenant and Scope. `Store::as_worker(tenant, scope, user)` sets the claims `{"role": "gnomon_worker", "sub": <user>, "app_metadata": {"tenant_id": <tenant>, "scopes": [<scope>]}}`, with no `sub` when `user` is `None`. Pass the user a job works for, such as the person whose upload it imports, and the Episodes it records name them in `recorded_by`. Without one, `recorded_by` is null, and gnomon still records the Episode.
 
 `Caller::read_episode` returns `recorded_by`, and for a retracted Episode when it was retracted and by whom. Whoever can read the Episode can read both, and erasing it removes both. Each edit by a person is an Episode of its own, so a Version, Summary or Community leads to who stated it through its Citations, and a write that cites an older Episode shows who recorded that one. gnomon records nothing else about who made a write: not who ran an Erasure, registered a Kind or set a merge rule. Your application logs what it needs (ADR-0003).
 
-To resolve any of the four your own way, replace it with `create or replace function` after the files run, keeping its signature. These rules apply to all four, because each runs as the caller during a read, as `gnomon_writer` during a write and as `gnomon_definer` during an Erasure, Kind registration, the merge-rule setter and the search index trigger:
+To resolve any of the four your own way, replace it with `create or replace function` after the files run, keeping its signature. These rules apply to all four, because each runs as the caller during a read, as `gnomon_writer` during a write, as `gnomon_eraser` during an Erasure and as `gnomon_definer` during Kind registration, the merge-rule setter and the search index trigger:
 
 - Read only the claims, or reach other data through a `SECURITY DEFINER` function of your own.
 - Do not depend on `current_user`.
-- Grant whatever outside gnomon it calls to `authenticated`, `gnomon_worker`, `gnomon_writer` and `gnomon_definer`.
+- Grant whatever outside gnomon it calls to `authenticated`, `gnomon_worker`, `gnomon_writer`, `gnomon_definer` and `gnomon_eraser`.
 - Answer for worker claims too. Tell a worker call by its `role` claim, because a worker call may carry `sub`.
 - End every `search_path` it sets, or that a function it calls sets, in `pg_temp` (ADR-0009).
 
@@ -134,9 +134,10 @@ create function membership.scopes(p_writable boolean) returns text[]
       and (m.writable or not p_writable)
   $$;
 revoke all on function membership.scopes(boolean) from public;
-grant usage on schema membership to authenticated, gnomon_worker, gnomon_writer, gnomon_definer;
+grant usage on schema membership
+  to authenticated, gnomon_worker, gnomon_writer, gnomon_definer, gnomon_eraser;
 grant execute on function membership.scopes(boolean)
-  to authenticated, gnomon_worker, gnomon_writer, gnomon_definer;
+  to authenticated, gnomon_worker, gnomon_writer, gnomon_definer, gnomon_eraser;
 
 create or replace function gnomon.allowed_scopes() returns text[]
   language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
@@ -161,6 +162,35 @@ create or replace function gnomon.writable_scopes() returns text[]
 ```
 
 `tests/writable_scopes.rs` runs this example for reads, writes and Erasure. The Scope rule must stay a set of keys, so the policies keep their index conditions (ADR-0005).
+
+## Data protection
+
+This section is not legal advice. It says what gnomon removes, so you can decide what your obligations need.
+
+Erase Episode (`Caller::erase_episode`) removes an Episode and everything gnomon derived from it alone, in every Scope of the Tenant, in one transaction (ADR-0003, ADR-0007):
+
+| Data | Removed |
+|---|---|
+| The Episode and its text | Yes, at commit |
+| Values that only this Episode gave, in current and closed Versions | Yes |
+| Search rows and embeddings from that text | Yes |
+| Summaries and Communities that cite it | Yes |
+| The same value from another Episode | No. Erase that Episode too |
+| `recorded_by` user IDs on other Episodes | No |
+| Old row copies on disk | When PostgreSQL vacuums the tables |
+| Backups, WAL and replicas | No. The operator controls them |
+| The application, its logs and model providers | No. The application controls them |
+
+Erase Node and Erase Edge keep the Episodes they were derived from, so a person's name can remain in an Episode's text after their Node is gone. To remove a person:
+
+1. List the Episodes behind their Node with `Caller::list_node_episodes`. It returns each Episode once, with its Scope: those behind the Node's values and statements, behind each Edge that joins it, and behind its Summaries. It leaves out Communities, because they cite Episodes about other Nodes. Search the Episode text too, because the list cannot find a name that appears only there. The list holds only what the caller can read, so a caller who cannot read every relevant Scope gets a shorter list. A worker reads one Scope, so call it with the worker of each.
+2. Erase those Episodes. If one also concerns other people, first record a new Episode without this person, and write what it states.
+3. Erase their Node.
+4. Remove the data held outside gnomon.
+
+Erase Scope removes a Scope's Episodes, Nodes and Edges in one call, which suits data held in a Scope of its own.
+
+Every Erasure runs as `gnomon_eraser`, whose policies check the Tenant alone. The named Episode, Node, Edge or Scope must be one the caller can read and write. What depends on it goes in every Scope of the Tenant, such as an Edge of another Scope that joins an erased Node, or a Node left with nothing once its last Edge goes. So the same request removes the same rows whoever makes it, and the result names only the Nodes and Edges the caller can read (ADR-0009).
 
 
 ## Connecting

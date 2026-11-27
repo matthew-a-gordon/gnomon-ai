@@ -38,8 +38,8 @@ pub use kind::{
 };
 pub use node::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, EndOfValidity,
-    EpisodeRetraction, NewNode, NodeId, NodeVersion, Patch, Precision, Retraction, Statement,
-    StatementKind, ValidTime, VersionId, WriteOutcome, WriteStatus,
+    EpisodeRetraction, NewNode, NodeEpisode, NodeId, NodeVersion, Patch, Precision, Retraction,
+    Statement, StatementKind, ValidTime, VersionId, WriteOutcome, WriteStatus,
 };
 pub use resolution::{FullTextNameMatch, Mention, ResolutionCandidate, VectorNameMatch};
 pub use search::{

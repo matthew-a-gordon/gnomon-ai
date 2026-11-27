@@ -278,14 +278,15 @@ async fn a_caller_cannot_redirect_the_store_functions_through_its_search_path() 
 /// alone.
 const ONTOLOGY_TABLES: &[&str] = &["kind", "kind_rule", "kind_merge"];
 
-/// The list a running Erasure of a Node, an Edge or a Scope keeps of what it
-/// reaches in Scopes the caller cannot see. No caller role may read it, and
-/// it holds no row once the Erasure returns.
-const ERASURE_REACH: &str = "erasure_reach";
-
+/// Every table has RLS and a Tenant, and every policy reads only the
+/// caller's Tenant and Scopes, with two exceptions. The eraser role's policies
+/// check the Tenant alone, because an Erasure removes what depends on what it
+/// erases in every Scope (#83). The search index trigger's policies on the
+/// BM25 counts reach every Scope whose counts its own transaction changed.
+/// No other role gains reach outside the caller's Scopes.
 #[tokio::test]
-async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_tenant_scope_policy()
-{
+async fn every_gnomon_table_has_rls_and_every_policy_but_the_erasers_and_the_counts_reads_only_the_callers_scopes()
+ {
     let w = world().await;
     let client = w.db.login().await;
     let tables = client
@@ -320,23 +321,6 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
             .await
             .unwrap();
         assert!(!policies.is_empty(), "gnomon.{name} has no policy");
-        if name == ERASURE_REACH {
-            // The list a running Erasure keeps of what it reaches: no Scope,
-            // and a policy for the definer role alone, which shows each
-            // transaction only its own rows.
-            assert!(!scope, "gnomon.{name} has a scope column");
-            for p in &policies {
-                let roles: Vec<String> = p.get(2);
-                assert_eq!(roles, vec!["gnomon_definer"], "gnomon.{name} policy roles");
-                let using: String = p.get(0);
-                assert_eq!(
-                    using,
-                    "((tenant_id = gnomon.tenant_id()) AND \
-                     (written_in = pg_current_xact_id_if_assigned()))"
-                );
-            }
-            continue;
-        }
         let ontology = ONTOLOGY_TABLES.contains(&name.as_str());
         assert_eq!(
             scope, !ontology,
@@ -354,23 +338,14 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
                 using.is_some() || check.is_some(),
                 "gnomon.{name} has a policy that checks nothing"
             );
-            // The definer's reach, for Erasure alone: it reads and deletes,
-            // in the caller's Tenant, only the rows of Edges a running
-            // Erasure listed, and never writes through it.
-            if let Some(reach) = using
-                .as_deref()
-                .filter(|u| u.contains("gnomon.erasure_reaches"))
-            {
-                assert_eq!(
-                    roles,
-                    ["gnomon_definer"],
-                    "gnomon.{name}: who has the reach"
-                );
-                assert!(
-                    reach.starts_with("((tenant_id = gnomon.tenant_id()) AND "),
-                    "gnomon.{name}: the reach is {reach}"
-                );
-                assert_eq!(check, None, "gnomon.{name}: the definer's reach writes");
+            // The eraser, for Erasure alone: every Scope of the caller's
+            // Tenant, and no other Tenant (#83). Its functions check the
+            // Scopes of what they erase and of what they return.
+            // The Ontology's tables check the Tenant alone for every role.
+            if roles == ["gnomon_eraser"] && !ontology {
+                let tenant = Some("(tenant_id = gnomon.tenant_id())".to_owned());
+                assert_eq!(using, tenant, "gnomon.{name}: the eraser's USING");
+                assert_eq!(check, tenant, "gnomon.{name}: the eraser's CHECK");
                 continue;
             }
             // The search index function, a definer, changes the BM25 counts
@@ -425,17 +400,35 @@ async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_t
     }
 }
 
-/// The only SECURITY DEFINER functions ADR-0009 allows: Kind registration,
-/// the setting of a Kind's merge rule, Erasure, and the trigger function that
-/// writes full-text Search's token rows and counts.
+/// The SECURITY DEFINER functions `gnomon_definer` owns (ADR-0009): Kind
+/// registration, the setting of a Kind's merge rule, and the trigger function
+/// that writes full-text Search's token rows and counts.
 const DEFINERS: &[&str] = &[
     "gnomon.maintain_search_index(",
     "gnomon.register_kind(",
     "gnomon.set_merge_rule(",
+];
+
+/// The SECURITY DEFINER functions `gnomon_eraser` owns: the four Erasures
+/// (ADR-0009, #83).
+const ERASERS: &[&str] = &[
     "gnomon.erase_episode(",
     "gnomon.erase_node(",
     "gnomon.erase_edge(",
     "gnomon.erase_scope(",
+];
+
+/// The tables of history that only Erasure deletes or rewrites. Neither
+/// `gnomon_definer` nor a caller role holds a write privilege on any of them
+/// (ADR-0009).
+const HISTORY_TABLES: &[&str] = &[
+    "gnomon.episode",
+    "gnomon.episode_retraction",
+    "gnomon.version",
+    "gnomon.citation",
+    "gnomon.contribution",
+    "gnomon.statement",
+    "gnomon.bound_statement",
 ];
 
 /// The functions a caller writes through, each a definer owned by
@@ -480,6 +473,7 @@ const CALLER_READS: &[&str] = &[
     "gnomon.kind_merge_rule(uuid,text)",
     "gnomon.list_citations(uuid,uuid)",
     "gnomon.list_gaps(uuid,text,text,uuid,text,integer)",
+    "gnomon.list_node_episodes(uuid,uuid)",
     "gnomon.list_statements(uuid,uuid)",
     "gnomon.neighbourhood_edges(uuid,uuid[],timestamp with time zone,timestamp with time zone)",
     "gnomon.period_end(timestamp with time zone,gnomon.time_precision)",
@@ -581,6 +575,20 @@ async fn no_caller_role_holds_a_write_privilege_and_each_executes_only_the_store
     }
     for db in [&plain, &granting] {
         let admin = db.admin().await;
+        // The search index trigger's owner writes the search tables and the
+        // Ontology, and no table of history: a change that let it write one
+        // would let it past no check, because only the eraser is let past
+        // the triggers that check a write (ADR-0009, #83).
+        let (writes, _) = caller_rights(&admin, "gnomon_definer").await;
+        let history: Vec<_> = writes
+            .iter()
+            .filter(|w| {
+                HISTORY_TABLES
+                    .iter()
+                    .any(|t| w.split(' ').next() == Some(t))
+            })
+            .collect();
+        assert!(history.is_empty(), "gnomon_definer may write {history:#?}");
         for role in [USER, WORKER, support::LOGIN_ROLE] {
             let (writes, functions) = caller_rights(&admin, role).await;
             assert!(writes.is_empty(), "{role} may write: {writes:#?}");
@@ -637,6 +645,7 @@ async fn every_gnomon_function_runs_as_the_invoker_with_a_search_path_ending_in_
         "gnomon.read_edge(",
         "gnomon.traverse(",
         "gnomon.list_citations(",
+        "gnomon.list_node_episodes(",
         "gnomon.default_tenant()",
         "gnomon.call_tenant(",
         "gnomon.switch_to_multi_tenant()",
@@ -658,6 +667,8 @@ async fn every_gnomon_function_runs_as_the_invoker_with_a_search_path_ending_in_
         let compact = name.replace(", ", ",");
         let owned_by = if DEFINERS.iter().any(|d| name.starts_with(d)) {
             Some("gnomon_definer")
+        } else if ERASERS.iter().any(|d| name.starts_with(d)) {
+            Some("gnomon_eraser")
         } else if WRITERS.contains(&compact.as_str()) {
             Some("gnomon_writer")
         } else {
@@ -695,16 +706,18 @@ async fn every_gnomon_function_runs_as_the_invoker_with_a_search_path_ending_in_
 }
 
 #[tokio::test]
-async fn the_definer_role_cannot_log_in_or_bypass_rls_and_no_role_belongs_to_it_or_it_to_one() {
+async fn the_definer_roles_cannot_log_in_or_bypass_rls_and_no_role_belongs_to_one_or_one_to_a_role()
+{
     let w = world().await;
     let client = w.db.login().await;
     // A migrating role acts as each definer role for one step, under the
     // server's lock when a test applies the files (tests/install.rs).
     let _lock = support::Server::get().await.lock();
-    // `gnomon_definer` owns Erasure, Kind registration, the merge-rule
-    // setter and the search index trigger, and `gnomon_writer` every
-    // function a caller writes through (ADR-0009, #81).
-    for role in ["gnomon_definer", "gnomon_writer"] {
+    // `gnomon_writer` owns every function a caller writes through,
+    // `gnomon_definer` Kind registration, the merge-rule setter and the
+    // search index trigger, and `gnomon_eraser` Erasure (ADR-0009, #81,
+    // #83).
+    for role in ["gnomon_definer", "gnomon_writer", "gnomon_eraser"] {
         let row = client
             .query_typed(
                 "select rolcanlogin, rolinherit, rolsuper or rolbypassrls,
@@ -980,10 +993,10 @@ async fn temporary_types_named_like_built_in_types_run_nothing_of_the_callers_as
     // first for tables and types. A caller creates a domain named like each
     // built-in type, whose check records the role it runs as, then calls
     // every group of definer functions: Kind registration, the merge-rule
-    // setter, a write that fires the search index trigger, and an Erasure,
-    // and the write functions, which run as `gnomon_writer` (#81). A
-    // function that resolved one of those names to the caller's domain would
-    // run the caller's check as `gnomon_definer` or `gnomon_writer`.
+    // setter, a write that fires the search index trigger, an Erasure, which
+    // runs as `gnomon_eraser` (#83), and the write functions, which run as
+    // `gnomon_writer` (#81). A function that resolved one of those names to
+    // the caller's domain would run the caller's check as one of those roles.
     let w = world().await;
     w.db.grant_kind_registration(USER).await;
     w.db.grant_erasure(USER).await;
@@ -1074,7 +1087,7 @@ async fn temporary_types_named_like_built_in_types_run_nothing_of_the_callers_as
     .expect("an Erasure");
 
     let ran_as = recorded_roles(&tx).await;
-    for definer in ["gnomon_definer", "gnomon_writer"] {
+    for definer in ["gnomon_definer", "gnomon_writer", "gnomon_eraser"] {
         let times = ran_as.split_whitespace().filter(|r| *r == definer).count();
         assert_eq!(
             times, 0,
@@ -1855,12 +1868,11 @@ async fn tenant_tables(client: &Client) -> Vec<String> {
             "select c.relname::text
              from pg_class c join pg_namespace n on n.oid = c.relnamespace
              where n.nspname = 'gnomon' and c.relkind in ('r', 'p')
-               and c.relname <> $1
                and exists (select from pg_attribute a
                            where a.attrelid = c.oid and a.attname = 'tenant_id'
                              and not a.attisdropped)
              order by 1",
-            &[(&ERASURE_REACH, Type::TEXT)],
+            &[],
         )
         .await
         .unwrap()
@@ -3815,7 +3827,7 @@ async fn the_migrations_grant_erasure_to_no_role_but_its_owner() {
             .await
             .unwrap();
         let owner: String = rows[0].get(1);
-        assert_eq!(owner, "gnomon_definer", "{erasure}");
+        assert_eq!(owner, "gnomon_eraser", "{erasure}");
         assert!(
             rows[0].get::<_, bool>(2),
             "{erasure} is not SECURITY DEFINER"
@@ -3823,7 +3835,7 @@ async fn the_migrations_grant_erasure_to_no_role_but_its_owner() {
         let grantees: Vec<String> = rows
             .iter()
             .filter_map(|r| r.get::<_, Option<String>>(0))
-            .filter(|g| g != "gnomon_definer")
+            .filter(|g| g != "gnomon_eraser")
             .collect();
         assert!(grantees.is_empty(), "{erasure} is granted to {grantees:?}");
     }
@@ -3960,11 +3972,11 @@ async fn a_caller_cannot_forge_the_erasure_bypass_or_delete_what_an_erasure_rewr
     erasable(&n).await;
     let t1 = n.w.t1;
 
-    // The bypass is the definer role itself, which no caller can become, nor
-    // the writer role. No setting a caller can change turns it on, and no
-    // caller may even ask whether it is on.
+    // The bypass is the eraser role itself, which no caller can become, nor
+    // the other definer roles. No setting a caller can change turns it on,
+    // and no caller may even ask whether it is on.
     for role in [USER, WORKER] {
-        for definer in ["gnomon_definer", "gnomon_writer"] {
+        for definer in ["gnomon_eraser", "gnomon_definer", "gnomon_writer"] {
             let mut client = n.w.db.login().await;
             let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
             let r = tx.batch_execute(&format!("set local role {definer}")).await;
@@ -3972,16 +3984,16 @@ async fn a_caller_cannot_forge_the_erasure_bypass_or_delete_what_an_erasure_rewr
         }
         let mut client = n.w.db.login().await;
         let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-        tx.batch_execute("select set_config('gnomon.running_as_definer', 'on', true)")
+        tx.batch_execute("select set_config('gnomon.running_as_eraser', 'on', true)")
             .await
             .unwrap();
         let r = tx
-            .query_typed("select gnomon.running_as_definer()", &[])
+            .query_typed("select gnomon.running_as_eraser()", &[])
             .await;
         assert_refused(r, &format!("{role} asking whether the bypass is on"));
         let mut client = n.w.db.login().await;
         let tx = as_caller(&mut client, role, &claims(t1, &["support"])).await;
-        tx.batch_execute("select set_config('gnomon.running_as_definer', 'on', true)")
+        tx.batch_execute("select set_config('gnomon.running_as_eraser', 'on', true)")
             .await
             .unwrap();
         let r = tx
@@ -4151,7 +4163,7 @@ async fn an_erasure_refuses_a_transaction_that_already_wrote_what_the_episode_to
 }
 
 // Erase a Node, an Edge or a Scope (ADR-0003, ADR-0005, ADR-0009). Erasure
-// as the definer: granted to no caller role, refused across Tenants and for
+// as the eraser: granted to no caller role, refused across Tenants and for
 // what the caller cannot see, and its reach into other Scopes, which erases
 // the Edges joining an erased Node, is open to no caller.
 
@@ -4438,30 +4450,18 @@ async fn a_caller_with_the_grant_cannot_erase_another_tenants_node_edge_or_scope
 }
 
 #[tokio::test]
-async fn no_caller_reaches_the_erasure_list_or_its_parts_and_an_erasure_widens_nothing_after_it() {
+async fn no_caller_calls_erasures_parts_and_an_erasure_widens_nothing_after_it() {
     let g = graph().await;
     let t1 = g.n.w.t1;
     for role in [USER, WORKER] {
         for (sql, what) in [
             (
-                "select count(*) from gnomon.erasure_reach",
-                "reading the Erasure's list",
-            ),
-            (
-                "insert into gnomon.erasure_reach (tenant_id, id) values ($1, $2)",
-                "listing a Node for an Erasure",
-            ),
-            (
-                "select gnomon.erasure_reaches($1, array[$2])",
-                "the reach check",
-            ),
-            (
-                "select gnomon.erasure_reaches_version($1, $2)",
-                "the Version reach check",
-            ),
-            (
                 "select gnomon.erase_versioned_rows($1, array[$2])",
                 "the row deletes",
+            ),
+            (
+                "select gnomon.erase_empty_nodes($1, array[$2])",
+                "the deletes of the Nodes left with nothing",
             ),
             (
                 "select gnomon.erase_graph($1, null, array[$2], '{}')",
@@ -4522,19 +4522,8 @@ async fn no_caller_reaches_the_erasure_list_or_its_parts_and_an_erasure_widens_n
         Ok(v) => panic!("an Erasure widened what the caller may erase: {v:?}"),
     }
     attempt.rollback().await.unwrap();
-    // Once the Erasure commits, its list is empty and billing's Edge that
-    // joined n1 is gone.
+    // Once the Erasure commits, billing's Edge that joined n1 is gone.
     tx.commit().await.unwrap();
-    let left: i64 =
-        g.n.w
-            .db
-            .admin()
-            .await
-            .query_typed("select count(*) from gnomon.erasure_reach", &[])
-            .await
-            .unwrap()[0]
-            .get(0);
-    assert_eq!(left, 0, "an Erasure left its list behind");
     let crossing: i64 =
         g.n.w
             .db
@@ -5225,6 +5214,7 @@ async fn callers_hold_only_select_on_the_embedding_tables_and_the_writer_insert_
         support::LOGIN_ROLE,
         "gnomon_writer",
         "gnomon_definer",
+        "gnomon_eraser",
     ] {
         for table in EMBEDDING_TABLES {
             let privileges: Vec<String> = admin
@@ -5247,7 +5237,7 @@ async fn callers_hold_only_select_on_the_embedding_tables_and_the_writer_insert_
                 .collect();
             let expected: Vec<&str> = match (role, *table) {
                 (r, _) if r == support::LOGIN_ROLE => vec![],
-                ("gnomon_definer", _) => vec!["SELECT", "DELETE"],
+                ("gnomon_definer" | "gnomon_eraser", _) => vec!["SELECT", "DELETE"],
                 ("gnomon_writer", "embedding") => vec!["SELECT", "INSERT"],
                 ("gnomon_writer", _) => vec!["SELECT", "INSERT", "UPDATE (text_hash)"],
                 _ => vec!["SELECT"],
@@ -5255,12 +5245,10 @@ async fn callers_hold_only_select_on_the_embedding_tables_and_the_writer_insert_
             assert_eq!(privileges, expected, "{role} on gnomon.{table}");
         }
     }
-    // The trigger functions and the Erasure policies' check run for no
-    // caller of their own.
+    // The trigger functions run for no caller of their own.
     for function in [
         "gnomon.embedding_bit_derive()",
         "gnomon.embedding_check_used()",
-        "gnomon.erasure_reaches_text(uuid, text, text)",
     ] {
         for role in [USER, WORKER] {
             let may: bool = admin
@@ -5746,22 +5734,16 @@ async fn a_caller_sees_and_writes_no_summary_or_community_of_another_tenant_or_s
 }
 
 #[tokio::test]
-async fn no_caller_reaches_a_summary_through_the_erasure_reach_and_an_erasure_reaches_only_its_nodes_summaries()
+async fn no_caller_runs_the_summary_deletes_and_an_erasure_removes_only_its_nodes_summaries_in_every_scope()
  {
     let d = summarized().await;
     let w = &d.g.n.w;
     let t1 = w.t1;
     for role in [USER, WORKER] {
-        for (sql, what) in [
-            (
-                "select gnomon.erasure_reaches_summary($1, $2)",
-                "the Summary reach check",
-            ),
-            (
-                "select gnomon.erase_summaries_and_communities($1, array[$2], '{}')",
-                "the Summary deletes",
-            ),
-        ] {
+        for (sql, what) in [(
+            "select gnomon.erase_summaries_and_communities($1, array[$2], '{}')",
+            "the Summary deletes",
+        )] {
             let mut client = w.db.login().await;
             let tx = as_caller(&mut client, role, &claims(t1, &["support", "billing"])).await;
             let r = tx
@@ -5772,7 +5754,7 @@ async fn no_caller_reaches_a_summary_through_the_erasure_reach_and_an_erasure_re
     }
 
     // The worker of support erases n1. In the same transaction it still sees
-    // no Summary of billing, though its Erasure reached one.
+    // no Summary of billing, though its Erasure removed one.
     let mut client = w.db.login().await;
     let tx = as_caller(&mut client, WORKER, &claims(t1, &["support"])).await;
     tx.query_typed(ERASE_NODE, &[(&t1, Type::UUID), (&d.g.n.n1, Type::UUID)])
@@ -5793,7 +5775,7 @@ async fn no_caller_reaches_a_summary_through_the_erasure_reach_and_an_erasure_re
     tx.commit().await.unwrap();
 
     // n1's Summaries in both Scopes and its Community are gone. billing's
-    // Node, whose Edge to n1 went too, was not listed, so its Summary stands.
+    // Node, whose Edge to n1 went too, was not erased, so its Summary stands.
     let admin = w.db.admin().await;
     for (table, id, stands) in [
         ("summary", d.support_summary, false),
@@ -5819,66 +5801,10 @@ async fn no_caller_reaches_a_summary_through_the_erasure_reach_and_an_erasure_re
         .await
         .unwrap()[0]
         .get(0);
-    assert_eq!(cited, 1, "the unlisted Summary lost its Citation");
-}
-
-#[tokio::test]
-async fn the_definers_summary_reach_covers_only_the_summaries_of_a_node_its_own_transaction_listed()
-{
-    let d = summarized().await;
-    let w = &d.g.n.w;
-    // The definer role as an Erasure runs, under the claims of a caller of
-    // support alone. The server's superuser switches to it, which no caller
-    // role can, because the definer has no members.
-    let mut admin = w.db.admin().await;
-    let mut tx = admin.transaction().await.unwrap();
-    tx.batch_execute("set local role gnomon_definer")
-        .await
-        .unwrap();
-    tx.query_typed(
-        "select set_config('request.jwt.claims', $1, true)",
-        &[(&claims(w.t1, &["support"]), Type::TEXT)],
-    )
-    .await
-    .unwrap();
-    const SUMMARIES: &str = "select id from gnomon.summary where scope = 'billing' order by id";
-    const CITED: &str =
-        "select summary_id from gnomon.summary_citation where scope = 'billing' order by 1";
-    // With nothing listed, the definer sees no Summary of billing.
-    assert!(visible_ids(&tx, SUMMARIES, &[]).await.is_empty());
-    assert!(visible_ids(&tx, CITED, &[]).await.is_empty());
-    // It cannot list a Node under another Tenant.
-    let sp = tx.savepoint("other_tenant").await.unwrap();
-    let r = sp
-        .query_typed(
-            "insert into gnomon.erasure_reach (tenant_id, id) values ($1, $2)",
-            &[(&w.t2, Type::UUID), (&d.g.billing_node, Type::UUID)],
-        )
-        .await;
-    assert_refused(r, "listing a Node under another Tenant");
-    sp.rollback().await.unwrap();
-    // With n1 listed, it reaches n1's Summary in billing and its Citation,
-    // and not the Summary of billing's own Node, which nothing listed.
-    tx.query_typed(
-        "insert into gnomon.erasure_reach (tenant_id, id) values ($1, $2)",
-        &[(&w.t1, Type::UUID), (&d.g.n.n1, Type::UUID)],
-    )
-    .await
-    .unwrap();
     assert_eq!(
-        visible_ids(&tx, SUMMARIES, &[]).await,
-        vec![d.billing_summary]
+        cited, 1,
+        "the Summary of a Node not erased lost its Citation"
     );
-    assert_eq!(visible_ids(&tx, CITED, &[]).await, vec![d.billing_summary]);
-    let deleted = tx
-        .execute_typed(
-            "delete from gnomon.summary_citation where scope = 'billing'",
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(deleted, 1, "the reach deleted beyond n1's Summary");
-    tx.rollback().await.unwrap();
 }
 
 // Resolution (ADR-0009, ADR-0010, `0004_search.sql`). The search index trigger
@@ -6092,6 +6018,7 @@ async fn callers_hold_only_select_on_the_name_table_and_the_writer_a_bits_update
         support::LOGIN_ROLE,
         "gnomon_writer",
         "gnomon_definer",
+        "gnomon_eraser",
     ] {
         let privileges: Vec<String> = admin
             .query_typed(
@@ -6114,6 +6041,7 @@ async fn callers_hold_only_select_on_the_name_table_and_the_writer_a_bits_update
         let expected: Vec<&str> = match role {
             r if r == support::LOGIN_ROLE => vec![],
             "gnomon_definer" => vec!["SELECT", "INSERT", "DELETE"],
+            "gnomon_eraser" => vec!["SELECT", "DELETE"],
             "gnomon_writer" => vec!["SELECT", "UPDATE (q)"],
             _ => vec!["SELECT"],
         };
@@ -6156,8 +6084,8 @@ async fn callers_hold_only_select_on_the_name_table_and_the_writer_a_bits_update
     }
     // The caller roles' only policy is a read of their Tenant and Scopes,
     // which the writer shares, and the writer updates only rows of a Scope
-    // it may write. The definer's reach is a read of the names that share a
-    // text with an Edge the running Erasure listed.
+    // it may write. The eraser reads and deletes in every Scope of the
+    // Tenant.
     let policies: Vec<(String, Vec<String>, String)> = admin
         .query_typed(
             "select policyname::text, array(select r::text from unnest(roles) r order by 1), cmd::text
@@ -6179,9 +6107,9 @@ async fn callers_hold_only_select_on_the_name_table_and_the_writer_a_bits_update
                 "ALL".to_owned()
             ),
             (
-                "node_name_erasure_reach_read".to_owned(),
-                vec!["gnomon_definer".to_owned()],
-                "SELECT".to_owned()
+                "node_name_eraser".to_owned(),
+                vec!["gnomon_eraser".to_owned()],
+                "ALL".to_owned()
             ),
             (
                 "node_name_tenant_scope".to_owned(),
@@ -6538,11 +6466,7 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_their_embeddings
             vec![],
             vec!["SELECT", "INSERT", "DELETE"],
         ),
-        (
-            "gnomon.derived_embedding",
-            vec!["SELECT", "INSERT"],
-            vec!["SELECT", "DELETE"],
-        ),
+        ("gnomon.derived_embedding", vec!["SELECT", "INSERT"], vec![]),
     ] {
         for role in [
             USER,
@@ -6550,6 +6474,7 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_their_embeddings
             support::LOGIN_ROLE,
             "gnomon_writer",
             "gnomon_definer",
+            "gnomon_eraser",
         ] {
             let privileges: Vec<String> = admin
                 .query_typed(
@@ -6571,6 +6496,7 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_their_embeddings
             let expected = match role {
                 r if r == support::LOGIN_ROLE => vec![],
                 "gnomon_definer" => definer.clone(),
+                "gnomon_eraser" => vec!["SELECT", "DELETE"],
                 "gnomon_writer" => writer.clone(),
                 _ => vec!["SELECT"],
             };
@@ -6621,9 +6547,10 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_their_embeddings
         .get(0);
     assert_eq!(owner, "gnomon_definer");
     // The callers' only policy is a read of their Tenant and Scopes, and the
-    // writer inserts embeddings only in a Scope it may write. The definer's
-    // reach reads and deletes the rows of a Summary the running Erasure
-    // reaches.
+    // writer inserts embeddings only in a Scope it may write. The definer
+    // writes the token rows in the caller's Scopes and has no policy on the
+    // embeddings, and the eraser reads and deletes both in every Scope of the
+    // Tenant.
     for table in DERIVED_SEARCH_TABLES {
         let policies: Vec<(String, Vec<String>, String)> = admin
             .query_typed(
@@ -6638,34 +6565,31 @@ async fn callers_hold_only_select_on_the_summary_token_rows_and_their_embeddings
             .iter()
             .map(|r| (r.get(0), r.get(1), r.get(2)))
             .collect();
-        let definer = vec!["gnomon_definer".to_owned()];
         let embeddings = *table == "derived_embedding";
         let mut readers = vec!["authenticated".to_owned(), "gnomon_worker".to_owned()];
         if embeddings {
             readers.push("gnomon_writer".to_owned());
         }
-        let mut expected = vec![
-            (
+        let mut expected = vec![];
+        if !embeddings {
+            expected.push((
                 format!("{table}_definer"),
-                definer.clone(),
+                vec!["gnomon_definer".to_owned()],
                 "ALL".to_owned(),
-            ),
+            ));
+        }
+        expected.extend([
             (
-                format!("{table}_erasure_reach_delete"),
-                definer.clone(),
-                "DELETE".to_owned(),
-            ),
-            (
-                format!("{table}_erasure_reach_read"),
-                definer,
-                "SELECT".to_owned(),
+                format!("{table}_eraser"),
+                vec!["gnomon_eraser".to_owned()],
+                "ALL".to_owned(),
             ),
             (
                 format!("{table}_tenant_scope"),
                 readers,
                 "SELECT".to_owned(),
             ),
-        ];
+        ]);
         if embeddings {
             expected.push((
                 format!("{table}_writer_insert"),

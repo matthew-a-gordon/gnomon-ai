@@ -22,9 +22,9 @@ use crate::{
     AsOf, BoundOutcome, BoundStatement, Citation, Community, CommunityId, EdgeId, EdgeVersion,
     EndOfValidity, Episode, EpisodeErasure, EpisodeId, EpisodeRetraction, Error, FullTextCandidate,
     GapCursor, GapPage, GraphErasure, Kind, Mention, MergeRule, NewCommunity, NewEdge, NewEpisode,
-    NewKind, NewNode, NewSummary, NodeId, NodeVersion, Patch, ResolutionCandidate, Retraction,
-    Scope, SearchRequest, SearchResult, StageRecord, StageWrite, Step, Summary, SummaryId,
-    TenantId, Traversal, UnavailableReason, VectorCandidate, VersionId, WriteOutcome,
+    NewKind, NewNode, NewSummary, NodeEpisode, NodeId, NodeVersion, Patch, ResolutionCandidate,
+    Retraction, Scope, SearchRequest, SearchResult, StageRecord, StageWrite, Step, Summary,
+    SummaryId, TenantId, Traversal, UnavailableReason, VectorCandidate, VersionId, WriteOutcome,
 };
 
 /// How many times a single call runs again when Postgres fails it with a
@@ -789,12 +789,14 @@ impl Caller<'_> {
     /// remain, each under the merge rule it recorded. As-of reads afterwards
     /// return the history as if the Episode had never existed. A Node or
     /// Edge left with nothing is erased too, and a Node only once no Edge
-    /// joins it.
+    /// joins it, in whichever Scope it is. The result names only the Nodes
+    /// and Edges the caller can read.
     ///
     /// Erasure is a definer function that the migrations grant to no caller
     /// role, so a call fails with [`Error::Forbidden`] until the deployment
-    /// grants EXECUTE on `gnomon.erase_episode` (ADR-0009). Writes to the Nodes and Edges the
-    /// Episode touched wait for it to commit.
+    /// grants EXECUTE on `gnomon.erase_episode` (ADR-0009). The Episode must
+    /// be one the caller can read and write. Writes to the Nodes and Edges
+    /// the Episode touched wait for it to commit.
     pub async fn erase_episode(
         &self,
         tenant: impl Into<Option<TenantId>>,
@@ -805,9 +807,14 @@ impl Caller<'_> {
 
     /// Erases a Node (ADR-0003): its Versions, Contributions, statements and
     /// Citations, and every Edge that joins it, whatever the Edge's Scope,
-    /// with that Edge's own rows. An endpoint of such an Edge left with
-    /// nothing is erased too when no other Edge joins it and the caller sees
-    /// its Scope. The Episodes stay. The Node must be one the caller sees.
+    /// with that Edge's own rows, and every Summary of the Node in every
+    /// Scope. An endpoint of such an Edge left with nothing is erased too, in
+    /// whichever Scope it is, when no other Edge joins it and no Summary or
+    /// Community names it. So the same request removes the same rows for
+    /// every caller, and the result names only the Nodes and Edges the caller
+    /// can read. The Episodes stay: [`list_node_episodes`]
+    /// (Self::list_node_episodes) lists them. The Node must be one the caller
+    /// can read and write, and a hidden one fails as an absent one does.
     ///
     /// Erasure is granted to no caller role by the migrations, so a call
     /// fails with [`Error::Forbidden`] until the deployment grants EXECUTE on
@@ -821,9 +828,9 @@ impl Caller<'_> {
     }
 
     /// Erases an Edge (ADR-0003): its Versions, Contributions, statements,
-    /// Citations and Sentences. Each endpoint left with nothing is erased too
-    /// when no other Edge joins it and the caller sees its Scope. The Edge
-    /// must be one the caller sees. It is granted as
+    /// Citations and Sentences. Each endpoint left with nothing is erased too,
+    /// as [`erase_node`](Self::erase_node) erases one, and the Episodes stay.
+    /// The Edge must be one the caller can read and write. It is granted as
     /// [`erase_node`](Self::erase_node) is, on `gnomon.erase_edge`.
     pub async fn erase_edge(
         &self,
@@ -835,9 +842,10 @@ impl Caller<'_> {
 
     /// Erases a Scope (ADR-0003): every row in it, its Episodes among them,
     /// and every Edge of another Scope that joins one of its Nodes, with that
-    /// Edge's own rows. An endpoint outside the Scope left with nothing is
-    /// erased too when no other Edge joins it and the caller sees its Scope.
-    /// Nothing else outside the Scope changes. The caller must see the Scope.
+    /// Edge's own rows, and every Summary of one of its Nodes in another
+    /// Scope. An endpoint outside the Scope left with nothing is erased too,
+    /// as [`erase_node`](Self::erase_node) erases one. Nothing else outside
+    /// the Scope changes. The caller must be able to read and write the Scope.
     /// It is granted as [`erase_node`](Self::erase_node) is, on
     /// `gnomon.erase_scope`.
     pub async fn erase_scope(
@@ -868,6 +876,29 @@ impl Caller<'_> {
         edge: EdgeId,
     ) -> Result<Vec<crate::Statement>, Error> {
         single!(self, tenant.into(), tx => tx.list_edge_statements(edge))
+    }
+
+    /// Lists the Episodes behind a Node, each once, with its Scope, in order
+    /// of ID: those that state a value, a statement or a bound of the Node or
+    /// of an Edge that joins it, those that a current or closed Version of
+    /// either cites, and those that a current or closed Summary of the Node
+    /// cites. Communities are left out, because they cite Episodes about
+    /// other Nodes too.
+    ///
+    /// Erase Node and Erase Edge keep these Episodes, so their text can still
+    /// name what the Node was (ADR-0003). The README's data protection
+    /// section gives the steps that erase them too.
+    ///
+    /// It runs as the caller and lists only Episodes the caller can read, so
+    /// a caller who cannot read every Scope gets a shorter list. The Node
+    /// need not be one the caller can read: a worker reads one Scope, so the
+    /// call is repeated with the worker of each.
+    pub async fn list_node_episodes(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        node: NodeId,
+    ) -> Result<Vec<NodeEpisode>, Error> {
+        single!(self, tenant.into(), tx => tx.list_node_episodes(node))
     }
 
     /// Lists the Citations of a Version: each Episode it was derived from,

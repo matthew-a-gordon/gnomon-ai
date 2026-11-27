@@ -804,9 +804,7 @@ async fn the_same_erasure_on_the_same_starting_data_always_removes_the_same_rows
     let tables: Vec<String> = gnomon_tables(&w.db.admin().await)
         .await
         .into_iter()
-        // No caller reads the list an Erasure of a Node, an Edge or a Scope
-        // keeps while it runs, which is empty once it returns.
-        .filter(|t| t != "schema_version" && t != "tenancy" && t != "erasure_reach")
+        .filter(|t| t != "schema_version" && t != "tenancy")
         // The BM25 counts change when the Erasure commits, not inside it.
         // `assert_only_removed` checks them against the token rows.
         .filter(|t| !support::erasure::BM25_COUNT_TABLES.contains(&t.as_str()))

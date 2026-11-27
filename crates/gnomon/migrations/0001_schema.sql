@@ -98,19 +98,24 @@ $$;
 -- the definer functions: a role that owns no table and cannot bypass RLS is
 -- held to the policies that name it (ADR-0009).
 --
---   gnomon_definer  Erasure, Kind registration, the merge-rule setter and
---                   the search index trigger.
 --   gnomon_writer   every function a caller writes through (#81). Its
 --                   policies read the caller's Scopes and write only those
 --                   that are writable as well.
+--   gnomon_definer  Kind registration, the merge-rule setter and the search
+--                   index trigger. Its policies read the caller's Scopes,
+--                   apart from the BM25 counts of its own transaction.
+--   gnomon_eraser   Erasure (#83). Its policies check the Tenant only, so an
+--                   Erasure removes what depends on what it erases in every
+--                   Scope of the Tenant. The Erasure functions check the
+--                   caller's Scopes themselves.
 --
--- A role of either name that already exists must hold no more than this.
--- No caller role is a member of either.
+-- A role of any of these names that already exists must hold no more than
+-- this. No caller role is a member of any of them.
 do $$
 declare
   r text;
 begin
-  foreach r in array array['gnomon_definer', 'gnomon_writer'] loop
+  foreach r in array array['gnomon_definer', 'gnomon_writer', 'gnomon_eraser'] loop
     if not exists (select from pg_roles where rolname = r) then
       execute format('create role %I nologin noinherit nobypassrls', r);
     end if;
@@ -143,8 +148,9 @@ $$;
 
 -- pgvector's schema. The Store's read functions run as the caller, so the
 -- caller roles need to reach pgvector's types and functions, the writer role
--- needs them to store embeddings, and the definer role needs them for the
--- search index trigger. `public` and Supabase's
+-- needs them to store embeddings, the definer role needs them for the
+-- search index trigger, and the eraser role for the embedding rows an
+-- Erasure deletes. `public` and Supabase's
 -- `extensions` already let them. A role that neither owns the schema nor
 -- holds the grant option is only warned and grants nothing, so the check
 -- after each grant fails the migration instead.
@@ -173,7 +179,7 @@ begin
     raise exception 'the caller roles authenticated and gnomon_worker must not hold CREATE on '
       'schema %, where pgvector is; revoke it and apply this migration again', ext;
   end if;
-  foreach r in array array['gnomon_definer', 'gnomon_writer'] loop
+  foreach r in array array['gnomon_definer', 'gnomon_writer', 'gnomon_eraser'] loop
     if not has_schema_privilege(r, ext, 'USAGE') then
       execute format('grant usage on schema %I to %I', ext, r);
       if not has_schema_privilege(r, ext, 'USAGE') then
@@ -317,8 +323,9 @@ create policy tenancy_switch on gnomon.tenancy for update
 -- gnomon.default_tenant())`.
 --
 -- The four run as the caller during a read, as `gnomon_writer` during a
--- write, and as `gnomon_definer` during an Erasure, Kind registration, the
--- merge-rule setter and the search index trigger (ADR-0009). So a
+-- write, as `gnomon_eraser` during an Erasure, and as `gnomon_definer`
+-- during Kind registration, the merge-rule setter and the search index
+-- trigger (ADR-0009). So a
 -- replacement reads only the claims, or reaches other data through a
 -- `SECURITY DEFINER` function of its own, such as one that reads a
 -- membership table. It does not depend on `current_user`. Anything outside
@@ -522,7 +529,7 @@ alter table gnomon.kind enable row level security;
 alter table gnomon.kind_rule enable row level security;
 
 create policy kind_tenant on gnomon.kind
-  for select to authenticated, gnomon_worker, gnomon_writer, gnomon_definer
+  for select to authenticated, gnomon_worker, gnomon_writer, gnomon_definer, gnomon_eraser
   using (tenant_id = gnomon.tenant_id());
 
 create policy kind_tenant_register on gnomon.kind
@@ -530,7 +537,7 @@ create policy kind_tenant_register on gnomon.kind
   with check (tenant_id = gnomon.tenant_id());
 
 create policy kind_rule_tenant on gnomon.kind_rule
-  for select to authenticated, gnomon_worker, gnomon_writer, gnomon_definer
+  for select to authenticated, gnomon_worker, gnomon_writer, gnomon_definer, gnomon_eraser
   using (tenant_id = gnomon.tenant_id());
 
 create policy kind_rule_tenant_register on gnomon.kind_rule
@@ -829,7 +836,7 @@ create index kind_merge_kind on gnomon.kind_merge (tenant_id, kind, id desc);
 alter table gnomon.kind_merge enable row level security;
 
 create policy kind_merge_tenant on gnomon.kind_merge
-  for select to authenticated, gnomon_worker, gnomon_writer, gnomon_definer
+  for select to authenticated, gnomon_worker, gnomon_writer, gnomon_definer, gnomon_eraser
   using (tenant_id = gnomon.tenant_id());
 
 create policy kind_merge_tenant_set on gnomon.kind_merge
@@ -880,22 +887,6 @@ create table gnomon.episode_retraction (
 );
 
 alter table gnomon.episode_retraction enable row level security;
-
--- What the running Erasure of a Node, an Edge or a Scope may reach outside
--- the caller's Scopes: the Nodes it erases and the Edges that join them.
-create table gnomon.erasure_reach (
-  tenant_id uuid not null,
-  written_in xid8 not null default pg_current_xact_id(),
-  id uuid not null,
-  primary key (tenant_id, written_in, id)
-);
-
-alter table gnomon.erasure_reach enable row level security;
-
-create policy erasure_reach_own on gnomon.erasure_reach
-  for all to gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and written_in = pg_current_xact_id_if_assigned())
-  with check (tenant_id = gnomon.tenant_id() and written_in = pg_current_xact_id());
 
 create type gnomon.stage_status as enum ('pending', 'running', 'retry', 'succeeded', 'failed');
 
@@ -1382,9 +1373,15 @@ alter table gnomon.derived_embedding enable row level security;
 --                          writes, read the rows of the caller's Tenant and
 --                          allowed Scopes. Callers hold no write privilege
 --                          on any table (#81).
---   <table>_definer        `gnomon_definer` reads, and writes what its
---                          grants allow, in the same rows, as Erasure, Kind
---                          registration and the search index trigger need.
+--   <table>_definer        `gnomon_definer` reads, and on the search tables
+--                          writes what its grants allow, in the same rows,
+--                          as the search index trigger needs. It has no
+--                          policy on a table the trigger never reads.
+--   <table>_eraser         `gnomon_eraser` reads and writes what its grants
+--                          allow in every row of the caller's Tenant, as
+--                          Erasure needs (#83). The Erasure functions check
+--                          the Scope of what they are asked to erase, and
+--                          what they return, themselves.
 --   <table>_writer_insert  `gnomon_writer` inserts rows of a Scope the
 --                          caller may both read and write.
 --   <table>_writer_update  `gnomon_writer` changes such rows, only in the
@@ -1409,6 +1406,13 @@ alter table gnomon.derived_embedding enable row level security;
 -- search index trigger writes them, as `gnomon_definer`. It reads and writes
 -- the embedding tables, and updates the bits of a name row, as the table
 -- above says.
+--
+-- The definer reads the tables the search index trigger derives text from,
+-- and reads and writes the tables it writes:
+--
+--   select  version, node, edge, sentence, summary, community
+--   all     search_token, embedding, embedding_bit, node_name,
+--           derived_search_token
 do $$
 declare
   t record;
@@ -1420,37 +1424,38 @@ declare
 begin
   for t in
     select * from (values
-      -- table, the writer reads it, inserts, update (old row), update (new row), deletes
-      ('episode',              true,  true,  null, null, false),
-      ('node',                 true,  true,  null, null, false),
-      ('edge',                 true,  true,  null, null, false),
-      ('statement',            true,  true,  null, null, false),
-      ('contribution',         true,  true,  null, null, false),
+      -- table, the writer reads it, inserts, update (old row), update (new row), deletes,
+      -- the definer's policy
+      ('episode',              true,  true,  null, null, false, null),
+      ('node',                 true,  true,  null, null, false, 'select'),
+      ('edge',                 true,  true,  null, null, false, 'select'),
+      ('statement',            true,  true,  null, null, false, null),
+      ('contribution',         true,  true,  null, null, false, null),
       ('version',              true,  true,
          'recorded_to = ''infinity'' or closed_in = pg_current_xact_id()',
          '(recorded_to = transaction_timestamp() and closed_in = pg_current_xact_id())'
          ' or (recorded_to = ''infinity'' and closed_in is null)',
-         true),
-      ('citation',             true,  true,  null, null, true),
-      ('bound_statement',      true,  true,  null, null, false),
-      ('sentence',             true,  true,  'true', 'true', false),
-      ('episode_retraction',   true,  true,  null, null, false),
-      ('stage_record',         true,  true,  'true', 'true', false),
-      ('stage_usage',          true,  true,  'true', 'true', false),
-      ('search_token',         false, false, null, null, false),
-      ('embedding',            true,  true,  null, null, false),
-      ('embedding_bit',        true,  true,  'true', 'true', false),
+         true, 'select'),
+      ('citation',             true,  true,  null, null, true,  null),
+      ('bound_statement',      true,  true,  null, null, false, null),
+      ('sentence',             true,  true,  'true', 'true', false, 'select'),
+      ('episode_retraction',   true,  true,  null, null, false, null),
+      ('stage_record',         true,  true,  'true', 'true', false, null),
+      ('stage_usage',          true,  true,  'true', 'true', false, null),
+      ('search_token',         false, false, null, null, false, 'all'),
+      ('embedding',            true,  true,  null, null, false, 'all'),
+      ('embedding_bit',        true,  true,  'true', 'true', false, 'all'),
       ('summary',              true,  true,
-         'recorded_to = ''infinity''', 'recorded_to = transaction_timestamp()', true),
-      ('summary_citation',     true,  true,  null, null, true),
+         'recorded_to = ''infinity''', 'recorded_to = transaction_timestamp()', true, 'select'),
+      ('summary_citation',     true,  true,  null, null, true,  null),
       ('community',            true,  true,
-         'recorded_to = ''infinity''', 'recorded_to = transaction_timestamp()', true),
-      ('community_member',     true,  true,  null, null, true),
-      ('community_citation',   true,  true,  null, null, true),
-      ('node_name',            true,  false, 'true', 'true', false),
-      ('derived_search_token', false, false, null, null, false),
-      ('derived_embedding',    true,  true,  null, null, false)
-    ) x(name, reads, inserts, update_using, update_check, deletes)
+         'recorded_to = ''infinity''', 'recorded_to = transaction_timestamp()', true, 'select'),
+      ('community_member',     true,  true,  null, null, true,  null),
+      ('community_citation',   true,  true,  null, null, true,  null),
+      ('node_name',            true,  false, 'true', 'true', false, 'all'),
+      ('derived_search_token', false, false, null, null, false, 'all'),
+      ('derived_embedding',    true,  true,  null, null, false, null)
+    ) x(name, reads, inserts, update_using, update_check, deletes, definer)
   loop
     execute format(
       'create policy %1$s_tenant_scope on gnomon.%1$I for select to %2$s using (%3$s)',
@@ -1458,9 +1463,19 @@ begin
       case when t.reads then 'authenticated, gnomon_worker, gnomon_writer'
            else 'authenticated, gnomon_worker' end,
       v_read);
+    if t.definer = 'select' then
+      execute format(
+        'create policy %1$s_definer on gnomon.%1$I for select to gnomon_definer
+           using (%2$s)', t.name, v_read);
+    elsif t.definer = 'all' then
+      execute format(
+        'create policy %1$s_definer on gnomon.%1$I for all to gnomon_definer
+           using (%2$s) with check (%2$s)', t.name, v_read);
+    end if;
     execute format(
-      'create policy %1$s_definer on gnomon.%1$I for all to gnomon_definer
-         using (%2$s) with check (%2$s)', t.name, v_read);
+      'create policy %1$s_eraser on gnomon.%1$I for all to gnomon_eraser
+         using (tenant_id = gnomon.tenant_id()) with check (tenant_id = gnomon.tenant_id())',
+      t.name);
     if t.inserts then
       execute format(
         'create policy %1$s_writer_insert on gnomon.%1$I for insert to gnomon_writer

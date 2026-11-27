@@ -34,12 +34,12 @@ In the order of the table:
 ## Considered options
 
 - Callers writing tables directly, under their own policies, with guard triggers that judge every possible direct write. This was the design before #81. Each trigger had to foresee every statement a caller could send, and a commit check that read rows under the claims at commit could be passed by changing the claims first (#75).
-- Every write function owned by the definer role that owns Erasure. Its wider policies, which reach other Scopes for Erasure, would then apply to every write.
+- Every write function owned by the role that owns Erasure. Its wider policies, which reach other Scopes for Erasure, would then apply to every write.
 
 ## Consequences
 
 - The login role can set any claims, so it must never reach end users. The database trusts the claims, and the Store does not verify them: the application verifies a token before it passes the claims to `Store::as_user`.
-- A deployment's own `gnomon.tenant_id()`, `gnomon.allowed_scopes()`, `gnomon.writable_scopes()` and `gnomon.user_id()` run as the caller, as `gnomon_writer` and as `gnomon_definer`. They read only the claims or reach other data through a definer function of the deployment's, and do not depend on `current_user` (README).
+- A deployment's own `gnomon.tenant_id()`, `gnomon.allowed_scopes()`, `gnomon.writable_scopes()` and `gnomon.user_id()` run as the caller, as `gnomon_writer`, as `gnomon_definer` and as `gnomon_eraser` (#83). They read only the claims or reach other data through a definer function of the deployment's, and do not depend on `current_user` (README).
 - gnomon records who recorded an Episode or its Retraction and nothing else about who made a write (ADR-0003). The application logs what it needs.
 - `VACUUM`, WAL, backups and replicas are the operator's. gnomon promises nothing about bytes on disk after an Erasure commits (ADR-0003).
 - The schema owner can disable row-level security, rewrite the tenancy row or replace any function. gnomon does not defend against it, so the owner is a role the operator controls.

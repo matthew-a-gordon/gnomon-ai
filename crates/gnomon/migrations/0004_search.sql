@@ -36,8 +36,8 @@
 -- time. The As-of instants decide only which Versions are returned.
 --
 -- Who writes. One trigger function, `gnomon.maintain_search_index`, writes
--- the token rows and the counts. It is the fourth kind of definer ADR-0009
--- allows, owned by the NOLOGIN `gnomon_definer`, and it is granted to no
+-- the token rows and the counts. It is a definer owned by the NOLOGIN
+-- `gnomon_definer` (ADR-0009), and it is granted to no
 -- role. No caller can execute it or attach it to a table of its own, because
 -- both need EXECUTE. Callers hold SELECT on the search tables and no write
 -- privilege, so no caller's statement, nor a trigger of a caller's own, can
@@ -79,10 +79,15 @@
 -- reopens is the one that stood just before the Episode first touched its
 -- Node or Edge, so its text owes nothing to the erased Episode. It is indexed
 -- again from its text as it stands, with no Sentence, and so is a Version
--- that was current then and that the Episode never closed. The definer may read
--- and delete the token rows of an Edge the running Erasure reaches in a
--- Scope the caller cannot see (see 0005). It may change the counts
--- only of a Scope whose changes its own transaction recorded.
+-- that was current then and that the Episode never closed. Erasure deletes
+-- token rows as `gnomon_eraser`, in every Scope of the Tenant, an erased
+-- Edge's of a Scope the caller cannot see among them (see 0005). The search
+-- index trigger then runs as its own owner, `gnomon_definer`, and needs no
+-- more than its usual rights for that: it records the count changes of its
+-- own transaction in any Scope of the Tenant, and changes the counts only
+-- of a Scope whose changes its own transaction recorded. Everything else it
+-- reads and writes, it reads and writes in the caller's Scopes, which hold
+-- every Version an Erasure inserts or reopens.
 --
 -- The vector branch. The Pipeline stores an embedding of a Version's search text after the
 -- write commits. A consumer searches with a query embedding at a valid-at
@@ -182,10 +187,10 @@
 -- Version of a Scope by text would cost an Erasure a scan of the Scope or the
 -- write path an index on the text hash. No embedding row names an Episode,
 -- and an embedding reaches its Episodes through its Version's Citations, so
--- `gnomon.erase_episode_rows` needs nothing more. The definer may read and
--- delete the embeddings of an Edge the running Erasure reaches in a Scope the
--- caller cannot see, and read the quantized rows of that Scope that share their texts, so that
--- it keeps a full vector another Version there still uses.
+-- `gnomon.erase_episode_rows` needs nothing more. The eraser reads and
+-- deletes them in every Scope of the Tenant, so it keeps a full vector
+-- another Version of the same Scope still uses, whether or not the caller
+-- can see that Scope.
 --
 -- Resolution. The Pipeline or a consumer matches a mention against the Nodes the graph
 -- already has (GLOSSARY: Resolution). The call searches the current names
@@ -276,9 +281,8 @@
 -- uses it. A Version an Erasure reopens gets its name rows again from its
 -- text, through the search index trigger, as it gets its token rows. No name
 -- row names an Episode, so `gnomon.erase_episode_rows` needs nothing more.
--- The definer may read the name rows of a Scope the caller cannot see that
--- share a text with an Edge the running Erasure reaches there, so that it
--- keeps a full vector a name there still uses.
+-- The eraser reads the name rows of every Scope of the Tenant, so it keeps
+-- a full vector a name of that Scope still uses.
 --
 -- Neighbourhood search and fusion. A consumer runs one Search call, `gnomon.search`, and gets one fused,
 -- ranked list of the Versions, Summaries and Communities that match its
@@ -397,8 +401,7 @@
 -- Erasure (ADR-0003). `gnomon.erase_summaries_and_communities`, which every
 -- Erasure that removes a Summary or Community calls, deletes their token
 -- rows and embedding rows first, and the counts go down at commit. The
--- definer reads and deletes the token and embedding rows of a Summary in a
--- Scope the caller cannot see when the running Erasure reaches that Summary.
+-- eraser reads and deletes them in every Scope of the Tenant.
 -- A row the transaction that wrote it deletes takes them
 -- with it through the foreign keys.
 --
@@ -431,7 +434,7 @@
 -- again no row would use the old full vector, so no Erasure would ever find
 -- it (ADR-0003). No caller and not the writer role holds DELETE on the
 -- embedding tables, so the
--- search index trigger, the fourth definer (ADR-0009), also deletes them
+-- search index trigger, a definer (ADR-0009), also deletes them
 -- when a Sentence is stored. That is the Version's quantized row of a text it
 -- no longer has, and that text's full vector unless a quantized row or a name
 -- row of the Scope still uses it. It touches only rows of the stored
@@ -780,7 +783,7 @@ create trigger version_index_search_text after insert on gnomon.version
 -- reopens. A caller's update closes a Version, whose rows stay.
 create trigger version_reindex_search_text after update on gnomon.version
   referencing new table as changed
-  for each statement when (gnomon.running_as_definer())
+  for each statement when (gnomon.running_as_eraser())
   execute function gnomon.maintain_search_index();
 
 create trigger sentence_index_search_text_insert after insert on gnomon.sentence

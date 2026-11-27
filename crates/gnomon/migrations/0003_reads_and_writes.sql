@@ -172,7 +172,7 @@
 -- `statement_id`. Erasure deletes, for an Episode: its `contribution` rows,
 -- which include those of its statements, then its `statement` rows, then
 -- its `bound_statement` rows. A statement's Contributions are deleted with
--- it, by the foreign key. No role but `gnomon_definer`, for Erasure, holds
+-- it, by the foreign key. No role but `gnomon_eraser`, for Erasure, holds
 -- an UPDATE or DELETE right on either table (ADR-0009).
 --
 -- Retract Episode. It records a Retraction for every current Version cited only
@@ -262,8 +262,7 @@
 -- and stage records. Erase Scope calls it for each of its Episodes, so a
 -- Scope's Erasure removes them too. Erase
 -- Node and Erase Edge leave Episodes, and their stage records, alone. The
--- definer role gets the Tenant and Scope policies and SELECT and DELETE on
--- both tables. Retract Episode changes neither table.
+-- eraser role gets its Tenant policy and SELECT and DELETE on both tables. Retract Episode changes neither table.
 --
 -- Summaries and Communities. The Pipeline writes a Summary of a Node, generated prose describing it,
 -- and a Community of Nodes, a group of closely connected Nodes with a
@@ -333,30 +332,26 @@
 -- Search derives from a Summary's or Community's text. A Retraction changes
 -- neither table: a Citation of a retracted Episode still counts.
 --
--- Reaching Summaries the caller cannot see. A Summary of a Node in Scope B
--- may describe a Node in Scope A. Erasing the Node, or Scope A, must remove
--- it, even when the caller cannot see Scope B, because the foreign key on the
--- Node would refuse the Node's delete while it stood. So the definer gets the
--- reach it has over Edges (ADR-0009, see 0005): it may read and delete
--- a Summary, in any Scope of the Tenant, of a Node its own Erasure listed in
--- `gnomon.erasure_reach`, and that Summary's Citations. No caller role holds
--- these policies, and a listed Node is visible only to the transaction that
--- listed it. Communities need no reach, because their Nodes are in their own
--- Scope, which the caller of the Erasure sees.
+-- Summaries of other Scopes. A Summary of a Node in Scope B may describe a
+-- Node in Scope A. Erasing the Node, or Scope A, removes it, even when the
+-- caller cannot see Scope B, because Erasure runs as `gnomon_eraser`, whose
+-- policies check the Tenant only (ADR-0009, see 0005). Communities hold
+-- Nodes of their own Scope only.
 --
 -- A Node that an Erasure would leave bare and delete stays as a bare identity
 -- while a Summary of it, or a Community holding it, still names it, as it
 -- does while an Edge still joins it. Only a Summary that cites no erased
 -- Episode can name it then.
 
--- Whether the current user is the NOLOGIN definer role, which is true only
--- inside a function that role owns. Erasure is the one such function that
--- writes the tables whose triggers this lets past. Kind registration and
--- the merge-rule setter run as the role too, and write only the Ontology.
--- It is false inside the write functions, which run as `gnomon_writer`.
-create function gnomon.running_as_definer() returns boolean
+-- Whether the current user is the NOLOGIN eraser role, which is true only
+-- inside an Erasure function, which that role owns. The triggers that check
+-- a write let an Erasure past, because it deletes and replays committed
+-- history (see 0005). No other role is let past: Kind registration, the
+-- merge-rule setter and the search index trigger run as `gnomon_definer`,
+-- and the write functions as `gnomon_writer`.
+create function gnomon.running_as_eraser() returns boolean
   language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
-  as $$ select current_user = 'gnomon_definer'::name $$;
+  as $$ select current_user = 'gnomon_eraser'::name $$;
 
 -- Refuses a write to a Scope the caller may read and may not write (#81).
 -- A Scope the caller cannot read is left to the write: one that looks a row
@@ -529,7 +524,7 @@ create function gnomon.contribution_check_insert() returns trigger
   $$;
 
 create trigger contribution_check_insert before insert on gnomon.contribution
-  for each row when (not gnomon.running_as_definer())
+  for each row when (not gnomon.running_as_eraser())
   execute function gnomon.contribution_check_insert();
 
 -- A new Version records the rule of its Node's or Edge's Kind, holds only
@@ -599,7 +594,7 @@ create function gnomon.version_check_insert() returns trigger
   $$;
 
 create trigger version_check_insert before insert on gnomon.version
-  for each row when (not gnomon.running_as_definer())
+  for each row when (not gnomon.running_as_eraser())
   execute function gnomon.version_check_insert();
 
 -- Records which transaction closed a Version: the writer's update policy
@@ -617,7 +612,7 @@ create function gnomon.version_set_closed_in() returns trigger
   $$;
 
 create trigger version_set_closed_in before update of recorded_to on gnomon.version
-  for each row when (not gnomon.running_as_definer())
+  for each row when (not gnomon.running_as_eraser())
   execute function gnomon.version_set_closed_in();
 
 -- A Citation is added only to a current Version, so closed history keeps
@@ -639,7 +634,7 @@ create function gnomon.citation_check_insert() returns trigger
   $$;
 
 create trigger citation_check_insert before insert on gnomon.citation
-  for each row when (not gnomon.running_as_definer())
+  for each row when (not gnomon.running_as_eraser())
   execute function gnomon.citation_check_insert();
 
 -- The key of a Node's advisory lock. Writes to a Node, and Erasure, take it
@@ -1473,7 +1468,7 @@ create function gnomon.statement_check_insert() returns trigger
   $$;
 
 create trigger statement_check_insert before insert on gnomon.statement
-  for each row when (not gnomon.running_as_definer())
+  for each row when (not gnomon.running_as_eraser())
   execute function gnomon.statement_check_insert();
 
 -- Writes a patch of property values for a Node or an Edge, and records it as a Correction when `p_kind` is
@@ -2129,7 +2124,7 @@ create trigger edge_await_endpoints before insert on gnomon.edge
 --             step wrote is one its transaction wrote, and a Version the step
 --             closed is one its transaction closed, as before. Every Version
 --             it opens must cite an Episode.
---             true for an Erasure's replay, which runs as `gnomon_definer`
+--             true for an Erasure's replay, which runs as `gnomon_eraser`
 --             past the triggers: the step wrote what was recorded at `p_at`
 --             and closed what it closed at `p_at`, and what it writes is
 --             recorded at `p_at` and marked written by no transaction.
@@ -2172,7 +2167,7 @@ create function gnomon.merge_versions(
     if p_rule is null or p_rule not in ('recency', 'ranked') then
       raise exception using errcode = 'GNW01', message = 'a merge rule is recency or ranked';
     end if;
-    if p_replay and not gnomon.running_as_definer() then
+    if p_replay and not gnomon.running_as_eraser() then
       raise exception using errcode = 'insufficient_privilege',
         message = 'only Erasure replays history';
     end if;
@@ -2710,7 +2705,7 @@ create function gnomon.summary_check_insert() returns trigger
   $$;
 
 create trigger summary_check_insert before insert on gnomon.summary
-  for each row when (not gnomon.running_as_definer())
+  for each row when (not gnomon.running_as_eraser())
   execute function gnomon.summary_check_insert();
 
 -- A Citation or a member is added only to a Summary or Community the current
@@ -2741,15 +2736,15 @@ create function gnomon.derived_check_insert() returns trigger
   $$;
 
 create trigger summary_citation_check_insert before insert on gnomon.summary_citation
-  for each row when (not gnomon.running_as_definer())
+  for each row when (not gnomon.running_as_eraser())
   execute function gnomon.derived_check_insert('summary', 'summary_id');
 
 create trigger community_member_check_insert before insert on gnomon.community_member
-  for each row when (not gnomon.running_as_definer())
+  for each row when (not gnomon.running_as_eraser())
   execute function gnomon.derived_check_insert('community', 'community_id');
 
 create trigger community_citation_check_insert before insert on gnomon.community_citation
-  for each row when (not gnomon.running_as_definer())
+  for each row when (not gnomon.running_as_eraser())
   execute function gnomon.derived_check_insert('community', 'community_id');
 
 -- The Citations a write names, checked: at least one, each of an Episode the

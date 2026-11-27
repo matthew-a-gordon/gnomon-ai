@@ -637,9 +637,10 @@ create function membership.scopes(p_writable boolean) returns text[]
       and (m.writable or not p_writable)
   $$;
 revoke all on function membership.scopes(boolean) from public;
-grant usage on schema membership to authenticated, gnomon_worker, gnomon_writer, gnomon_definer;
+grant usage on schema membership
+  to authenticated, gnomon_worker, gnomon_writer, gnomon_definer, gnomon_eraser;
 grant execute on function membership.scopes(boolean)
-  to authenticated, gnomon_worker, gnomon_writer, gnomon_definer;
+  to authenticated, gnomon_worker, gnomon_writer, gnomon_definer, gnomon_eraser;
 create or replace function gnomon.allowed_scopes() returns text[]
   language sql stable parallel safe security invoker set search_path = pg_catalog, pg_temp
   as $$

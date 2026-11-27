@@ -12,6 +12,9 @@ Every property value an Episode states is stored as a Contribution: the Episode,
 - Re-extract from the remaining Episodes with the Pipeline after an Erasure. Not deterministic, and it costs model calls.
 - A merge rule decided only in the Pipeline. Consumers that write extracted values straight to the Store would bypass it.
 - An `append_only` merge rule for evidence. Evidence is held as Episodes, which are already immutable.
+- For Erasure, changing old Versions in place instead of replaying history. Replay decides again what a Retraction retracts, for example when erasing one Episode leaves a Version cited only by a retracted one, and a rewrite in place would have to repeat that logic (#83).
+- For Erasure, deleting history from the first time the erased Episode touched a Node or Edge, with no replay. It destroys history unrelated to the erased Episode (#83).
+- Row locks instead of advisory locks for writes and Erasure. Under the writer's policies (#81), `FOR NO KEY UPDATE` and `FOR KEY SHARE` skip a row that a role may read and may not update, such as a Node in a read-only Scope, so a write would not wait for an Erasure of it. Tried on PostgreSQL 17 (#83).
 
 ## Consequences
 
@@ -20,7 +23,7 @@ Every property value an Episode states is stored as a Contribution: the Episode,
 - A rule change applies to later writes only. Each Version records the rule that chose its values, and an Erasure recomputes each Version under that recorded rule, so the result does not depend on when the Erasure runs.
 - As-of reads at a past known-at instant are stable except across an Erasure, which rewrites Recorded-time history as if the erased Episode never existed.
 - Erasing the Episode behind a Retraction makes the retracted fact current again.
-- A Node left with no Versions stays as a bare identity while any Edge joins it, and is erased with its last Edge.
+- A Node left with no Versions stays as a bare identity while any Edge joins it, and is erased with its last Edge, in whichever Scope it is, once no Summary or Community names it either. So the same request removes the same rows for every caller (ADR-0009).
 - A no-op write creates no Version but adds the new Episode's Citation, so a repeated statement corroborates the Version it matches.
 - A write and an Erasure serialise on each Node with a per-Node advisory lock (`pg_advisory_xact_lock`). Without it, a write could compute a Version from Contributions that an Erasure is about to delete, and that Version would carry the erased value. Both paths take the lock. An Erasure takes the locks of every Node it touches up front, in a fixed order, so two Erasures cannot deadlock. A write to an affected Node waits until the Erasure commits. Reads never wait.
 - Recompute cost was measured in the `prototype/recompute-cost` branch (`FINDINGS.md`), on 24,620 Nodes and 1.9 million Version rows, as a non-owner role under RLS. The data were synthetic and the numbers come from a scratch server with fsync off.
@@ -29,4 +32,4 @@ Every property value an Episode states is stored as a Contribution: the Episode,
   - Erasure of one Episode cited by 2,086 Versions across 500 Nodes took 24 to 35 seconds in one transaction, and it matched an oracle on every as-of read checked. Cost grows with each affected Node's history, at about 2 ms per replay step.
   - Truncate-and-replay rewrote about 22 times more Version rows than changed. Replaying only from the earliest recorded time the erased Episode touched cut the time by 6% when the Episode was early in the history, 31% in the middle and 73% when it was late.
   - As-of reads were unaffected during an Erasure (p50 about 4 ms against 5 ms with 8 readers). After an Erasure they ran about 50% slower until the tables were vacuumed and about 20% slower afterwards. Vacuuming is Postgres's autovacuum and the operator's concern, not a gnomon call (ADR-0003).
-  - The 500 advisory locks of one Erasure needed `max_locks_per_transaction` raised to 1024. A larger Erasure needs a larger lock table or a different lock design.
+  - The prototype found that the 500 advisory locks of one Erasure needed `max_locks_per_transaction` raised to 1024. That was wrong about the limit: the lock table is shared by every session, and one transaction may hold more than `max_locks_per_transaction` while it has room. On PostgreSQL 17 with `max_connections` 100 and the default `max_locks_per_transaction`, one transaction held 5,000 advisory locks and failed at 20,000 (#83). A larger Erasure needs a larger lock table or a different lock design.

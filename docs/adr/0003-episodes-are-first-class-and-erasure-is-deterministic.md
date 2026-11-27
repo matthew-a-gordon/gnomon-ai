@@ -26,6 +26,7 @@ An Episode is an immutable record of its own, not a Node. A Version, Summary, Co
   - gnomon offers no call for it and promises nothing about the bytes on disk, in WAL, in backups or on replicas.
   - Spec #1 asked for a vacuum call after Erasure. It was built and then dropped by the project owner's decision, because it kept a privileged role and code for a physical guarantee the library cannot give. A plain `VACUUM` leaves the bytes in free space and index pages, and skips pruning a page another process has pinned. A transaction that began before the Erasure committed keeps the tuples through `VACUUM FULL` too, and no call reaches WAL, backups or replicas.
 - Erasure is not exposed over MCP unless a deployment turns it on.
+- Erase Node and Erase Edge keep the Episodes the Node or Edge was derived from, so an Episode's text can still name what was erased (#83). `Caller::list_node_episodes` lists each Episode behind a Node once, with its Scope: those behind its values, statements and bounds and those of every Edge that joins it, those their current and closed Versions cite, and those its current and closed Summaries cite. It leaves out Communities, because they cite Episodes about other Nodes. It runs as the caller, so a caller who cannot read every Scope gets a shorter list. The README's data protection section gives the steps that remove a person: list, erase the Episodes, erase the Node, then remove what is held outside gnomon.
 
 ## Amendment: who recorded an Episode (#81)
 

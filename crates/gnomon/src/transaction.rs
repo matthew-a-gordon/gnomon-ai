@@ -29,11 +29,12 @@ use crate::{
     Community, CommunityId, DerivedCitation, Direction, EdgeId, EdgeVersion, EndOfValidity,
     Episode, EpisodeErasure, EpisodeId, EpisodeRetracted, EpisodeRetraction, Error,
     FullTextCandidate, FullTextNameMatch, Gap, GapCursor, GapPage, GraphErasure, Kind, KindOf,
-    Mention, MergeRule, NewCommunity, NewEdge, NewEpisode, NewKind, NewNode, NewSummary, NodeId,
-    NodeVersion, Patch, Precision, ResolutionCandidate, Retraction, Scope, SearchHit,
-    SearchRequest, SearchResult, SignalRank, StageError, StageOutcome, StageRecord, StageStatus,
-    StageUsage, StageWrite, StatementKind, Step, Summary, SummaryId, TenantId, Traversal,
-    ValidTime, VectorCandidate, VectorNameMatch, VersionId, Versioned, WriteOutcome, WriteStatus,
+    Mention, MergeRule, NewCommunity, NewEdge, NewEpisode, NewKind, NewNode, NewSummary,
+    NodeEpisode, NodeId, NodeVersion, Patch, Precision, ResolutionCandidate, Retraction, Scope,
+    SearchHit, SearchRequest, SearchResult, SignalRank, StageError, StageOutcome, StageRecord,
+    StageStatus, StageUsage, StageWrite, StatementKind, Step, Summary, SummaryId, TenantId,
+    Traversal, ValidTime, VectorCandidate, VectorNameMatch, VersionId, Versioned, WriteOutcome,
+    WriteStatus,
 };
 
 /// The statement that sets a call's claims and checks its Tenant. The
@@ -1012,6 +1013,26 @@ impl Transaction {
             })
             .collect();
         self.done(call, statements)
+    }
+
+    /// As [`Caller::list_node_episodes`](crate::Caller::list_node_episodes),
+    /// in this transaction.
+    pub async fn list_node_episodes(&mut self, node: NodeId) -> Result<Vec<NodeEpisode>, Error> {
+        let call = self.call();
+        let rows = self
+            .query(
+                "select episode_id, scope from gnomon.list_node_episodes($1, $2)",
+                &[(&self.tenant.0, Type::UUID), (&node.0, Type::UUID)],
+            )
+            .await?;
+        let episodes = rows
+            .iter()
+            .map(|r| NodeEpisode {
+                episode: EpisodeId(r.get(0)),
+                scope: Scope::new(r.get::<_, String>(1)),
+            })
+            .collect();
+        self.done(call, episodes)
     }
 
     /// As [`Caller::list_citations`](crate::Caller::list_citations), in this

@@ -658,7 +658,7 @@ async fn erasing_a_node_removes_its_summaries_in_every_scope_even_one_the_caller
         0
     );
     assert_eq!(rows_naming(&w, "community_member", "node_id", x.0).await, 0);
-    // The reach is only to a Summary of the Node the Erasure listed: y's
+    // The Erasure removes only the Summaries of the Node it erased: y's
     // Summary in billing, which the worker cannot see either, stands, and so
     // does every row that does not draw on x.
     for (table, id) in [
@@ -673,15 +673,6 @@ async fn erasing_a_node_removes_its_summaries_in_every_scope_even_one_the_caller
         rows_naming(&w, "summary_citation", "summary_id", y_billing.0).await,
         1
     );
-    // The Erasure's list is empty again.
-    let left: i64 =
-        w.db.admin()
-            .await
-            .query_typed("select count(*) from gnomon.erasure_reach", &[])
-            .await
-            .unwrap()[0]
-            .get(0);
-    assert_eq!(left, 0);
 }
 
 #[tokio::test]

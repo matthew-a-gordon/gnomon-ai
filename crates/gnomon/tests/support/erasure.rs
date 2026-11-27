@@ -900,7 +900,12 @@ pub async fn assert_search_counts_match_the_token_rows(admin: &Client) {
 /// checks against the token rows instead, and the full vectors, which it
 /// checks with [`assert_no_unused_full_vector`].
 pub async fn every_row(admin: &Client) -> Vec<String> {
-    let tables: Vec<String> = gnomon_tables(admin)
+    rows_of(admin, &every_row_tables(admin).await).await
+}
+
+/// The tables [`every_row`] reads.
+pub async fn every_row_tables(admin: &Client) -> Vec<String> {
+    gnomon_tables(admin)
         .await
         .into_iter()
         .filter(|t| {
@@ -909,8 +914,7 @@ pub async fn every_row(admin: &Client) -> Vec<String> {
                 && t != FULL_VECTORS
                 && !BM25_COUNT_TABLES.contains(&t.as_str())
         })
-        .collect();
-    rows_of(admin, &tables).await
+        .collect()
 }
 
 /// Checks that an Erasure removed exactly the rows that name one of `ids` in
