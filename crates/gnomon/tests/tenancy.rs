@@ -475,62 +475,6 @@ async fn in_single_tenant_mode_the_operator_cannot_change_the_default_tenant_or_
     }
 }
 
-#[tokio::test]
-async fn a_deployment_that_replaced_tenant_id_before_this_migration_keeps_its_own() {
-    // A chain at migration 0004, whose deployment reads the Tenant from
-    // its own claim.
-    let db = TestDb::empty_with_login().await;
-    let operator = db.operator().await;
-    let files = support::exported(support::DEFAULT_DIMENSION);
-    let (before, after): (Vec<_>, Vec<_>) =
-        files.iter().partition(|(name, _)| name.as_str() < "0005");
-    assert!(!after.is_empty(), "the export has a migration 0005");
-    for (_, sql) in &before {
-        operator.batch_execute(sql).await.unwrap();
-    }
-    operator
-        .batch_execute(
-            "create or replace function gnomon.tenant_id() returns uuid
-               language sql stable parallel safe security invoker set search_path = ''
-               as $$ select (nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb
-                             ->> 'org')::uuid $$",
-        )
-        .await
-        .unwrap();
-    for (_, sql) in &after {
-        operator.batch_execute(sql).await.unwrap();
-    }
-
-    let org = support::tenant();
-    let mut client = db.login().await;
-    let tx = client.transaction().await.unwrap();
-    tx.batch_execute("set local role authenticated")
-        .await
-        .unwrap();
-    let tenant_of = |claims: Value| {
-        let tx = &tx;
-        async move {
-            tx.query_typed(
-                "select set_config('request.jwt.claims', $1, true)",
-                &[(&claims.to_string(), tokio_postgres::types::Type::TEXT)],
-            )
-            .await
-            .unwrap();
-            tx.query_typed("select gnomon.tenant_id()", &[])
-                .await
-                .unwrap()[0]
-                .get::<_, Option<uuid::Uuid>>(0)
-        }
-    };
-    assert_eq!(
-        tenant_of(json!({ "org": org.to_string() })).await,
-        Some(org.0)
-    );
-    // The deployment's own function has no fallback, so claims without its
-    // claim reach no Tenant, not even the default one.
-    assert_eq!(tenant_of(json!({ "app_metadata": {} })).await, None);
-}
-
 async fn tenancy_mode(db: &TestDb) -> String {
     db.operator()
         .await

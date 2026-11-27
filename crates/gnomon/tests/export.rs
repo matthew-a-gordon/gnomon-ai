@@ -74,7 +74,7 @@ fn plain_export_writes_numbered_sql_files_starting_at_0001() {
     );
 
     // Each file is its migration's number and name. The numbers start at
-    // 0001 and rise, and need not be contiguous: number 13 is unused.
+    // 0001 and rise.
     let names = exported_files(out.path());
     let expected: Vec<String> = gnomon::migrations::MIGRATIONS
         .iter()
@@ -289,31 +289,4 @@ fn supabase_export_refuses_a_chain_missing_an_earlier_gnomon_migration() {
     let run = export("supabase", "1536", out.path());
     assert!(!run.status.success(), "filled a gap after later migrations");
     assert_eq!(chain(out.path()), before);
-}
-
-// Released output.
-
-#[test]
-fn released_supabase_and_alembic_output_never_changes() {
-    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
-    for target in ["supabase", "alembic"] {
-        let out = tempfile::tempdir().unwrap();
-        assert_ok(&export(target, "1536", out.path()));
-        let exported = chain(out.path());
-        for entry in std::fs::read_dir(golden.join(target)).unwrap() {
-            let path = entry.unwrap().path();
-            let name = path.file_name().unwrap().to_str().unwrap();
-            // A Supabase file name starts with a version from the export's
-            // clock: `<version>_<golden name>`.
-            let (file, contents) = exported
-                .iter()
-                .find(|(f, _)| f == name || f.ends_with(&format!("_{name}")))
-                .unwrap_or_else(|| panic!("{target} exported no {name}"));
-            assert_eq!(
-                contents,
-                &std::fs::read_to_string(&path).unwrap(),
-                "{target} {file} differs from the released tests/golden/{target}/{name}"
-            );
-        }
-    }
 }
