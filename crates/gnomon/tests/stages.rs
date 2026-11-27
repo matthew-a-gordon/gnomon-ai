@@ -512,13 +512,14 @@ async fn every_call_that_stores_a_stages_output_commits_it_with_the_stage_record
     let w = World::new().await;
     let caller = w.caller();
     let mut n = 0;
-    for output in OUTPUTS {
-        for commit in [true, false] {
+    for (i, output) in OUTPUTS.into_iter().enumerate() {
+        // Every other output ends without a commit by a rollback, the rest
+        // by a drop, so both are covered.
+        let without = if i % 2 == 0 { End::Rollback } else { End::Drop };
+        for how in [End::Commit, without] {
             n += 1;
-            let what = format!(
-                "{output:?}, {}",
-                if commit { "committed" } else { "rolled back" }
-            );
+            let commit = how == End::Commit;
+            let what = format!("{output:?}, {how:?}");
             let (saved, episode, stage) = match output {
                 Output::Episode => {
                     // add_episode records the Episode and its first stage's
@@ -537,7 +538,7 @@ async fn every_call_that_stores_a_stages_output_commits_it_with_the_stage_record
                     tx.write_stages(&[StageWrite::pending(e, "graph")])
                         .await
                         .unwrap();
-                    end(tx, commit, n / 2).await;
+                    end(tx, how).await;
                     (Saved::Episode(e), e, None)
                 }
                 _ => {
@@ -549,7 +550,7 @@ async fn every_call_that_stores_a_stages_output_commits_it_with_the_stage_record
                     tx.write_stages(&[StageWrite::finish(&claim, StageOutcome::Succeeded, vec![])])
                         .await
                         .unwrap();
-                    end(tx, commit, n / 2).await;
+                    end(tx, how).await;
                     (saved, e, Some(claim))
                 }
             };
@@ -567,15 +568,19 @@ async fn every_call_that_stores_a_stages_output_commits_it_with_the_stage_record
     }
 }
 
-/// Commits `tx`, or ends it without a commit: by rolling it back for an
-/// even `n` and by dropping it for an odd one, so both are covered.
-async fn end(tx: gnomon::Transaction, commit: bool, n: usize) {
-    if commit {
-        tx.commit().await.unwrap();
-    } else if n.is_multiple_of(2) {
-        tx.rollback().await.unwrap();
-    } else {
-        drop(tx);
+/// How a transaction of the output test ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    Commit,
+    Rollback,
+    Drop,
+}
+
+async fn end(tx: gnomon::Transaction, how: End) {
+    match how {
+        End::Commit => tx.commit().await.unwrap(),
+        End::Rollback => tx.rollback().await.unwrap(),
+        End::Drop => drop(tx),
     }
 }
 

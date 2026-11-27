@@ -323,6 +323,48 @@ async fn a_transaction_saves_nothing_until_it_commits_and_commit_fails_after_a_f
 }
 
 #[tokio::test]
+async fn a_transaction_whose_call_was_cancelled_while_it_waited_on_a_lock_ends_without_waiting_for_it()
+ {
+    let w = World::new().await;
+    let e = w.episode(at(2024, 1, 1), None).await;
+    let node = w
+        .node("account", e, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    let patch = Patch::new(e, ValidTime::UNKNOWN, values(json!({ "plan": "pro" })));
+    let caller = w.caller();
+    let mut holder = caller.transaction(w.tenant).await.unwrap();
+    holder.write_node(node, &patch).await.unwrap();
+
+    for end_by_commit in [true, false] {
+        // The call waits on the holder's lock, and is cancelled there, so
+        // the server is still running it.
+        let mut tx = caller.transaction(w.tenant).await.unwrap();
+        {
+            let waiting = tx.write_node(node, &patch);
+            tokio::pin!(waiting);
+            until_waiting_on_a_lock(&w.db, &mut waiting).await;
+        }
+        // Ending the transaction must not queue behind that statement, which
+        // waits until the holder commits. A timeout stands in for a hang.
+        let ended = async {
+            if end_by_commit {
+                assert!(matches!(tx.commit().await, Err(Error::RolledBack)));
+            } else {
+                tx.rollback().await.unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), ended)
+            .await
+            .expect("ending the transaction waited for the cancelled statement");
+    }
+    holder.commit().await.unwrap();
+    assert_eq!(
+        w.current_values(node, at(2024, 1, 1)).await,
+        Some(json!({ "plan": "pro" }))
+    );
+}
+
+#[tokio::test]
 async fn a_deadlock_in_a_transaction_is_a_conflict_its_holder_can_run_again() {
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
@@ -396,15 +438,20 @@ async fn a_connection_lost_during_commit_says_the_outcome_is_unknown() {
     assert_eq!(last.as_deref(), Some("commit"));
 }
 
-/// Where in a statement's text a transaction starts or ends.
-fn transaction_edge(m: &Sent) -> Option<bool> {
+/// A message that opens or ends a transaction.
+enum Boundary {
+    Begin,
+    End,
+}
+
+fn boundary(m: &Sent) -> Option<Boundary> {
     match m {
         Sent::Query(q) => {
             let q = q.trim().to_ascii_lowercase();
             if q.starts_with("begin") {
-                Some(true)
+                Some(Boundary::Begin)
             } else if q == "commit" || q == "rollback" {
-                Some(false)
+                Some(Boundary::End)
             } else {
                 None
             }
@@ -504,15 +551,15 @@ async fn a_call_cancelled_at_any_point_leaves_no_open_transaction_on_a_connectio
     for (n, sent) in log.by_connection().iter().enumerate() {
         let mut open = false;
         for m in sent {
-            match transaction_edge(m) {
-                Some(true) => {
+            match boundary(m) {
+                Some(Boundary::Begin) => {
                     assert!(
                         !open,
                         "connection {n} began a transaction inside another: {sent:#?}"
                     );
                     open = true;
                 }
-                Some(false) => open = false,
+                Some(Boundary::End) => open = false,
                 None => {}
             }
         }

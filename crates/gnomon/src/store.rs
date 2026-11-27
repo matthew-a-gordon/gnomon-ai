@@ -260,8 +260,8 @@ fn is_missing_schema(e: &tokio_postgres::Error) -> bool {
 ///
 /// Every method is a single call: one transaction of its own, which commits
 /// when the call succeeds, on a connection of its own. A single call that
-/// fails with a serialization failure or a deadlock runs again, up to eight
-/// times, before it returns [`Error::Conflict`]. To make several calls in
+/// fails with a serialization failure or a deadlock runs again from the
+/// start, a few times, before it returns [`Error::Conflict`]. To make several calls in
 /// one transaction, such as a stage's output and its stage records, start a
 /// [`Transaction`] with [`transaction`](Self::transaction).
 pub struct Caller<'s> {
