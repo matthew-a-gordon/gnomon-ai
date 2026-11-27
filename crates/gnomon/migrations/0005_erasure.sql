@@ -11,9 +11,9 @@
 -- Who runs it. The four Erasure functions are SECURITY DEFINER, owned by
 -- `gnomon_eraser`, a NOLOGIN role that owns no table, cannot bypass RLS and
 -- has no members (ADR-0009, #83). Its policies check the Tenant against
--- `gnomon.tenant_id()` and nothing else, so an Erasure removes what depends
--- on what it erases in every Scope of the caller's Tenant, those the caller
--- may not write or read among them, and nothing of another Tenant. The
+-- `gnomon.tenant_id()` and nothing else. So an Erasure removes what depends
+-- on what it erases in every Scope of the caller's Tenant, even a Scope the
+-- caller may not write or read. It removes nothing of another Tenant. The
 -- files grant the four to no caller role: each deployment grants them to
 -- the roles it chooses.
 --

@@ -812,8 +812,8 @@ impl Caller<'_> {
     /// whichever Scope it is, when no other Edge joins it and no Summary or
     /// Community names it. So the same request removes the same rows for
     /// every caller, and the result names only the Nodes and Edges the caller
-    /// can read. The Episodes stay: [`list_node_episodes`]
-    /// (Self::list_node_episodes) lists them. The Node must be one the caller
+    /// can read. The Episodes stay, and
+    /// [`list_node_episodes`](Self::list_node_episodes) lists them. The Node must be one the caller
     /// can read and write, and a hidden one fails as an absent one does.
     ///
     /// Erasure is granted to no caller role by the migrations, so a call

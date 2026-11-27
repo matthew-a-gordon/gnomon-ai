@@ -724,34 +724,21 @@ async fn rows_after(w: &World, scopes: &[&str], request: &Request) -> (Vec<Strin
     .await
     .unwrap();
     let t = &w.tenant.0;
-    let rows = match request {
-        Request::Episode(id) => {
-            tx.query_typed(
-                "select erased_nodes from gnomon.erase_episode($1, $2)",
-                &[(t, Type::UUID), (id, Type::UUID)],
-            )
-            .await
+    let (function, id, scope) = match request {
+        Request::Episode(id) => ("erase_episode", Some(id), None),
+        Request::Node(id) => ("erase_node", Some(id), None),
+        Request::Edge(id) => ("erase_edge", Some(id), None),
+        Request::Scope(scope) => ("erase_scope", None, Some(scope)),
+    };
+    let sql = format!("select erased_nodes from gnomon.{function}($1, $2)");
+    let rows = match (id, scope) {
+        (Some(id), _) => {
+            tx.query_typed(&sql, &[(t, Type::UUID), (id, Type::UUID)])
+                .await
         }
-        Request::Node(id) => {
-            tx.query_typed(
-                "select erased_nodes from gnomon.erase_node($1, $2)",
-                &[(t, Type::UUID), (id, Type::UUID)],
-            )
-            .await
-        }
-        Request::Edge(id) => {
-            tx.query_typed(
-                "select erased_nodes from gnomon.erase_edge($1, $2)",
-                &[(t, Type::UUID), (id, Type::UUID)],
-            )
-            .await
-        }
-        Request::Scope(scope) => {
-            tx.query_typed(
-                "select erased_nodes from gnomon.erase_scope($1, $2)",
-                &[(t, Type::UUID), (scope, Type::TEXT)],
-            )
-            .await
+        (_, scope) => {
+            tx.query_typed(&sql, &[(t, Type::UUID), (scope.unwrap(), Type::TEXT)])
+                .await
         }
     }
     .unwrap();
@@ -849,10 +836,13 @@ async fn the_episodes_behind_a_node_are_each_one_its_node_edges_and_summaries_ci
     let bounding = support(4, "when x's plan began").await;
     let joining = support(5, "x owns part of Initech").await;
     let summarizing = support(6, "a summary of x").await;
+    let edge_ending = support(10, "x's share of Initech ends").await;
+    let edge_bounding = support(11, "when x's share of Initech began").await;
+    let first_summarizing = support(12, "the first summary of x").await;
     // These reach x only through what the list leaves out.
     let grouping = support(7, "a community holding x").await;
     let initech_own = support(8, "Initech's name").await;
-    let unrelated = support(9, "nothing about x").await;
+    let _unrelated = support(9, "nothing about x").await;
 
     let x = w
         .node(
@@ -898,28 +888,62 @@ async fn the_episodes_behind_a_node_are_each_one_its_node_edges_and_summaries_ci
             json!({ "name": "Initech" }),
         )
         .await;
-    w.edge(
-        x,
-        initech,
-        joining,
-        ValidTime::UNKNOWN,
-        json!({ "share": 7 }),
-    )
-    .await;
-    let cite = |e: EpisodeId| vec![gnomon::DerivedCitation::of(e)];
-    w.seeing(ALL_SCOPES)
-        .write_summary(
+    let to_initech = w
+        .edge(
+            x,
+            initech,
+            joining,
+            ValidTime::UNKNOWN,
+            json!({ "share": 7 }),
+        )
+        .await;
+    // A bound and an End of validity of the Edge, each from an Episode that
+    // states nothing else.
+    let edge_version = w.current_edge_version(to_initech, at(2024, 6, 1)).await;
+    w.caller()
+        .state_edge_bound(
             w.tenant,
-            &gnomon::NewSummary {
-                scope: Scope::new(SCOPE),
-                node: x,
-                content: "x is a gold account".into(),
-                as_of_valid: at(2024, 6, 1),
-                citations: cite(summarizing),
+            to_initech,
+            &gnomon::BoundStatement {
+                episode: edge_bounding,
+                version: edge_version,
+                side: gnomon::BoundSide::Start,
+                bound: Bound::At(at(2020, 1, 1)),
             },
         )
         .await
         .unwrap();
+    w.caller()
+        .end_edge_validity(
+            w.tenant,
+            to_initech,
+            &EndOfValidity {
+                episode: edge_ending,
+                at: Bound::At(at(2031, 1, 1)),
+            },
+        )
+        .await
+        .unwrap();
+    // A Summary of x, then the one that replaces it, which closes the first.
+    let cite = |e: EpisodeId| vec![gnomon::DerivedCitation::of(e)];
+    for (content, episode) in [
+        ("x is an account", first_summarizing),
+        ("x is a gold account", summarizing),
+    ] {
+        w.seeing(ALL_SCOPES)
+            .write_summary(
+                w.tenant,
+                &gnomon::NewSummary {
+                    scope: Scope::new(SCOPE),
+                    node: x,
+                    content: content.into(),
+                    as_of_valid: at(2024, 6, 1),
+                    citations: cite(episode),
+                },
+            )
+            .await
+            .unwrap();
+    }
     w.seeing(ALL_SCOPES)
         .write_community(
             w.tenant,
@@ -961,13 +985,21 @@ async fn the_episodes_behind_a_node_are_each_one_its_node_edges_and_summaries_ci
         )
         .await
         .unwrap();
-    let _ = unrelated;
 
-    let in_support: Vec<(EpisodeId, String)> =
-        [value, replacing, ending, bounding, joining, summarizing]
-            .into_iter()
-            .map(|e| (e, SCOPE.to_owned()))
-            .collect();
+    let in_support: Vec<(EpisodeId, String)> = [
+        value,
+        replacing,
+        ending,
+        bounding,
+        joining,
+        edge_ending,
+        edge_bounding,
+        first_summarizing,
+        summarizing,
+    ]
+    .into_iter()
+    .map(|e| (e, SCOPE.to_owned()))
+    .collect();
     let in_billing: Vec<(EpisodeId, String)> = [billing_joining, billing_summarizing]
         .into_iter()
         .map(|e| (e, "billing".to_owned()))

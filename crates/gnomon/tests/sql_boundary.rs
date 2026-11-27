@@ -576,9 +576,9 @@ async fn no_caller_role_holds_a_write_privilege_and_each_executes_only_the_store
     for db in [&plain, &granting] {
         let admin = db.admin().await;
         // The search index trigger's owner writes the search tables and the
-        // Ontology, and no table of history: a change that let it write one
-        // would let it past no check, because only the eraser is let past
-        // the triggers that check a write (ADR-0009, #83).
+        // Ontology, and no table of history. Only the eraser is let past the
+        // triggers that check a write, so this is a privilege, not a
+        // convention (ADR-0009, #83).
         let (writes, _) = caller_rights(&admin, "gnomon_definer").await;
         let history: Vec<_> = writes
             .iter()
@@ -5740,17 +5740,15 @@ async fn no_caller_runs_the_summary_deletes_and_an_erasure_removes_only_its_node
     let w = &d.g.n.w;
     let t1 = w.t1;
     for role in [USER, WORKER] {
-        for (sql, what) in [(
-            "select gnomon.erase_summaries_and_communities($1, array[$2], '{}')",
-            "the Summary deletes",
-        )] {
-            let mut client = w.db.login().await;
-            let tx = as_caller(&mut client, role, &claims(t1, &["support", "billing"])).await;
-            let r = tx
-                .query_typed(sql, &[(&t1, Type::UUID), (&d.billing_summary, Type::UUID)])
-                .await;
-            assert_refused(r, &format!("{role} {what}"));
-        }
+        let mut client = w.db.login().await;
+        let tx = as_caller(&mut client, role, &claims(t1, &["support", "billing"])).await;
+        let r = tx
+            .query_typed(
+                "select gnomon.erase_summaries_and_communities($1, array[$2], '{}')",
+                &[(&t1, Type::UUID), (&d.billing_summary, Type::UUID)],
+            )
+            .await;
+        assert_refused(r, &format!("{role} the Summary deletes"));
     }
 
     // The worker of support erases n1. In the same transaction it still sees

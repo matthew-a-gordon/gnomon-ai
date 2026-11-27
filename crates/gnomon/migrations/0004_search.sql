@@ -80,8 +80,8 @@
 -- Node or Edge, so its text owes nothing to the erased Episode. It is indexed
 -- again from its text as it stands, with no Sentence, and so is a Version
 -- that was current then and that the Episode never closed. Erasure deletes
--- token rows as `gnomon_eraser`, in every Scope of the Tenant, an erased
--- Edge's of a Scope the caller cannot see among them (see 0005). The search
+-- token rows as `gnomon_eraser`, in every Scope of the Tenant. Some belong
+-- to an erased Edge of a Scope the caller cannot see (see 0005). The search
 -- index trigger then runs as its own owner, `gnomon_definer`, and needs no
 -- more than its usual rights for that: it records the count changes of its
 -- own transaction in any Scope of the Tenant, and changes the counts only
