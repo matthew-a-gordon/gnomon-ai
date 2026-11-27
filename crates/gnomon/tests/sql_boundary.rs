@@ -11,6 +11,7 @@ use gnomon::{EpisodeId, NewEpisode, Scope, Store, TenantId};
 use serde_json::json;
 use support::TestDb;
 use support::erasure::BM25_COUNT_TABLES;
+use support::timestamptz::Timestamptz;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Transaction};
@@ -4938,7 +4939,7 @@ async fn a_caller_reads_only_its_own_tenants_and_scopes_token_rows_and_counts() 
             let scopes: Vec<String> = tx
                 .query_typed(
                     "select scope from gnomon.search_full_text($1, 'zebra billing support', $2, null, 10)",
-                    &[(&tenant, Type::UUID), (&at, Type::TIMESTAMPTZ)],
+                    &[(&tenant, Type::UUID), (&Timestamptz(at), Type::TIMESTAMPTZ)],
                 )
                 .await
                 .unwrap()
@@ -5248,7 +5249,7 @@ async fn a_caller_reads_only_its_own_tenants_and_scopes_embeddings() {
                     &format!(
                         "select distinct scope from gnomon.search_vector($1, {query}, $2, null, 400)"
                     ),
-                    &[(&tenant, Type::UUID), (&at, Type::TIMESTAMPTZ)],
+                    &[(&tenant, Type::UUID), (&Timestamptz(at), Type::TIMESTAMPTZ)],
                 )
                 .await
                 .unwrap()
@@ -5459,7 +5460,7 @@ async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_c
             &[
                 (&t.0, Type::UUID),
                 (&embedding, Type::FLOAT4_ARRAY),
-                (&as_of.valid_at, Type::TIMESTAMPTZ),
+                (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
             ],
         )
         .await

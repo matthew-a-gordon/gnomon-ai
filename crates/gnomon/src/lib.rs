@@ -8,8 +8,8 @@
 //! commit together. [`migrations`] lists the files of the schema the Store
 //! expects, which a consumer copies into its own migration chain.
 //!
-//! Times are [`jiff::Timestamp`]s, version 0.2, stored as `timestamptz` to
-//! the microsecond. The driver truncates a time with finer digits toward
+//! Times are [`jiff::Timestamp`]s, version 1, stored as `timestamptz` to
+//! the microsecond. The Store truncates a time with finer digits toward
 //! 2000-01-01 UTC, so a time after it moves down to the microsecond and a time
 //! before it moves up. A time the Store returns passes back unchanged.
 //! `timestamptz` holds times a `Timestamp` cannot, such as `infinity` and
@@ -27,6 +27,7 @@ mod search;
 mod stage;
 mod store;
 mod summary;
+mod timestamptz;
 mod transaction;
 
 use std::fmt;

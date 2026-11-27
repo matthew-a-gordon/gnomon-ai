@@ -10,6 +10,7 @@ use tokio_postgres::types::Type;
 use uuid::Uuid;
 
 use super::erasure::World;
+use super::timestamptz::Timestamptz;
 
 /// The embedding dimension the suites use.
 pub const DIM: usize = super::DEFAULT_DIMENSION as usize;
@@ -262,10 +263,10 @@ pub async fn load(
             ids.push(id);
             node_of.push(node);
             props.push(serde_json::json!({ "name": format!("{scope} text {text}") }).to_string());
-            vf.push(valid_from);
-            vt.push(valid_to);
-            rf.push(at);
-            rt.push(next);
+            vf.push(valid_from.map(Timestamptz));
+            vt.push(valid_to.map(Timestamptz));
+            rf.push(Timestamptz(at));
+            rt.push(next.map(Timestamptz));
             if let Some(n) = next {
                 at = n;
             }
@@ -546,14 +547,18 @@ pub async fn load_names(
                 })
                 .to_string(),
             );
-            vf.push(valid_from);
-            vt.push(valid_to);
+            vf.push(valid_from.map(Timestamptz));
+            vt.push(valid_to.map(Timestamptz));
             if is_current {
-                rf.push(if only { utc(2024, 1, 1) } else { replaced_at });
+                rf.push(Timestamptz(if only {
+                    utc(2024, 1, 1)
+                } else {
+                    replaced_at
+                }));
                 rt.push(None);
             } else {
-                rf.push(utc(2023, 6, 1));
-                rt.push(Some(replaced_at));
+                rf.push(Timestamptz(utc(2023, 6, 1)));
+                rt.push(Some(Timestamptz(replaced_at)));
             }
         }
     }

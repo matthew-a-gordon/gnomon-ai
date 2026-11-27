@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio_postgres::types::Type;
 
+use super::timestamptz::Timestamptz;
 use super::vectors::Rng;
 use super::{DEFAULT_DIMENSION, Server, TestDb};
 
@@ -323,7 +324,7 @@ impl Dataset {
                                          and recorded_to = 'infinity'),
                         count(*)
                  from gnomon.version where node_id is not null",
-                &[(&valid_at(), Type::TIMESTAMPTZ)],
+                &[(&Timestamptz(valid_at()), Type::TIMESTAMPTZ)],
             )
             .await
             .unwrap();

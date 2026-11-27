@@ -118,6 +118,44 @@ async fn a_time_finer_than_a_microsecond_is_stored_truncated_toward_the_year_200
 }
 
 #[tokio::test]
+async fn a_time_is_written_and_read_as_the_microsecond_the_server_counts() {
+    let w = World::new().await;
+    // Each direction is checked against the server's own count from 1970, so
+    // an error that a write and a read would cancel out cannot pass.
+    for (time, micros) in [
+        ("0001-01-01T00:00:00Z", -62_135_596_800_000_000_i64),
+        ("1969-07-20T20:17:40.123456Z", -14_182_939_876_544),
+        ("2000-01-01T00:00:00Z", 946_684_800_000_000),
+        ("2024-03-14T09:30:00.123456Z", 1_710_408_600_123_456),
+        // The last microsecond a `Timestamp` holds.
+        ("9999-12-30T22:00:00.999999Z", 253_402_207_200_999_999),
+    ] {
+        let written = w.episode(instant(time)).await;
+        let rows = w
+            .sql(&format!(
+                "select (extract(epoch from reference_time) * 1000000)::int8
+                 from gnomon.read_episode($1, '{}')",
+                written.0
+            ))
+            .await;
+        assert_eq!(rows[0].get::<_, i64>(0), micros, "write of {time}");
+
+        let rows = w
+            .sql(&format!(
+                "select gnomon.record_episode($1, '{SCOPE}', 'from SQL', '{time}', null)"
+            ))
+            .await;
+        let from_sql = EpisodeId(rows[0].get(0));
+        let read = w.caller().read_episode(w.tenant, from_sql).await.unwrap();
+        assert_eq!(
+            read.unwrap().reference_time.as_microsecond(),
+            micros,
+            "read of {time}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_stored_time_outside_the_range_of_a_timestamp_fails_the_read_with_an_error() {
     let w = World::new().await;
     // A `Timestamp` ends at 9999-12-30T22:00 UTC, so the last day of 9999,

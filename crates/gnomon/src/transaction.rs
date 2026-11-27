@@ -22,8 +22,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use tokio_postgres::Row;
-use tokio_postgres::types::{FromSql, ToSql, Type};
+use tokio_postgres::types::{ToSql, Type};
 
+use crate::timestamptz::Timestamptz;
 use crate::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, BranchRank, Citation,
     Community, CommunityId, DerivedCitation, Direction, EdgeId, EdgeVersion, EndOfValidity,
@@ -289,7 +290,7 @@ impl Transaction {
                     (&self.tenant.0, Type::UUID),
                     (&episode.scope.as_str(), Type::TEXT),
                     (&episode.content, Type::TEXT),
-                    (&episode.reference_time, Type::TIMESTAMPTZ),
+                    (&Timestamptz(episode.reference_time), Type::TIMESTAMPTZ),
                     (&episode.authority, Type::INT4),
                 ],
             )
@@ -600,7 +601,7 @@ impl Transaction {
                     (&statement.episode.0, Type::UUID),
                     (&statement.version.0, Type::UUID),
                     (&side, Type::TEXT),
-                    (&at, Type::TIMESTAMPTZ),
+                    (&at.map(Timestamptz), Type::TIMESTAMPTZ),
                     (&precision, Type::TEXT),
                 ],
             )
@@ -684,7 +685,7 @@ impl Transaction {
                         (&id, Type::UUID),
                         (&is_edge, Type::BOOL),
                         (&end.episode.0, Type::UUID),
-                        (&at, Type::TIMESTAMPTZ),
+                        (&at.map(Timestamptz), Type::TIMESTAMPTZ),
                         (&precision, Type::TEXT),
                     ],
                 )
@@ -837,8 +838,8 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&node.0, Type::UUID),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                 ],
             )
             .await?;
@@ -866,8 +867,8 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&ids, Type::UUID_ARRAY),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                 ],
             )
             .await?;
@@ -897,8 +898,8 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&edge.0, Type::UUID),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                 ],
             )
             .await?;
@@ -936,8 +937,8 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&node.0, Type::UUID),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                     (&direction, Type::TEXT),
                     (&kinds, Type::TEXT_ARRAY),
                 ],
@@ -1002,8 +1003,8 @@ impl Transaction {
                     episode: EpisodeId(r.get(1)),
                     version: r.get::<_, Option<uuid::Uuid>>(2).map(VersionId),
                     valid_time: ValidTime {
-                        from: bound(time(r, 3)?, r.get(4)),
-                        to: bound(time(r, 5)?, r.get(6)),
+                        from: bound(optional_time(r, 3)?, r.get(4)),
+                        to: bound(optional_time(r, 5)?, r.get(6)),
                     },
                     recorded_at: time(r, 7)?,
                 })
@@ -1077,8 +1078,8 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&query, Type::TEXT),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                     (&limit, Type::INT4),
                 ],
             )
@@ -1159,8 +1160,8 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&query, Type::FLOAT4_ARRAY),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                     (&limit, Type::INT4),
                 ],
             )
@@ -1201,7 +1202,7 @@ impl Transaction {
                     (&self.tenant.0, Type::UUID),
                     (&mention.text, Type::TEXT),
                     (&embedding, Type::FLOAT4_ARRAY),
-                    (&mention.valid_at, Type::TIMESTAMPTZ),
+                    (&mention.valid_at.map(Timestamptz), Type::TIMESTAMPTZ),
                     (&limit, Type::INT4),
                 ],
             )
@@ -1259,8 +1260,8 @@ impl Transaction {
                     (&self.tenant.0, Type::UUID),
                     (&request.text, Type::TEXT),
                     (&embedding, Type::FLOAT4_ARRAY),
-                    (&request.as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&request.as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(request.as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&request.as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                     (&seeds, Type::UUID_ARRAY),
                     (&request.depth, Type::INT4),
                     (&w.vector, Type::FLOAT8),
@@ -1467,7 +1468,7 @@ impl Transaction {
             (&summary.scope.as_str(), Type::TEXT),
             (&summary.node.0, Type::UUID),
             (&summary.content, Type::TEXT),
-            (&summary.as_of_valid, Type::TIMESTAMPTZ),
+            (&Timestamptz(summary.as_of_valid), Type::TIMESTAMPTZ),
             (&episodes, Type::UUID_ARRAY),
             (&properties, Type::TEXT_ARRAY),
             (&places, Type::TEXT_ARRAY),
@@ -1495,7 +1496,7 @@ impl Transaction {
             (&replaces, Type::UUID_ARRAY),
             (&members, Type::UUID_ARRAY),
             (&community.content, Type::TEXT),
-            (&community.as_of_valid, Type::TIMESTAMPTZ),
+            (&Timestamptz(community.as_of_valid), Type::TIMESTAMPTZ),
             (&episodes, Type::UUID_ARRAY),
             (&properties, Type::TEXT_ARRAY),
             (&places, Type::TEXT_ARRAY),
@@ -1539,8 +1540,8 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&node.0, Type::UUID),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                 ],
             )
             .await?;
@@ -1554,7 +1555,7 @@ impl Transaction {
                     content: r.get(3),
                     as_of_valid: time(r, 4)?,
                     recorded_from: time(r, 5)?,
-                    recorded_to: time(r, 6)?,
+                    recorded_to: optional_time(r, 6)?,
                     citations: derived_citations(r, 7),
                 })
             })
@@ -1578,8 +1579,8 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&node.0, Type::UUID),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                 ],
             )
             .await?;
@@ -1597,7 +1598,7 @@ impl Transaction {
                     content: r.get(3),
                     as_of_valid: time(r, 4)?,
                     recorded_from: time(r, 5)?,
-                    recorded_to: time(r, 6)?,
+                    recorded_to: optional_time(r, 6)?,
                     citations: derived_citations(r, 7),
                 })
             })
@@ -1698,9 +1699,9 @@ async fn write_patch(
                 (&tx.tenant.0, Type::UUID),
                 (&id, Type::UUID),
                 (&patch.episode.0, Type::UUID),
-                (&from, Type::TIMESTAMPTZ),
+                (&from.map(Timestamptz), Type::TIMESTAMPTZ),
                 (&from_precision, Type::TEXT),
-                (&to, Type::TIMESTAMPTZ),
+                (&to.map(Timestamptz), Type::TIMESTAMPTZ),
                 (&to_precision, Type::TEXT),
                 (&values, Type::JSONB),
                 (&places, Type::JSONB),
@@ -1736,11 +1737,11 @@ fn node_version(row: &Row, at: usize) -> Result<NodeVersion, Error> {
         kind: row.get(at + 3),
         values: object(row.get(at + 4)),
         valid_time: ValidTime {
-            from: bound(time(row, at + 5)?, row.get(at + 6)),
-            to: bound(time(row, at + 7)?, row.get(at + 8)),
+            from: bound(optional_time(row, at + 5)?, row.get(at + 6)),
+            to: bound(optional_time(row, at + 7)?, row.get(at + 8)),
         },
         recorded_from: time(row, at + 9)?,
-        recorded_to: time(row, at + 10)?,
+        recorded_to: optional_time(row, at + 10)?,
         uncertain: row.get(at + 11),
         text_hash: row.get(at + 12),
         merge_rule: MergeRule::from_sql(row.get(at + 13)),
@@ -1760,11 +1761,11 @@ fn edge_version(row: &Row, at: usize) -> Result<EdgeVersion, Error> {
         target: NodeId(row.get(at + 5)),
         values: object(row.get(at + 6)),
         valid_time: ValidTime {
-            from: bound(time(row, at + 7)?, row.get(at + 8)),
-            to: bound(time(row, at + 9)?, row.get(at + 10)),
+            from: bound(optional_time(row, at + 7)?, row.get(at + 8)),
+            to: bound(optional_time(row, at + 9)?, row.get(at + 10)),
         },
         recorded_from: time(row, at + 11)?,
-        recorded_to: time(row, at + 12)?,
+        recorded_to: optional_time(row, at + 12)?,
         uncertain: row.get(at + 13),
         text_hash: row.get(at + 14),
         merge_rule: MergeRule::from_sql(row.get(at + 15)),
@@ -1779,11 +1780,18 @@ fn object(values: Value) -> Map<String, Value> {
     }
 }
 
-/// A column that holds a time or a null. `timestamptz` holds times outside
-/// the range of a `Timestamp`, and `Row::get` panics on a value it cannot
-/// convert, so every time is decoded here.
-fn time<'a, T: FromSql<'a>>(row: &'a Row, at: usize) -> Result<T, Error> {
-    Ok(row.try_get(at)?)
+/// A column that holds a time. `timestamptz` holds times outside the range
+/// of a `Timestamp`, and `Row::get` panics on a value it cannot convert, so
+/// every time is decoded here or in [`optional_time`].
+fn time(row: &Row, at: usize) -> Result<Timestamp, Error> {
+    Ok(row.try_get::<_, Timestamptz>(at)?.0)
+}
+
+/// A column that holds a time or a null, as [`time`] decodes one.
+fn optional_time(row: &Row, at: usize) -> Result<Option<Timestamp>, Error> {
+    Ok(row
+        .try_get::<_, Option<Timestamptz>>(at)?
+        .map(|stored| stored.0))
 }
 
 /// A Valid-time bound as the Store returns it: unknown, or an instant.
@@ -1840,7 +1848,7 @@ async fn read_kind(tx: &Transaction, name: &str) -> Result<Option<Kind>, Error> 
 
 /// An Episode from a row of `gnomon.read_episode`'s columns, in their order.
 fn episode_record(r: &Row) -> Result<Episode, Error> {
-    let retracted_at: Option<Timestamp> = time(r, 8)?;
+    let retracted_at: Option<Timestamp> = optional_time(r, 8)?;
     Ok(Episode {
         tenant: TenantId(r.get(0)),
         scope: Scope::new(r.get::<_, String>(1)),
@@ -1874,8 +1882,8 @@ fn stage_record(row: &Row, usage: Vec<StageUsage>) -> Result<StageRecord, Error>
             code,
             status: row.get(7),
         }),
-        retry_at: time(row, 8)?,
-        lease_until: time(row, 9)?,
+        retry_at: optional_time(row, 8)?,
+        lease_until: optional_time(row, 9)?,
         created_at: time(row, 10)?,
         updated_at: time(row, 11)?,
         usage,

@@ -22,6 +22,8 @@ pub mod erasure;
 pub mod install;
 pub mod perf;
 pub mod server;
+#[path = "../../src/timestamptz.rs"]
+pub mod timestamptz;
 pub mod tls;
 pub mod vectors;
 pub mod wire;

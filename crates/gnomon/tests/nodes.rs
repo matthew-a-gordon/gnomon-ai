@@ -13,8 +13,15 @@ use gnomon::{
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{Map, Value, json};
 use support::TestDb;
+use support::timestamptz::Timestamptz;
+use tokio_postgres::Row;
 
 const SCOPE: &str = "support";
+
+/// A `timestamptz` column that may hold a null.
+fn stored(row: &Row, at: usize) -> Option<Timestamp> {
+    row.get::<_, Option<Timestamptz>>(at).map(|t| t.0)
+}
 
 fn day(d: i8) -> Timestamp {
     support::utc(2024, 1, d)
@@ -453,7 +460,10 @@ async fn each_value_is_stored_as_a_contribution_with_its_episode_and_valid_time(
         )
         .await
         .iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+        .map(|r| {
+            let (from, to) = (stored(r, 3), stored(r, 4));
+            (r.get(0), r.get(1), r.get(2), from, to)
+        })
         .collect();
     assert_eq!(
         got,
@@ -738,7 +748,10 @@ impl World {
         )
         .await
         .iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .map(|r| {
+            let from = stored(r, 2).expect("a Version has a Recorded start");
+            (r.get(0), r.get(1), from, stored(r, 3))
+        })
         .collect()
     }
 

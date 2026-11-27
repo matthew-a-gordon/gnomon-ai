@@ -12,6 +12,7 @@ use gnomon::{
 use jiff::SignedDuration;
 use serde_json::json;
 use support::erasure::{SCOPE, World, at};
+use support::timestamptz::Timestamptz;
 use support::vectors::{Rng, cosine_distance, embed_every_version, sentence_hash};
 
 fn now() -> AsOf {
@@ -676,8 +677,14 @@ async fn the_re_rank_reads_each_candidates_full_vector_by_one_primary_key_probe(
                 &[
                     (&w.tenant.0, tokio_postgres::types::Type::UUID),
                     (&query, tokio_postgres::types::Type::FLOAT4_ARRAY),
-                    (&as_of.valid_at, tokio_postgres::types::Type::TIMESTAMPTZ),
-                    (&as_of.known_at, tokio_postgres::types::Type::TIMESTAMPTZ),
+                    (
+                        &Timestamptz(as_of.valid_at),
+                        tokio_postgres::types::Type::TIMESTAMPTZ,
+                    ),
+                    (
+                        &as_of.known_at.map(Timestamptz),
+                        tokio_postgres::types::Type::TIMESTAMPTZ,
+                    ),
                 ],
             )
             .await
