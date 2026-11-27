@@ -2,8 +2,9 @@
 # required status checks of the ruleset on main, so renaming a job also means
 # changing the ruleset.
 #
-# No push trigger: the ruleset requires an up-to-date branch, so the pull request
-# run tests what lands on main. No cache: each run builds from nothing.
+# The workflow does not run on pushes to main, because the ruleset requires an
+# up-to-date branch and so the pull request run tests what lands there. It caches
+# nothing, so each run builds from nothing.
 #
 # This repository is public. The token only reads, the workflow uses no secret,
 # the trigger is pull_request and never pull_request_target, and every

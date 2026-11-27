@@ -68,6 +68,8 @@ struct TestImage {
     cmd: &'static [&'static str],
 }
 
+/// `.github/workflows/ci.yml` pulls these images before the tests, so a new
+/// tag goes there too.
 const IMAGES: &[TestImage] = &[
     TestImage {
         key: "pgvector",
