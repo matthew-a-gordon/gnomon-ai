@@ -1,9 +1,10 @@
 //! The performance suite (ticket #21), on demand and apart from the
 //! correctness suite. It asserts the Search budgets of ADR-0010, on the data
 //! shape of prototype 5 (`origin/prototype/exact-search`), and the patch
-//! write limits of ADR-0007 (#84), on a small Store and on a large one.
-//! ADR-0020 gives it no `criterion`: it asserts budgets and does not compare
-//! runs.
+//! write limits of ADR-0007 (#84), on a small Store and on a large one. It
+//! also times Search and Resolution on the same shape with realistic word
+//! frequencies, and writes of long texts (#85). ADR-0020 gives it no
+//! `criterion`: it asserts budgets and does not compare runs.
 //!
 //! Cargo builds it only with `--features performance`, so a plain
 //! `cargo test` or `cargo nextest run` never runs it. See `docs/testing.md`
@@ -20,13 +21,13 @@ mod support;
 use std::time::{Duration, Instant};
 
 use gnomon::{
-    AsOf, NewEpisode, NewNode, Patch, ROOT_NODE_KIND, Scope, SearchRequest, Store, TenantId,
-    ValidTime,
+    AsOf, KindOf, Mention, NewEpisode, NewKind, NewNode, Patch, ROOT_NODE_KIND, Scope,
+    SearchRequest, Store, TenantId, ValidTime,
 };
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{Map, Value, json};
 use support::TestDb;
-use support::perf::{self, Dataset, Record, Stats};
+use support::perf::{self, Dataset, QueryWords, Record, Stats, Vocabulary};
 use support::vectors::Rng;
 use tokio::sync::Mutex;
 
@@ -52,7 +53,7 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::const_new(());
 
 async fn fused_search_case(case: &str, visible_target: usize, budget_ms: f64) {
     let _one = ONE_AT_A_TIME.lock().await;
-    let data = Dataset::get(perf::texts_for_visible(visible_target)).await;
+    let data = Dataset::get(perf::texts_for_visible(visible_target), Vocabulary::Numbers).await;
     println!(
         "{case}: {} texts, {} Versions, {} visible now",
         data.texts, data.versions, data.visible
@@ -178,6 +179,408 @@ async fn fused_search_stays_under_250_ms_at_p95_up_to_200000_visible_rows() {
     fused_search_case("fused_search_200k", 200_000, SEARCH_BUDGET_200K).await;
 }
 
+// ---- realistic word frequencies (#85) ----
+
+/// The classes of query the Search cases on realistic word frequencies time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum QueryClass {
+    /// A word in 8 to 40 visible texts.
+    Rare,
+    /// A word in 0.6% to 1.5% of the visible texts.
+    Mid,
+    /// One of the three commonest words.
+    Common,
+    /// A natural-language question: three of the ten commonest words, a mid
+    /// word and a rare word.
+    Question,
+}
+
+impl QueryClass {
+    const ALL: [QueryClass; 4] = [
+        QueryClass::Rare,
+        QueryClass::Mid,
+        QueryClass::Common,
+        QueryClass::Question,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            QueryClass::Rare => "rare word",
+            QueryClass::Mid => "mid word",
+            QueryClass::Common => "common word",
+            QueryClass::Question => "natural-language question",
+        }
+    }
+
+    fn query(self, words: &QueryWords, rng: &mut Rng) -> String {
+        let pick = |rng: &mut Rng, pool: &[String]| pool[rng.below(pool.len())].clone();
+        match self {
+            QueryClass::Rare => pick(rng, &words.rare),
+            QueryClass::Mid => pick(rng, &words.mid),
+            QueryClass::Common => pick(rng, &words.commonest[..3]),
+            QueryClass::Question => {
+                let mut common: Vec<String> = vec![];
+                while common.len() < 3 {
+                    let w = pick(rng, &words.commonest);
+                    if !common.contains(&w) {
+                        common.push(w);
+                    }
+                }
+                let (mid, rare) = (pick(rng, &words.mid), pick(rng, &words.rare));
+                format!("{} {mid} {} {} {rare}", common[0], common[1], common[2])
+            }
+        }
+    }
+}
+
+/// The query classes whose Search budget is asserted at each size: those
+/// that met it before Search counted word frequency at query time (#85). None
+/// did. On pgvector before #85, a rare word took 150 ms at p95 at 50,000
+/// visible rows and 665 ms at 200,000, so every class is recorded only, and
+/// #87 tracks the cost of the full-text branch with these frequencies.
+const WORD_BUDGETED_50K: &[QueryClass] = &[];
+const WORD_BUDGETED_200K: &[QueryClass] = &[];
+
+/// The seed of the queries, the query vectors and the long texts, so every
+/// run times the same ones.
+const WORD_SEED: u64 = 85;
+
+/// Searches and Resolutions discarded before the timed ones, and timed, for
+/// each query class.
+const WORD_WARM_UP: usize = 5;
+const WORD_SAMPLES: usize = 50;
+
+/// Times one call, after `WORD_WARM_UP` discarded ones, `WORD_SAMPLES` times.
+async fn time_calls<F, Fut>(mut call: F) -> Vec<Duration>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut times = vec![];
+    for i in 0..WORD_WARM_UP + WORD_SAMPLES {
+        let started = Instant::now();
+        call(i).await;
+        if i >= WORD_WARM_UP {
+            times.push(started.elapsed());
+        }
+    }
+    times
+}
+
+async fn word_frequency_case(
+    case: &str,
+    visible_target: usize,
+    budget_ms: f64,
+    budgeted: &[QueryClass],
+) {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let data = Dataset::get(perf::texts_for_visible(visible_target), Vocabulary::Words).await;
+    let words = data.query_words().await;
+    println!(
+        "{case}: {} texts, {} Versions, {} visible now; {} words, the commonest in {:.1}% of \
+         visible texts; {} rare, {} mid and {} rare name words to query",
+        data.texts,
+        data.versions,
+        data.visible,
+        words.vocabulary,
+        words.commonest_share * 100.0,
+        words.rare.len(),
+        words.mid.len(),
+        words.rare_names.len()
+    );
+    assert!(
+        (data.visible as f64) >= visible_target as f64 * 0.95
+            && (data.visible as f64) <= visible_target as f64 * 1.05,
+        "{} visible rows is not about {visible_target}",
+        data.visible
+    );
+    // The vocabulary is the one #85 measured: its commonest word is in about
+    // 82% of the texts.
+    assert!(
+        (0.79..=0.85).contains(&words.commonest_share),
+        "the commonest word is in {:.1}% of the visible texts, not about 82%",
+        words.commonest_share * 100.0
+    );
+    let store = data.store().await;
+    let caller = store.as_worker(data.tenant(), Scope::new(perf::SCOPE), None);
+    let centres = data.centres().await;
+    let record = Record::start(case, &data.db).await;
+    let current = AsOf::current(perf::valid_at());
+    let tenant = data.tenant();
+
+    let mut classes = vec![];
+    let mut failures = vec![];
+    for class in QueryClass::ALL {
+        // The same queries and vectors in every run.
+        let mut rng = Rng::new(WORD_SEED);
+        let queries: Vec<(String, Vec<f32>)> = (0..WORD_WARM_UP + WORD_SAMPLES)
+            .map(|_| {
+                let text = class.query(&words, &mut rng);
+                let (_, q) = data.query_for(&mut rng, &centres);
+                (text, q)
+            })
+            .collect();
+        let fused = Stats::of(
+            &time_calls(|i| {
+                let (caller, (text, q)) = (&caller, &queries[i]);
+                async move {
+                    let request = SearchRequest::text(text, current).with_embedding(q);
+                    let results = caller.search(tenant, &request, 10).await.unwrap();
+                    assert!(!results.is_empty(), "a search found nothing for {text:?}");
+                }
+            })
+            .await,
+        );
+        let branch = Stats::of(
+            &time_calls(|i| {
+                let (caller, (text, _)) = (&caller, &queries[i]);
+                async move {
+                    let found = caller
+                        .search_full_text(tenant, text, current, 10)
+                        .await
+                        .unwrap();
+                    assert!(!found.is_empty(), "full text found nothing for {text:?}");
+                }
+            })
+            .await,
+        );
+        let asserted = budgeted.contains(&class);
+        println!(
+            "{case}: {}: fused Search p50 {:.1} ms, p95 {:.1} ms; full-text branch alone p50 \
+             {:.1} ms, p95 {:.1} ms (budget {budget_ms} ms at p95, {})",
+            class.name(),
+            fused.p50,
+            fused.p95,
+            branch.p50,
+            branch.p95,
+            if asserted {
+                "asserted"
+            } else {
+                "recorded only"
+            }
+        );
+        if asserted && fused.p95 >= budget_ms {
+            failures.push(format!(
+                "fused Search p95 {:.1} ms for a {} is over the {budget_ms} ms budget",
+                fused.p95,
+                class.name()
+            ));
+        }
+        classes.push(json!({
+            "class": class.name(),
+            "example_query": queries[0].0,
+            "fused_search": fused.to_json(),
+            "full_text_branch_alone": branch.to_json(),
+            "budget_p95_ms": budget_ms,
+            "budget_asserted": asserted,
+        }));
+    }
+
+    // Resolution's full-text half: a mention of one word, with no embedding.
+    let mut resolution = vec![];
+    for (class, pool) in [
+        ("common name word", &words.common_names),
+        ("rare name word", &words.rare_names),
+    ] {
+        let mut rng = Rng::new(WORD_SEED);
+        let mentions: Vec<String> = (0..WORD_WARM_UP + WORD_SAMPLES)
+            .map(|_| pool[rng.below(pool.len())].clone())
+            .collect();
+        let stats = Stats::of(
+            &time_calls(|i| {
+                let (caller, mention) = (&caller, &mentions[i]);
+                async move {
+                    let found = caller
+                        .resolve(tenant, &Mention::text(mention), 10)
+                        .await
+                        .unwrap();
+                    assert!(
+                        !found.is_empty(),
+                        "Resolution found nothing for {mention:?}"
+                    );
+                }
+            })
+            .await,
+        );
+        println!(
+            "{case}: Resolution's full-text half, {class}: p50 {:.1} ms, p95 {:.1} ms \
+             (recorded only)",
+            stats.p50, stats.p95
+        );
+        resolution.push(json!({ "class": class, "example_mention": mentions[0],
+                                "resolve": stats.to_json() }));
+    }
+
+    let loaded = record.finish(json!({
+        "visible_rows": data.visible,
+        "versions": data.versions,
+        "texts": data.texts,
+        "vocabulary": words.vocabulary,
+        "commonest_word_share": words.commonest_share,
+        "commonest_words": words.commonest,
+        "warm_up_discarded": WORD_WARM_UP,
+        "search": classes,
+        "resolution_full_text": resolution,
+    }));
+    assert!(
+        failures.is_empty(),
+        "{}{}",
+        failures.join("; "),
+        if loaded {
+            " (the machine was loaded: rerun when it is quieter)"
+        } else {
+            ""
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_with_word_frequencies_at_50k_meets_the_budgets_it_met_before_85() {
+    word_frequency_case(
+        "word_frequencies_50k",
+        50_000,
+        SEARCH_BUDGET_50K,
+        WORD_BUDGETED_50K,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_with_word_frequencies_at_200k_meets_the_budgets_it_met_before_85() {
+    word_frequency_case(
+        "word_frequencies_200k",
+        200_000,
+        SEARCH_BUDGET_200K,
+        WORD_BUDGETED_200K,
+    )
+    .await;
+}
+
+// ---- long texts (#85) ----
+
+/// The distinct words of a long text, the Nodes written first so the Scope
+/// holds the vocabulary, and the writes discarded and timed of each kind.
+const LONG_TEXT_WORDS: usize = 100;
+const LONG_TEXT_EARLIER_NODES: usize = 200;
+const LONG_TEXT_WARM_UP: usize = 5;
+const LONG_TEXT_SAMPLES: usize = 50;
+/// The Nodes one transaction creates, and the transactions discarded and
+/// timed.
+const BATCH_NODES: usize = 25;
+const BATCH_WARM_UP: usize = 2;
+const BATCH_SAMPLES: usize = 20;
+
+/// The Kind of the long-text Nodes: its `text` is searchable.
+const NOTE: &str = "note";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn long_text_writes_and_a_transaction_of_25_nodes_are_timed_with_their_commits() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let w = Writes::new().await;
+    w.db.grant_kind_registration("gnomon_worker").await;
+    w.caller()
+        .register_kind(&NewKind {
+            tenant: Some(w.tenant),
+            name: NOTE.into(),
+            of: KindOf::Node,
+            parent: None,
+            properties: json!({ "type": "object",
+                                "properties": { "text": { "type": "string" } } }),
+            search: vec!["text".into()],
+        })
+        .await
+        .unwrap();
+    let mut rng = Rng::new(WORD_SEED);
+    let new_node = NewNode {
+        tenant: Some(w.tenant),
+        scope: Scope::new(perf::SCOPE),
+        kind: NOTE.to_owned(),
+    };
+    let long_patch = |rng: &mut Rng, ep| {
+        Patch::new(
+            ep,
+            ValidTime::since(day(0)),
+            values(json!({
+                "name": format!("{} {}", perf::zipf_word(rng), perf::zipf_word(rng)),
+                "text": perf::distinct_words(rng, LONG_TEXT_WORDS),
+            })),
+        )
+    };
+
+    let mut nodes = vec![];
+    for _ in 0..LONG_TEXT_EARLIER_NODES {
+        let first = long_patch(&mut rng, w.episode(day(1)).await);
+        nodes.push(w.create_with(&new_node, &first).await);
+    }
+    w.analyze().await;
+    let record = Record::start("long_text_writes", &w.db.name).await;
+
+    let mut creates = vec![];
+    for i in 0..LONG_TEXT_WARM_UP + LONG_TEXT_SAMPLES {
+        let first = long_patch(&mut rng, w.episode(day(1)).await);
+        let started = Instant::now();
+        let node = w.create_with(&new_node, &first).await;
+        if i >= LONG_TEXT_WARM_UP {
+            creates.push(started.elapsed());
+        }
+        nodes.push(node);
+    }
+    // Each patch replaces the text of one of the earlier Nodes.
+    let mut patches = vec![];
+    for (i, node) in nodes
+        .iter()
+        .take(LONG_TEXT_WARM_UP + LONG_TEXT_SAMPLES)
+        .enumerate()
+    {
+        let patch = long_patch(&mut rng, w.episode(day(2)).await);
+        let took = w.timed(*node, &patch).await;
+        if i >= LONG_TEXT_WARM_UP {
+            patches.push(took);
+        }
+    }
+    let mut batches = vec![];
+    for i in 0..BATCH_WARM_UP + BATCH_SAMPLES {
+        let mut firsts = vec![];
+        for _ in 0..BATCH_NODES {
+            firsts.push(long_patch(&mut rng, w.episode(day(1)).await));
+        }
+        let started = Instant::now();
+        let mut tx = w.caller().transaction(w.tenant).await.unwrap();
+        for first in &firsts {
+            tx.create_node(&new_node, first).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        if i >= BATCH_WARM_UP {
+            batches.push(started.elapsed());
+        }
+    }
+    let (create, patch, batch) = (
+        Stats::of(&creates),
+        Stats::of(&patches),
+        Stats::of(&batches),
+    );
+    for (what, stats) in [
+        ("create, a text of 100 distinct words", &create),
+        ("patch, a text of 100 distinct words", &patch),
+        ("one transaction that creates 25 such Nodes", &batch),
+    ] {
+        println!(
+            "long_text_writes: {what}, with its commit: p50 {:.2} ms, p95 {:.2} ms, n = {} \
+             (recorded only)",
+            stats.p50, stats.p95, stats.n
+        );
+    }
+    record.finish(json!({
+        "distinct_words_per_text": LONG_TEXT_WORDS,
+        "earlier_nodes": LONG_TEXT_EARLIER_NODES,
+        "warm_up_discarded": LONG_TEXT_WARM_UP,
+        "create": create.to_json(),
+        "patch": patch.to_json(),
+        "transaction_of_25_creates": batch.to_json(),
+        "transactions_discarded": BATCH_WARM_UP,
+    }));
+}
+
 // ---- patch writes ----
 
 fn day(d: i64) -> Timestamp {
@@ -298,18 +701,19 @@ impl Writes {
     }
 
     async fn create(&self, first: &Patch) -> gnomon::NodeId {
-        self.caller()
-            .create_node(
-                &NewNode {
-                    tenant: Some(self.tenant),
-                    scope: Scope::new(perf::SCOPE),
-                    kind: ROOT_NODE_KIND.to_owned(),
-                },
-                first,
-            )
-            .await
-            .unwrap()
-            .0
+        self.create_with(
+            &NewNode {
+                tenant: Some(self.tenant),
+                scope: Scope::new(perf::SCOPE),
+                kind: ROOT_NODE_KIND.to_owned(),
+            },
+            first,
+        )
+        .await
+    }
+
+    async fn create_with(&self, node: &NewNode, first: &Patch) -> gnomon::NodeId {
+        self.caller().create_node(node, first).await.unwrap().0
     }
 
     async fn write(&self, node: gnomon::NodeId, patch: &Patch) {

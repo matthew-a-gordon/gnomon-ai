@@ -3,7 +3,8 @@
 # then the 200,000-row Search case again in a container capped at 4 GiB, on
 # each image. See docs/testing.md.
 #
-#   scripts/perf.sh [search|search50k|search200k|patch|capped|all]      (default: all)
+#   scripts/perf.sh [search|search50k|search200k|patch|capped|words|words50k|words200k|writes|all]
+#                                                                       (default: all)
 #
 # Containers are named gnomon-t21-<image> and gnomon-t21-4g-<image>, publish on
 # loopback with a port Docker picks, keep their data on disk in an anonymous
@@ -19,11 +20,11 @@ images="${PERF_IMAGES:-pgvector supabase}"
 uncapped_args="-c shared_buffers=8GB -c work_mem=64MB -c maintenance_work_mem=512MB -c max_parallel_workers_per_gather=0 -c fsync=off -c autovacuum=off -c max_wal_size=16GB"
 capped_args="-c shared_buffers=1GB -c effective_cache_size=3GB -c work_mem=16MB -c maintenance_work_mem=512MB -c max_parallel_workers_per_gather=0 -c fsync=off -c autovacuum=off -c max_wal_size=8GB"
 
-# The patch case builds a small Store and a large one, and runs on Postgres's
-# own settings with fsync off, so it measures the merge and not the disk's
-# flush time (#84), as prototype 4 did. PERF_PATCH_ARGS="" runs it with
-# durable commits instead. Its tables must not run with autovacuum off: they
-# would never be analyzed.
+# The patch case builds a small Store and a large one. It and the long-text
+# writes (#85) run on Postgres's own settings with fsync off, so they measure
+# the writes and not the disk's flush time (#84), as prototype 4 did.
+# PERF_PATCH_ARGS="" runs them with durable commits instead. Their tables
+# must not run with autovacuum off: they would never be analyzed.
 patch_args="${PERF_PATCH_ARGS--c fsync=off}"
 
 teardown() { # <container name>: remove it and its anonymous volumes, nothing else
@@ -40,6 +41,11 @@ teardown() { # <container name>: remove it and its anonymous volumes, nothing el
 stage_limit_50k="${PERF_LIMIT_50K:-25m}"
 stage_limit_200k="${PERF_LIMIT_200K:-45m}"
 stage_limit_patch="${PERF_LIMIT_PATCH:-25m}"
+# The data sets with realistic word frequencies hold about 41 words a text,
+# so their token rows take longer to build (#85).
+stage_limit_words_50k="${PERF_LIMIT_WORDS_50K:-30m}"
+stage_limit_words_200k="${PERF_LIMIT_WORDS_200K:-75m}"
+stage_limit_writes="${PERF_LIMIT_WRITES:-15m}"
 
 stage() { # <image> <prefix> <memory or ""> <postgres args> <time limit> <cargo test filters...>
   local image="$1" prefix="$2" memory="$3" args="$4" limit="$5"; shift 5
@@ -68,6 +74,15 @@ for image in $images; do
   esac
   case "$what" in
     capped|all) stage "$image" gnomon-t21-4g 4g "$capped_args" "$stage_limit_200k" 200000_visible || status=1 ;;
+  esac
+  case "$what" in
+    words|words50k|all) stage "$image" gnomon-t21 "" "$uncapped_args" "$stage_limit_words_50k" word_frequencies_at_50k || status=1 ;;
+  esac
+  case "$what" in
+    words|words200k|all) stage "$image" gnomon-t21 "" "$uncapped_args" "$stage_limit_words_200k" word_frequencies_at_200k || status=1 ;;
+  esac
+  case "$what" in
+    words|writes|all) stage "$image" gnomon-t21 "" "$patch_args" "$stage_limit_writes" long_text_writes || status=1 ;;
   esac
 done
 docker ps -a --filter name=gnomon-t21 --format 'left over: {{.Names}} {{.Status}}'

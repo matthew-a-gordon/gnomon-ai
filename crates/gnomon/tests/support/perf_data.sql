@@ -15,6 +15,14 @@
 -- so two builds of one size hold the same texts, vectors, times and IDs
 -- whatever the migration files say. A run before a change and one
 -- after it then measure the same rows.
+--
+-- Two data sets are built from this file (#85). The first gives each Version
+-- the name `perf text <n>`, so every word but the number is in every text.
+-- The second, with realistic word frequencies, gives each text words drawn
+-- from a Zipf vocabulary instead, and adds Summaries. Its sections start
+-- with `-- words only`, and the first data set skips them. They come after
+-- the sections both share and seed the generator again, so the two data sets
+-- hold the same Nodes, Versions, times and vectors.
 set maintenance_work_mem = '512MB';
 select setseed(0.21);
 create schema perf;
@@ -75,6 +83,29 @@ create unlogged table perf.vers as
              generate_series(1, t.reps) r(rep)) e) f) z;
 create index on perf.vers (batch);
 -- @@
+-- words only
+-- The words of each text: two for its name, then a body, 23 to 59 words in
+-- all (41 on average), each drawn on its own from a Zipf vocabulary of 50,000
+-- words, `w1` the commonest, with exponent 0.93. By the inverse of the
+-- continuous distribution, rank r is drawn with probability about
+-- (r + 1)^0.07 - r^0.07 over 50001^0.07 - 1, so `w1` is in about 82% of
+-- texts, as in the data #85 measured.
+select setseed(0.85);
+create function perf.word(u float8) returns text
+  language sql immutable as $$
+    select 'w' || floor(power(1 + u * (power(50001::float8, 0.07) - 1), 1 / 0.07))::int
+  $$;
+create unlogged table perf.words as
+  select x.id,
+         string_agg(perf.word(x.u), ' ' order by x.k) filter (where x.k <= 2) as name,
+         string_agg(perf.word(x.u), ' ' order by x.k) filter (where x.k > 2) as body
+  from (select t.id, g.k, random() as u
+        from (select id, 23 + floor(random() * 37)::int as n
+              from generate_series(1, {{texts}}) id) t,
+             generate_series(1, t.n) g(k)) x
+  group by x.id;
+alter table perf.words add primary key (id);
+-- @@
 begin;
 set local session_replication_role = replica;
 insert into gnomon.node (tenant_id, scope, id, kind)
@@ -83,17 +114,51 @@ insert into gnomon.version (tenant_id, scope, id, node_id, props, valid_from,
                             valid_from_precision, valid_to, valid_to_precision,
                             recorded_from, recorded_to, merge_rule, closed_in)
   select '{{tenant}}', '{{scope}}', v.id, n.uuid,
-         jsonb_build_object('name', '{{scope}} text ' || v.text_id),
+         {{props}},
          coalesce(n.vf, '-infinity'),
          case when n.vf is null then 'unknown' else 'instant' end::gnomon.time_precision,
          coalesce(n.vt, 'infinity'),
          case when n.vt is null then 'unknown' else 'instant' end::gnomon.time_precision,
          v.rf, coalesce(v.rt, 'infinity'), 'recency',
          case when v.rt is null then null else '0'::xid8 end
-  from perf.vers v join perf.node n on n.i = v.node_i;
+  from perf.vers v join perf.node n on n.i = v.node_i{{words_join}};
+commit;
+-- @@
+-- words only
+-- A Summary of every tenth Node, current since the Node's first Version, for
+-- the valid-at instant 2024-01-01. Its text is the body of the Node's first
+-- text and of the next text, about 78 words. Search scores Summaries and
+-- Versions on one BM25 scale, so their words count together.
+begin;
+set local session_replication_role = replica;
+insert into gnomon.summary (tenant_id, scope, id, node_id, content, as_of_valid, recorded_from)
+  select '{{tenant}}', '{{scope}}', md5('summary ' || n.i)::uuid, n.uuid,
+         a.body || ' ' || b.body, '2024-01-01', n.rstart
+  from perf.node n
+    join perf.words a on a.id = n.first_text + 1
+    join perf.words b on b.id = (n.first_text + 1) % {{texts}} + 1
+  where n.i % 10 = 0;
 commit;
 -- @@
 -- @@index-search-text@@
+-- @@
+-- words only
+-- How many texts visible at the valid-at instant and the current belief hold
+-- each word, and how many current names, for the cases to pick their query
+-- words from. Only Node Versions count.
+create table perf.word_df as
+  select t.token, count(*) as visible_texts
+  from gnomon.search_token t
+    join gnomon.version v on v.tenant_id = t.tenant_id and v.scope = t.scope and v.id = t.version_id
+  where v.node_id is not null and v.recorded_to = 'infinity'
+    and v.valid_from <= '{{valid_at}}' and '{{valid_at}}' < v.valid_to
+  group by t.token;
+create table perf.name_word_df as
+  select w.lexeme as token, count(*) as current_names
+  from gnomon.node_name n
+    cross join unnest(to_tsvector('simple', n.name)) w
+  where n.recorded_to = 'infinity'
+  group by w.lexeme;
 -- @@
 -- @@embeddings@@
 -- One connection stores the embeddings, in batches of Versions, each as two
@@ -157,5 +222,9 @@ commit;
 -- @@
 drop table perf.vers, perf.tx, perf.node, perf.pool;
 drop function perf.normal_vec(float8, int);
+-- @@
+-- words only
+drop table perf.words;
+drop function perf.word(float8);
 -- @@
 vacuum (freeze, analyze);
