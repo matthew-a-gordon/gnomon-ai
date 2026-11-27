@@ -88,7 +88,7 @@ impl World {
     }
 
     pub fn caller(&self) -> gnomon::Caller<'_> {
-        self.store.as_worker(self.tenant, Scope::new(SCOPE))
+        self.store.as_worker(self.tenant, Scope::new(SCOPE), None)
     }
 
     pub fn claims(&self) -> String {
@@ -219,7 +219,7 @@ impl World {
 
     /// The worker of a Scope, which may erase in that Scope only.
     pub fn worker_in(&self, scope: &str) -> gnomon::Caller<'_> {
-        self.store.as_worker(self.tenant, Scope::new(scope))
+        self.store.as_worker(self.tenant, Scope::new(scope), None)
     }
 
     pub async fn episode_in(

@@ -43,7 +43,7 @@ struct Identity {
 impl Identity {
     fn caller<'s>(&self, store: &'s Store) -> Caller<'s> {
         match self.role {
-            Role::Worker => store.as_worker(self.tenant, Scope::new(&self.scope)),
+            Role::Worker => store.as_worker(self.tenant, Scope::new(&self.scope), None),
             Role::User => store.as_user(support::user(self.tenant, &[&self.scope])),
         }
     }

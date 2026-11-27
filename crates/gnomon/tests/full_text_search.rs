@@ -714,7 +714,7 @@ async fn writers_in_one_scope_sharing_words_all_commit_and_the_counts_stay_exact
             let store = gnomon::Store::connect(&url, &support::connect_options())
                 .await
                 .unwrap();
-            let caller = store.as_worker(tenant, Scope::new(SCOPE));
+            let caller = store.as_worker(tenant, Scope::new(SCOPE), None);
             for j in 0..10usize {
                 let mut name: Vec<&str> = words.to_vec();
                 name.rotate_left((i + j) % words.len());

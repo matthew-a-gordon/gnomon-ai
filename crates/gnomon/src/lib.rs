@@ -70,10 +70,6 @@ pub const TENANT_REQUIRED: &str = "GNT01";
 /// Tenant the caller's claims bind.
 pub const TENANT_MISMATCH: &str = "GNT02";
 
-/// The SQLSTATE the tenancy row raises for any change but the switch from
-/// single-tenant to multi-tenant mode, such as switching back.
-pub const TENANCY_ONE_WAY: &str = "GNT03";
-
 /// The SQLSTATE a stage write raises when it finishes a stage record that is
 /// no longer running at the attempt its claim returned, because another
 /// claim took the record after its lease expired.
@@ -150,6 +146,23 @@ pub struct Episode {
     pub authority: Option<i32>,
     /// When gnomon recorded the Episode.
     pub recorded_at: DateTime<Utc>,
+    /// Who recorded the Episode, as the deployment's `gnomon.user_id()`
+    /// named them, or `None`. By default it is the end user's `sub` claim,
+    /// or the user a worker was given. A person's edit is an Episode of its
+    /// own, so a Version, Summary or Community leads to who stated it
+    /// through its Citations.
+    pub recorded_by: Option<String>,
+    /// When the Episode was retracted and by whom, or `None` while it is
+    /// not.
+    pub retracted: Option<EpisodeRetracted>,
+}
+
+/// The Retraction of an Episode: when Retract Episode recorded it, and who.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeRetracted {
+    pub recorded_at: DateTime<Utc>,
+    /// As the Episode's own `recorded_by`.
+    pub recorded_by: Option<String>,
 }
 
 /// Why a Store call failed.

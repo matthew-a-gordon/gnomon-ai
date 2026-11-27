@@ -70,7 +70,7 @@ async fn fused_search_case(case: &str, visible_target: usize, budget_ms: f64) {
         data.visible
     );
     let store = data.store().await;
-    let caller = store.as_worker(data.tenant(), Scope::new(perf::SCOPE));
+    let caller = store.as_worker(data.tenant(), Scope::new(perf::SCOPE), None);
     let centres = data.centres().await;
     let mut rng = Rng::new(21);
     let record = Record::start(case, &data.db).await;
@@ -169,7 +169,8 @@ struct Writes {
 
 impl Writes {
     fn caller(&self) -> gnomon::Caller<'_> {
-        self.store.as_worker(self.tenant, Scope::new(perf::SCOPE))
+        self.store
+            .as_worker(self.tenant, Scope::new(perf::SCOPE), None)
     }
 
     async fn episode(&self, reference_time: DateTime<Utc>) -> gnomon::EpisodeId {

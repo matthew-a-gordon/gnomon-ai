@@ -77,7 +77,7 @@ async fn in_single_tenant_mode_a_worker_that_names_no_tenant_uses_the_default_te
     let db = TestDb::migrated().await;
     let store = store(&db).await;
     let default = db.default_tenant().await;
-    let worker = store.as_worker(None, Scope::new("ingest"));
+    let worker = store.as_worker(None, Scope::new("ingest"), None);
 
     let id = worker
         .record_episode(&episode(None, "ingest", "A nightly import."))
@@ -94,7 +94,7 @@ async fn in_single_tenant_mode_a_worker_that_names_no_tenant_uses_the_default_te
     let alice = store.as_user(user_without_tenant(&["ingest"]));
     assert!(alice.read_episode(None, id).await.unwrap().is_some());
     // So does a worker that names the default Tenant.
-    let named = store.as_worker(default, Scope::new("ingest"));
+    let named = store.as_worker(default, Scope::new("ingest"), None);
     assert!(named.read_episode(default, id).await.unwrap().is_some());
 }
 
@@ -129,7 +129,7 @@ async fn in_multi_tenant_mode_every_call_that_names_no_tenant_fails_and_never_us
     // claims bind none: neither reaches the default by naming no Tenant.
     let bound = store.as_user(support::user(first, &["support"]));
     let unbound = store.as_user(user_without_tenant(&["support"]));
-    let worker = store.as_worker(None, Scope::new("support"));
+    let worker = store.as_worker(None, Scope::new("support"), None);
     let (episode_id, node, version) = (
         EpisodeId(uuid::Uuid::new_v4()),
         NodeId(uuid::Uuid::new_v4()),
@@ -227,7 +227,7 @@ async fn a_call_whose_tenant_differs_from_the_tenant_in_the_claims_fails_in_eith
             db.switch_to_multi_tenant().await;
         }
         let alice = store.as_user(support::user(a, &["support"]));
-        let worker = store.as_worker(a, Scope::new("support"));
+        let worker = store.as_worker(a, Scope::new("support"), None);
         let expected =
             format!("the call names Tenant {b}, but the caller's claims bind Tenant {a}");
         for caller in [&alice, &worker] {
@@ -405,35 +405,13 @@ async fn switching_to_multi_tenant_mode_keeps_every_row_readable_under_the_forme
 }
 
 #[tokio::test]
-async fn switching_back_to_single_tenant_mode_is_refused_even_to_the_operator() {
+async fn switching_again_changes_nothing_and_the_deployment_stays_multi_tenant() {
+    // Only the schema's owner could switch back, by changing the row
+    // itself, and gnomon offers no defence against its owner (ADR-0024).
     let db = TestDb::migrated().await;
     let first = db.default_tenant().await;
     db.switch_to_multi_tenant().await;
     let operator = db.operator().await;
-
-    for sql in [
-        "update gnomon.tenancy set mode = 'single', switched_at = null",
-        "update gnomon.tenancy set default_tenant_id = gen_random_uuid()",
-        "update gnomon.tenancy set switched_at = switched_at - interval '1 day'",
-        "delete from gnomon.tenancy",
-        "truncate gnomon.tenancy",
-    ] {
-        match operator.batch_execute(sql).await {
-            Err(e) => assert_eq!(
-                e.code().map(|c| c.code()),
-                Some(gnomon::TENANCY_ONE_WAY),
-                "{sql}: {e:?}"
-            ),
-            Ok(()) => panic!("{sql} was allowed"),
-        }
-    }
-    match operator
-        .batch_execute("insert into gnomon.tenancy (mode, default_tenant_id) values ('single', gen_random_uuid())")
-        .await
-    {
-        Err(e) => assert_eq!(e.code(), Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION), "{e:?}"),
-        Ok(()) => panic!("a second tenancy row was inserted"),
-    }
 
     // Switching again changes nothing, and the deployment is still
     // multi-tenant with the same first Tenant.
@@ -453,26 +431,6 @@ async fn switching_back_to_single_tenant_mode_is_refused_even_to_the_operator() 
         ),
         TENANT_REQUIRED_MESSAGE
     );
-}
-
-#[tokio::test]
-async fn in_single_tenant_mode_the_operator_cannot_change_the_default_tenant_or_remove_the_row() {
-    let db = TestDb::migrated().await;
-    let operator = db.operator().await;
-    for sql in [
-        "update gnomon.tenancy set default_tenant_id = gen_random_uuid()",
-        "delete from gnomon.tenancy",
-        "truncate gnomon.tenancy",
-    ] {
-        match operator.batch_execute(sql).await {
-            Err(e) => assert_eq!(
-                e.code().map(|c| c.code()),
-                Some(gnomon::TENANCY_ONE_WAY),
-                "{sql}: {e:?}"
-            ),
-            Ok(()) => panic!("{sql} was allowed"),
-        }
-    }
 }
 
 async fn tenancy_mode(db: &TestDb) -> String {
@@ -518,7 +476,7 @@ async fn a_role_the_deployment_grants_the_switch_can_switch_and_one_without_upda
 
     db.admin()
         .await
-        .batch_execute("grant update (mode) on gnomon.tenancy to gnomon_worker")
+        .batch_execute("grant update (mode, switched_at) on gnomon.tenancy to gnomon_worker")
         .await
         .unwrap();
     let tx = client.transaction().await.unwrap();

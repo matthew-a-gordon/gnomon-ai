@@ -13,7 +13,12 @@
 -- beside Kind registration, the merge-rule setter and the search index
 -- trigger. Like them it is owned by the NOLOGIN `gnomon_definer` and checks
 -- the Tenant against `gnomon.tenant_id()`. The files grant it to no caller
--- role: each deployment grants it to the roles it chooses.
+-- role: each deployment grants it to the roles it chooses. The Scope of the
+-- named Episode, Node or Edge, or the named Scope, must be one the caller
+-- may write (`gnomon.writable_scopes()`, #81), and an Erasure of one the
+-- caller may only read is refused with `insufficient_privilege`. Erasure
+-- still removes what depends on what it erases in every Scope, those the
+-- caller may not write or read among them.
 --
 -- Recompute is replay, from prototype 4 (`prototype/recompute-cost`,
 -- FINDINGS.md). For each Node and Edge the Episode touched:
@@ -579,6 +584,7 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
       raise exception using errcode = 'GNW01',
         message = format('Episode %s is not visible to the caller', p_episode_id);
     end if;
+    perform gnomon.check_scope_writable(v_scope);
 
     -- The locks of every Node and Edge the Episode touched and of their
     -- Edges' endpoints, in order of ID, then the Episode's row, as a write
@@ -1105,13 +1111,17 @@ create function gnomon.erase_node(p_tenant_id uuid, p_node_id uuid)
   )
   language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
   as $$
+  declare
+    v_scope text;
   begin
     perform gnomon.erasure_check_tenant(p_tenant_id);
-    if not exists (select from gnomon.node n
-                   where n.tenant_id = p_tenant_id and n.id = p_node_id) then
+    select n.scope into v_scope
+      from gnomon.node n where n.tenant_id = p_tenant_id and n.id = p_node_id;
+    if not found then
       raise exception using errcode = 'GNW01',
         message = format('Node %s is not visible to the caller', p_node_id);
     end if;
+    perform gnomon.check_scope_writable(v_scope);
     return query select * from gnomon.erase_graph(p_tenant_id, null, array[p_node_id], '{}');
   end
   $$;
@@ -1126,16 +1136,21 @@ create function gnomon.erase_edge(p_tenant_id uuid, p_edge_id uuid)
   )
   language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
   as $$
+  declare
+    v_scope text;
   begin
     perform gnomon.erasure_check_tenant(p_tenant_id);
     -- The caller's own policy decides, not the reach an Erasure in the same
     -- transaction might still hold.
-    if not exists (select from gnomon.edge e
-                   where e.tenant_id = p_tenant_id and e.id = p_edge_id
-                     and e.scope = any(gnomon.allowed_scopes())) then
+    select e.scope into v_scope
+      from gnomon.edge e
+      where e.tenant_id = p_tenant_id and e.id = p_edge_id
+        and e.scope = any(gnomon.allowed_scopes());
+    if not found then
       raise exception using errcode = 'GNW01',
         message = format('Edge %s is not visible to the caller', p_edge_id);
     end if;
+    perform gnomon.check_scope_writable(v_scope);
     return query select * from gnomon.erase_graph(p_tenant_id, null, '{}', array[p_edge_id]);
   end
   $$;
@@ -1156,6 +1171,7 @@ create function gnomon.erase_scope(p_tenant_id uuid, p_scope text)
       raise exception using errcode = 'GNW01',
         message = format('Scope %s is not visible to the caller', p_scope);
     end if;
+    perform gnomon.check_scope_writable(p_scope);
     return query select * from gnomon.erase_graph(p_tenant_id, p_scope, '{}', '{}');
   end
   $$;

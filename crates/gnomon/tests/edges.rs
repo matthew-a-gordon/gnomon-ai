@@ -52,7 +52,7 @@ impl World {
     }
 
     fn caller(&self) -> gnomon::Caller<'_> {
-        self.store.as_worker(self.tenant, Scope::new(SCOPE))
+        self.store.as_worker(self.tenant, Scope::new(SCOPE), None)
     }
 
     /// An end user of the Tenant who may read and write `scopes`.
@@ -474,7 +474,7 @@ async fn an_edges_endpoints_may_be_in_any_scope_of_the_tenant_the_caller_can_see
     let node_in = |scope: &'static str| {
         let w = &w;
         async move {
-            let caller = w.store.as_worker(w.tenant, Scope::new(scope));
+            let caller = w.store.as_worker(w.tenant, Scope::new(scope), None);
             let ep = caller
                 .record_episode(&NewEpisode {
                     tenant: Some(w.tenant),
@@ -571,7 +571,7 @@ async fn an_edge_to_a_node_in_another_tenant_is_refused() {
     let w = World::new().await;
     let other = TenantId(uuid::Uuid::new_v4());
     let theirs = {
-        let caller = w.store.as_worker(other, Scope::new(SCOPE));
+        let caller = w.store.as_worker(other, Scope::new(SCOPE), None);
         let ep = caller
             .record_episode(&NewEpisode {
                 tenant: Some(other),

@@ -326,7 +326,7 @@ async fn another_tenant_and_another_scope_read_no_summary_or_community() {
             .is_empty()
     );
     let other = support::tenant();
-    let stranger = w.store.as_worker(other, Scope::new(SCOPE));
+    let stranger = w.store.as_worker(other, Scope::new(SCOPE), None);
     assert!(
         stranger
             .read_summaries(other, a, as_of)

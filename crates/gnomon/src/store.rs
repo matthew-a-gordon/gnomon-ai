@@ -38,12 +38,12 @@ use crate::migrations::{EmbeddingDimension, SCHEMA_VERSION};
 use crate::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, Citation, Community,
     CommunityId, DerivedCitation, Direction, EdgeId, EdgeVersion, EndOfValidity, Episode,
-    EpisodeErasure, EpisodeId, EpisodeRetraction, Error, FullTextCandidate, FullTextNameMatch,
-    GraphErasure, Kind, KindOf, Mention, MergeRule, NewCommunity, NewEdge, NewEpisode, NewKind,
-    NewNode, NewSummary, NodeId, NodeVersion, Patch, Precision, ResolutionCandidate, Retraction,
-    Scope, StageError, StageOutcome, StageRecord, StageStatus, StageUsage, StageWrite,
-    StatementKind, Step, Summary, SummaryId, TenantId, Traversal, ValidTime, VectorCandidate,
-    VectorNameMatch, VersionId, Versioned, WriteOutcome, WriteStatus,
+    EpisodeErasure, EpisodeId, EpisodeRetracted, EpisodeRetraction, Error, FullTextCandidate,
+    FullTextNameMatch, GraphErasure, Kind, KindOf, Mention, MergeRule, NewCommunity, NewEdge,
+    NewEpisode, NewKind, NewNode, NewSummary, NodeId, NodeVersion, Patch, Precision,
+    ResolutionCandidate, Retraction, Scope, StageError, StageOutcome, StageRecord, StageStatus,
+    StageUsage, StageWrite, StatementKind, Step, Summary, SummaryId, TenantId, Traversal,
+    ValidTime, VectorCandidate, VectorNameMatch, VersionId, Versioned, WriteOutcome, WriteStatus,
 };
 use crate::{BranchRank, SearchHit, SearchRequest, SearchResult, SignalRank};
 use crate::{Gap, GapCursor, GapPage};
@@ -155,20 +155,39 @@ impl Store {
     /// for the default Tenant; its claims then bind no Tenant, and the
     /// reference `gnomon.tenant_id()` returns the default one.
     ///
+    /// `user` is the person a background job works for, if any. The
+    /// reference `gnomon.user_id()` reads it, so an Episode the worker
+    /// records, or retracts, records that user in `recorded_by`. Without
+    /// one, `recorded_by` is null.
+    ///
     /// The claims are
-    /// `{"role": "gnomon_worker", "app_metadata": {"tenant_id": <tenant>, "scopes": [<scope>]}}`,
-    /// without `"tenant_id"` for `None`. A deployment that replaces
-    /// `gnomon.tenant_id()` and `gnomon.allowed_scopes()` must read them.
-    pub fn as_worker(&self, tenant: impl Into<Option<TenantId>>, scope: Scope) -> Caller<'_> {
+    /// `{"role": "gnomon_worker", "sub": <user>, "app_metadata": {"tenant_id": <tenant>, "scopes": [<scope>]}}`,
+    /// without `"sub"` for no user and without `"tenant_id"` for `None`. A
+    /// deployment that replaces `gnomon.tenant_id()`,
+    /// `gnomon.allowed_scopes()`, `gnomon.writable_scopes()` or
+    /// `gnomon.user_id()` must read them, and tells a worker call by its
+    /// `role`.
+    pub fn as_worker(
+        &self,
+        tenant: impl Into<Option<TenantId>>,
+        scope: Scope,
+        user: Option<&str>,
+    ) -> Caller<'_> {
         let mut app_metadata = Map::new();
         if let Some(tenant) = tenant.into() {
             app_metadata.insert("tenant_id".into(), Value::String(tenant.0.to_string()));
         }
         app_metadata.insert("scopes".into(), serde_json::json!([scope.as_str()]));
-        let claims = serde_json::json!({
-            "role": CallerRole::Worker.name(),
-            "app_metadata": app_metadata,
-        });
+        let mut claims = Map::new();
+        claims.insert(
+            "role".into(),
+            Value::String(CallerRole::Worker.name().into()),
+        );
+        if let Some(user) = user {
+            claims.insert("sub".into(), Value::String(user.to_owned()));
+        }
+        claims.insert("app_metadata".into(), Value::Object(app_metadata));
+        let claims = Value::Object(claims);
         Caller {
             store: self,
             role: CallerRole::Worker,
@@ -415,7 +434,8 @@ impl Caller<'_> {
             .statements
             .query(
                 &tx,
-                "select tenant_id, scope, id, content, reference_time, authority, recorded_at
+                "select tenant_id, scope, id, content, reference_time, authority, recorded_at,
+                        recorded_by, retracted_at, retracted_by
                  from gnomon.read_episode($1, $2)",
                 &[(&tenant.0, Type::UUID), (&id.0, Type::UUID)],
             )
@@ -429,6 +449,13 @@ impl Caller<'_> {
             reference_time: r.get::<_, DateTime<Utc>>(4),
             authority: r.get(5),
             recorded_at: r.get::<_, DateTime<Utc>>(6),
+            recorded_by: r.get(7),
+            retracted: r
+                .get::<_, Option<DateTime<Utc>>>(8)
+                .map(|recorded_at| EpisodeRetracted {
+                    recorded_at,
+                    recorded_by: r.get(9),
+                }),
         }))
     }
 
