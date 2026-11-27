@@ -2111,6 +2111,29 @@ create function gnomon.edge_await_endpoints() returns trigger
 create trigger edge_await_endpoints before insert on gnomon.edge
   for each row execute function gnomon.edge_await_endpoints();
 
+-- A Citation the merge gives a candidate Version: the property, the Episode
+-- and the place, whether the step recorded the Contribution, and the
+-- Episode's Reference time and Recorded time, which the Citation's foreign
+-- key to the Episode names.
+create type gnomon.merge_citation as (
+  property text,
+  episode_id uuid,
+  place text,
+  fresh boolean,
+  episode_reference_time timestamptz,
+  episode_recorded_at timestamptz
+);
+
+-- A Version the merge computes over its window, with its Citations.
+create type gnomon.merge_candidate as (
+  valid_from timestamptz,
+  valid_from_precision gnomon.time_precision,
+  valid_to timestamptz,
+  valid_to_precision gnomon.time_precision,
+  props jsonb,
+  citations gnomon.merge_citation[]
+);
+
 -- The merge, at a chosen Recorded time and under a chosen
 -- rule, so that the write path and Erasure share it (ADR-0007). It reads only
 -- the Contributions, bound statements and Episode Retractions recorded by
@@ -2155,8 +2178,8 @@ create function gnomon.merge_versions(
     v_ranked constant boolean := p_rule = 'ranked';
     w0 timestamptz;
     w1 timestamptz;
-    candidates jsonb;
-    v_fresh jsonb;
+    candidates gnomon.merge_candidate[];
+    v_fresh gnomon.merge_candidate[];
     stale uuid[];
     -- The statements and bound statements of this Node or Edge that belong to
     -- an Episode retracted by `p_at`, which the merge leaves out.
@@ -2332,15 +2355,14 @@ create function gnomon.merge_versions(
       from merged m
     ), island_citations as (
       select i.island,
-             jsonb_agg(distinct jsonb_build_array(
-               s.property, s.episode_id, s.place, s.fresh, s.ref, s.episode_rec)) as cites
+             array_agg(distinct row(s.property, s.episode_id, s.place, s.fresh, s.ref,
+                                    s.episode_rec)::gnomon.merge_citation) as cites
       from islands i join supporters s on s.sf = i.sf
       group by i.island
     )
-    select coalesce(jsonb_agg(jsonb_build_object(
-             'vf', m.vf, 'vt', m.vt, 'vfp', m.vfp, 'vtp', m.vtp, 'props', m.props,
-             'cites', coalesce(ic.cites, '[]'::jsonb))),
-           '[]'::jsonb)
+    select coalesce(array_agg(row(m.vf, m.vfp, m.vt, m.vtp, m.props,
+                                  coalesce(ic.cites, '{}'))::gnomon.merge_candidate),
+                    '{}')
       into candidates
       from merged_precision m left join island_citations ic using (island);
 
@@ -2353,10 +2375,11 @@ create function gnomon.merge_versions(
         and v.recorded_to = 'infinity'
         and v.valid_from >= w0 and v.valid_to <= w1
         and not exists (
-          select from jsonb_to_recordset(candidates)
-            cand(vf timestamptz, vt timestamptz, vfp text, vtp text, props jsonb)
-          where cand.vf = v.valid_from and cand.vt = v.valid_to and cand.props = v.props
-            and cand.vfp = v.valid_from_precision::text and cand.vtp = v.valid_to_precision::text
+          select from unnest(candidates) cand
+          where cand.valid_from = v.valid_from and cand.valid_to = v.valid_to
+            and cand.props = v.props
+            and cand.valid_from_precision = v.valid_from_precision
+            and cand.valid_to_precision = v.valid_to_precision
         );
     changed := cardinality(stale) > 0;
     delete from gnomon.citation x
@@ -2371,27 +2394,27 @@ create function gnomon.merge_versions(
     -- 5. Reopen what the step closed and now restores, and insert the rest.
     -- The new Versions are those no open Version, and none the step closed,
     -- already holds, found before the reopening.
-    select coalesce(jsonb_agg(cand.c), '[]') into v_fresh
-      from jsonb_array_elements(candidates) cand(c)
+    select coalesce(array_agg(cand), '{}') into v_fresh
+      from unnest(candidates) cand
       where not exists (
         select from gnomon.version v
         where v.tenant_id = p_tenant_id and v.scope = v_scope and v.versioned_id = p_id
-          and v.valid_from = (cand.c ->> 'vf')::timestamptz
-          and v.valid_to = (cand.c ->> 'vt')::timestamptz
-          and v.props = cand.c -> 'props'
-          and v.valid_from_precision::text = cand.c ->> 'vfp'
-          and v.valid_to_precision::text = cand.c ->> 'vtp'
+          and v.valid_from = cand.valid_from and v.valid_to = cand.valid_to
+          and v.props = cand.props
+          and v.valid_from_precision = cand.valid_from_precision
+          and v.valid_to_precision = cand.valid_to_precision
           and (v.recorded_to = 'infinity'
                or (v.recorded_to = t and (p_replay or v.closed_in = me)))
       );
     with reopened as (
       update gnomon.version v set recorded_to = 'infinity'
-        from jsonb_to_recordset(candidates)
-          cand(vf timestamptz, vt timestamptz, vfp text, vtp text, props jsonb)
+        from unnest(candidates) cand
         where v.tenant_id = p_tenant_id and v.scope = v_scope and v.versioned_id = p_id
           and v.recorded_to = t and (p_replay or v.closed_in = me)
-          and v.valid_from = cand.vf and v.valid_to = cand.vt and v.props = cand.props
-          and v.valid_from_precision::text = cand.vfp and v.valid_to_precision::text = cand.vtp
+          and v.valid_from = cand.valid_from and v.valid_to = cand.valid_to
+          and v.props = cand.props
+          and v.valid_from_precision = cand.valid_from_precision
+          and v.valid_to_precision = cand.valid_to_precision
         returning v.id
     )
     select coalesce(array_agg(id), '{}') into opened from reopened;
@@ -2403,10 +2426,9 @@ create function gnomon.merge_versions(
         )
         select p_tenant_id, v_scope,
                case when not p_is_edge then p_id end, case when p_is_edge then p_id end,
-               f.props, f.vf, f.vfp::gnomon.time_precision, f.vt, f.vtp::gnomon.time_precision,
+               f.props, f.valid_from, f.valid_from_precision, f.valid_to, f.valid_to_precision,
                p_rule::gnomon.merge_rule, t, 'infinity', '0'::xid8
-        from jsonb_to_recordset(v_fresh)
-          f(vf timestamptz, vt timestamptz, vfp text, vtp text, props jsonb)
+        from unnest(v_fresh) f
         returning id
       )
       select opened || coalesce(array_agg(id), '{}') into opened from inserted;
@@ -2420,10 +2442,9 @@ create function gnomon.merge_versions(
         )
         select p_tenant_id, v_scope,
                case when not p_is_edge then p_id end, case when p_is_edge then p_id end,
-               f.props, f.vf, f.vfp::gnomon.time_precision, f.vt, f.vtp::gnomon.time_precision,
+               f.props, f.valid_from, f.valid_from_precision, f.valid_to, f.valid_to_precision,
                p_rule::gnomon.merge_rule
-        from jsonb_to_recordset(v_fresh)
-          f(vf timestamptz, vt timestamptz, vfp text, vtp text, props jsonb)
+        from unnest(v_fresh) f
         returning id
       )
       select opened || coalesce(array_agg(id), '{}') into opened from inserted;
@@ -2436,30 +2457,30 @@ create function gnomon.merge_versions(
         tenant_id, scope, version_id, episode_id, property, place,
         episode_reference_time, episode_recorded_at, recorded_at, written_in
       )
-        select p_tenant_id, v_scope, v.id, (cc ->> 1)::uuid, cc ->> 0, cc ->> 2,
-               (cc ->> 4)::timestamptz, (cc ->> 5)::timestamptz, t, '0'::xid8
-        from jsonb_to_recordset(candidates) cand(vf timestamptz, vt timestamptz, cites jsonb)
+        select p_tenant_id, v_scope, v.id, cc.episode_id, cc.property, cc.place,
+               cc.episode_reference_time, cc.episode_recorded_at, t, '0'::xid8
+        from unnest(candidates) cand
         join gnomon.version v
           on v.tenant_id = p_tenant_id and v.scope = v_scope and v.versioned_id = p_id
          and v.recorded_to = 'infinity'
-         and v.valid_from = cand.vf and v.valid_to = cand.vt
-        cross join lateral jsonb_array_elements(cand.cites) cc
-        where v.id = any(opened) or (cc ->> 3)::boolean
+         and v.valid_from = cand.valid_from and v.valid_to = cand.valid_to
+        cross join lateral unnest(cand.citations) cc
+        where v.id = any(opened) or cc.fresh
         on conflict do nothing;
     else
       insert into gnomon.citation (
         tenant_id, scope, version_id, episode_id, property, place,
         episode_reference_time, episode_recorded_at
       )
-        select p_tenant_id, v_scope, v.id, (cc ->> 1)::uuid, cc ->> 0, cc ->> 2,
-               (cc ->> 4)::timestamptz, (cc ->> 5)::timestamptz
-        from jsonb_to_recordset(candidates) cand(vf timestamptz, vt timestamptz, cites jsonb)
+        select p_tenant_id, v_scope, v.id, cc.episode_id, cc.property, cc.place,
+               cc.episode_reference_time, cc.episode_recorded_at
+        from unnest(candidates) cand
         join gnomon.version v
           on v.tenant_id = p_tenant_id and v.scope = v_scope and v.versioned_id = p_id
          and v.recorded_to = 'infinity'
-         and v.valid_from = cand.vf and v.valid_to = cand.vt
-        cross join lateral jsonb_array_elements(cand.cites) cc
-        where v.id = any(opened) or (cc ->> 3)::boolean
+         and v.valid_from = cand.valid_from and v.valid_to = cand.valid_to
+        cross join lateral unnest(cand.citations) cc
+        where v.id = any(opened) or cc.fresh
         on conflict do nothing;
       -- 7. Every Version the step opened cites an Episode, so Erase Episode,
       -- which starts from an Episode's Citations, finds it.
