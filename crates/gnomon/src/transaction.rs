@@ -95,12 +95,15 @@ impl Conn {
     /// and the error says so. After any failed COMMIT the connection is
     /// closed when this drops.
     pub(crate) async fn commit(&mut self) -> Result<(), Error> {
+        // A connection the client already saw close cannot send COMMIT, so
+        // that transaction is known not to have committed.
+        let sent = !self.client().is_closed();
         match self.client().batch_execute("commit").await {
             Ok(()) => {
                 self.open = false;
                 Ok(())
             }
-            Err(e) => Err(Error::from_statement(e, true)),
+            Err(e) => Err(Error::from_statement(e, sent)),
         }
     }
 
@@ -197,22 +200,30 @@ impl Transaction {
     /// Commits everything the transaction's calls wrote.
     ///
     /// It fails with [`Error::RolledBack`], and saves nothing, when a call in
-    /// the transaction failed or was cancelled. It fails with
+    /// the transaction failed or was cancelled. The Store then closes the
+    /// connection instead of sending ROLLBACK, which would wait behind a
+    /// cancelled statement the server is still running; the server rolls the
+    /// transaction back. It fails with
     /// [`Error::Unavailable`] and
     /// [`UnavailableReason::LostDuringCommit`](crate::UnavailableReason::LostDuringCommit)
     /// when the connection is lost before COMMIT is answered: the
     /// transaction may or may not have committed.
     pub async fn commit(mut self) -> Result<(), Error> {
         if self.failed {
-            let _ = self.conn.rollback().await;
+            // Dropping the connection with its transaction open closes it.
             return Err(Error::RolledBack);
         }
         self.conn.commit().await
     }
 
     /// Rolls the transaction back, saving nothing, and returns its
-    /// connection to the pool.
+    /// connection to the pool. After a call in it failed or was cancelled,
+    /// the Store closes the connection instead, as [`commit`](Self::commit)
+    /// does.
     pub async fn rollback(mut self) -> Result<(), Error> {
+        if self.failed {
+            return Ok(());
+        }
         self.conn.rollback().await
     }
 

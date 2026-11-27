@@ -176,19 +176,20 @@ impl ConnectOptions {
 /// already verifies the certificate chain and the host name, as
 /// `verify-full` asks. A URL names it as a query parameter, and a key=value
 /// string as `sslmode=verify-full`, with optional spaces around `=` and
-/// optional single quotes around the value.
+/// optional single quotes around the value. Text inside another key's
+/// quoted value is left alone.
 fn accept_verify_full(connection: &str) -> (Cow<'_, str>, bool) {
     let is_url = connection.starts_with("postgres://") || connection.starts_with("postgresql://");
     let bytes = connection.as_bytes();
+    let quoted = (!is_url).then(|| quoted_bytes(bytes));
     let mut at = 0;
     while let Some(found) = connection[at..].find("sslmode") {
         let start = at + found;
         at = start + "sslmode".len();
         let before = start.checked_sub(1).map(|i| bytes[i]);
-        let starts_token = if is_url {
-            matches!(before, Some(b'?' | b'&'))
-        } else {
-            before.is_none_or(|b| b.is_ascii_whitespace())
+        let starts_token = match &quoted {
+            None => matches!(before, Some(b'?' | b'&')),
+            Some(quoted) => !quoted[start] && before.is_none_or(|b| b.is_ascii_whitespace()),
         };
         if !starts_token {
             continue;
@@ -393,6 +394,27 @@ impl ServerCertVerifier for AnyCertificate {
     }
 }
 
+/// Which bytes of a key=value string are inside a single-quoted value,
+/// where a backslash escapes the next byte.
+fn quoted_bytes(bytes: &[u8]) -> Vec<bool> {
+    let mut inside = false;
+    let mut escaped = false;
+    bytes
+        .iter()
+        .map(|&b| {
+            let was = inside;
+            if escaped {
+                escaped = false;
+            } else if inside && b == b'\\' {
+                escaped = true;
+            } else if b == b'\'' {
+                inside = !inside;
+            }
+            was || inside
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::accept_verify_full;
@@ -421,6 +443,8 @@ mod tests {
         for untouched in [
             "host=db sslmode=require",
             "host=db application_name=sslmode=verify-full",
+            "host=db application_name='x sslmode=verify-full'",
+            "host=db application_name='it\\'s sslmode=verify-full'",
             "host=db sslmode=verify-fuller",
             "postgres://db/x?xsslmode=verify-full",
             "postgres://db/x?sslmode=verify-ca",

@@ -337,15 +337,22 @@ impl Error {
         }
     }
 
-    /// Whether running the call or the transaction again can succeed with
-    /// nothing saved twice: after a [`Conflict`](Error::Conflict), and after
-    /// an [`Unavailable`](Error::Unavailable) whose transaction is known not
-    /// to have committed. It is false after the connection was lost during
-    /// COMMIT, because the first run may have committed.
+    /// Whether the call or the transaction saved nothing and running it
+    /// again as it was can succeed: after a [`Conflict`](Error::Conflict),
+    /// and after an [`Unavailable`](Error::Unavailable) because no
+    /// connection was free or the connection was lost before COMMIT.
+    ///
+    /// It is false after the connection was lost during COMMIT, because the
+    /// first run may have committed, and after a connection could not be
+    /// opened, because a refused login or certificate fails the same way
+    /// every time.
     pub fn can_run_again(&self) -> bool {
         match self {
             Error::Conflict(_) => true,
-            Error::Unavailable { reason, .. } => *reason != UnavailableReason::LostDuringCommit,
+            Error::Unavailable { reason, .. } => matches!(
+                reason,
+                UnavailableReason::PoolTimeout | UnavailableReason::Lost
+            ),
             _ => false,
         }
     }
@@ -382,15 +389,20 @@ impl Error {
             };
         }
         let message = e.as_db_error().map(|d| d.message().to_owned());
-        match (e.code().map(SqlState::code), message) {
+        let code = e.code().cloned();
+        match (code.as_ref().map(SqlState::code), message) {
             (Some(INVALID_KIND), Some(m)) => Error::InvalidKind(m),
             (Some(KIND_CONFLICT), Some(m)) => Error::KindConflict(m),
             (Some(INVALID_WRITE), Some(m)) => Error::InvalidWrite(m),
             (Some(TENANT_REQUIRED), Some(m)) => Error::TenantRequired(m),
             (Some(TENANT_MISMATCH), Some(m)) => Error::TenantMismatch(m),
             (Some(STAGE_CLAIM_LOST), Some(m)) => Error::StageClaimLost(m),
-            (Some("42501"), _) => Error::Forbidden(e),
-            (Some("40001" | "40P01"), _) => Error::Conflict(e),
+            _ if code == Some(SqlState::INSUFFICIENT_PRIVILEGE) => Error::Forbidden(e),
+            _ if code == Some(SqlState::T_R_SERIALIZATION_FAILURE)
+                || code == Some(SqlState::T_R_DEADLOCK_DETECTED) =>
+            {
+                Error::Conflict(e)
+            }
             _ => Error::Database(e),
         }
     }
@@ -410,8 +422,11 @@ fn is_lost(e: &tokio_postgres::Error) -> bool {
         return true;
     }
     if let Some(code) = e.code() {
-        let code = code.code();
-        return code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03");
+        // Class 08 has no single SqlState constant to compare with.
+        return code.code().starts_with("08")
+            || *code == SqlState::ADMIN_SHUTDOWN
+            || *code == SqlState::CRASH_SHUTDOWN
+            || *code == SqlState::CANNOT_CONNECT_NOW;
     }
     std::error::Error::source(e).is_some_and(|s| s.is::<std::io::Error>())
 }
