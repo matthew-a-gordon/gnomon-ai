@@ -305,6 +305,16 @@ pub struct BoundOutcome {
     pub opened: Vec<VersionId>,
 }
 
+/// One Episode behind a Node, as
+/// [`Caller::list_node_episodes`](crate::Caller::list_node_episodes) lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeEpisode {
+    /// The Episode.
+    pub episode: EpisodeId,
+    /// The Episode's Scope.
+    pub scope: Scope,
+}
+
 /// The link from a Version to an Episode it was derived from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Citation {

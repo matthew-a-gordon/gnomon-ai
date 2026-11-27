@@ -1,0 +1,57 @@
+# The rules `cargo deny` checks (ADR-0020). The lint job runs `check bans
+# licenses sources`, whose verdict depends only on Cargo.lock, the crates it
+# names and this file. The advisories jobs run `check advisories`, which reads a
+# database that changes daily.
+
+[graph]
+# So a banned crate behind an optional feature is seen. No targets are named, so
+# every target is checked.
+all-features = true
+
+[bans]
+multiple-versions = "warn"
+# Without this, a duplicate that only dev-dependencies bring in is not reported.
+multiple-versions-include-dev = true
+# The graph holds dev-dependencies, so these bans cover them.
+deny = [
+  { crate = "ring", reason = "aws-lc-rs is the one crypto provider (ADR-0021)" },
+  { crate = "openssl-sys", reason = "TLS goes through rustls and aws-lc-rs (ADR-0021)" },
+  { crate = "native-tls", reason = "TLS goes through rustls and aws-lc-rs (ADR-0021)" },
+]
+
+[licenses]
+# gnomon ships its dependencies inside its artifacts under Apache-2.0. Any
+# licence not listed here needs an entry in `exceptions` that names one crate,
+# with a comment giving the reason.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "BSL-1.0",
+  "Unicode-3.0",
+  "Unlicense",
+  # For aws-lc-sys. The licence expression of 0.47.0 does not name it, so no
+  # crate needs this entry today.
+  "OpenSSL",
+]
+exceptions = []
+include-dev = true
+# Some licences above are allowed before any crate uses them.
+unused-allowed-license = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[advisories]
+# Every crate counts, not only the ones this workspace names. The default scope
+# differs between cargo-deny versions and kinds of advisory, so both are stated.
+unmaintained = "all"
+unsound = "all"
+ignore = []

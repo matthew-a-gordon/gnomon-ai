@@ -72,7 +72,7 @@ pub enum Answer {
 pub async fn proxy(upstream: SocketAddr, answer: Answer) -> SocketAddr {
     let acceptor = match answer {
         Answer::Tls(cert) => {
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
             let config = ServerConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
                 .unwrap()

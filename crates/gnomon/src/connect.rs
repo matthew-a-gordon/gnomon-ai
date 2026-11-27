@@ -1,29 +1,58 @@
-//! How the Store connects: TLS and the statement mode.
+//! How the Store connects: TLS and the connection pool.
 //!
 //! TLS with certificate verification is the default. The Store verifies the
 //! server's certificate chain against trusted roots and checks that the
 //! certificate names the host it connected to. Turning verification off,
 //! or TLS off, takes an explicit [`Tls`] setting. The connection string's
 //! `sslmode` never turns either off.
+//!
+//! The pool opens a connection only when a call needs one and none is free,
+//! keeps at most [`ConnectOptions::max_connections`], and runs no keepalive
+//! or reaper task (ADR-0016). An idle connection is checked when a call
+//! takes it, never in the background.
 
+use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use tokio_postgres::config::SslMode;
+use tokio_postgres::{Config, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::Error;
 
+/// The default of [`ConnectOptions::max_connections`].
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10;
+
+/// The default of [`ConnectOptions::wait_timeout`].
+pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The settings a Store connects with. The default verifies the server's
-/// certificate against the platform's trusted roots and sends no named
-/// statements.
-#[derive(Debug, Clone, Default)]
+/// certificate against the platform's trusted roots, keeps at most
+/// [`DEFAULT_MAX_CONNECTIONS`] connections, closes none for being idle,
+/// and waits at most [`DEFAULT_WAIT_TIMEOUT`] for a free one.
+#[derive(Debug, Clone)]
 pub struct ConnectOptions {
     pub(crate) tls: Tls,
-    pub(crate) named_statements: bool,
+    pub(crate) max_connections: usize,
+    pub(crate) idle_timeout: Option<Duration>,
+    pub(crate) wait_timeout: Duration,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        ConnectOptions {
+            tls: Tls::default(),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            idle_timeout: None,
+            wait_timeout: DEFAULT_WAIT_TIMEOUT,
+        }
+    }
 }
 
 impl ConnectOptions {
@@ -33,19 +62,171 @@ impl ConnectOptions {
         self
     }
 
-    /// Turns named prepared statements on or off. They are off by default,
-    /// and every statement is sent unnamed, which works on every
-    /// transaction-mode pooler at its default settings (ADR-0001).
-    ///
-    /// Turn them on only behind a pooler that supports them: PgBouncer 1.21
-    /// or later with `max_prepared_statements` above 0, or Supavisor with
-    /// `named_prepared_statements` enabled, or with no pooler at all.
-    /// Elsewhere calls fail. With them on, the Store prepares each statement
-    /// once per connection and reuses it.
-    pub fn named_statements(mut self, on: bool) -> Self {
-        self.named_statements = on;
+    /// Sets the most connections the Store keeps open at once, at least 1.
+    /// The default is [`DEFAULT_MAX_CONNECTIONS`]; the bindings set 2. Each
+    /// single call and each open [`Transaction`](crate::Transaction) holds
+    /// one while it runs.
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max;
         self
     }
+
+    /// Closes a connection that has been idle in the pool for longer than
+    /// `idle`, when a call would take it next, and opens a new one instead.
+    /// Nothing closes it before then, because no background task runs. By
+    /// default no connection is closed for being idle.
+    pub fn idle_timeout(mut self, idle: Option<Duration>) -> Self {
+        self.idle_timeout = idle;
+        self
+    }
+
+    /// Sets how long a call waits for a free connection when all
+    /// [`max_connections`](Self::max_connections) are in use, before it
+    /// fails with [`Error::Unavailable`]. The default is
+    /// [`DEFAULT_WAIT_TIMEOUT`].
+    pub fn wait_timeout(mut self, wait: Duration) -> Self {
+        self.wait_timeout = wait;
+        self
+    }
+
+    /// The connection pool these settings describe, for `connection`. It
+    /// opens no connection.
+    pub(crate) fn pool(&self, connection: &str) -> Result<deadpool_postgres::Pool, Error> {
+        use deadpool_postgres::{
+            Manager, ManagerConfig, Pool, QueueMode, RecyclingMethod, Runtime,
+        };
+
+        if self.max_connections == 0 {
+            return Err(Error::InvalidConnection(
+                "the maximum number of connections must be at least 1".into(),
+            ));
+        }
+        let (connection, verify_full) = accept_verify_full(connection);
+        let mut config: Config = connection.parse().map_err(|e| {
+            Error::InvalidConnection(format!("the connection string does not parse: {e}"))
+        })?;
+        let ssl_mode = config.get_ssl_mode();
+        // Recycling checks only that the client has not seen its connection
+        // close, so a healthy call sends no extra query. A connection that
+        // died unseen fails when its transaction starts, and the Store then
+        // replaces it once (`store.rs`).
+        let manager_config = ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        };
+        let manager = match self.tls.connector()? {
+            None => {
+                if matches!(ssl_mode, SslMode::Require) {
+                    return Err(Error::InvalidConnection(format!(
+                        "the connection string sets sslmode={}, but the Store's TLS setting is \
+                         Tls::plaintext()",
+                        if verify_full {
+                            "verify-full"
+                        } else {
+                            "require"
+                        }
+                    )));
+                }
+                config.ssl_mode(SslMode::Disable);
+                Manager::from_config(config, NoTls, manager_config)
+            }
+            Some(tls) => {
+                if matches!(ssl_mode, SslMode::Disable) {
+                    return Err(Error::InvalidConnection(
+                        "the connection string sets sslmode=disable, which does not turn TLS \
+                         off; connect with Tls::plaintext() to connect without TLS"
+                            .into(),
+                    ));
+                }
+                if verify_full && matches!(self.tls.0, Mode::Unverified) {
+                    return Err(Error::InvalidConnection(
+                        "the connection string sets sslmode=verify-full, but the Store's TLS \
+                         setting is Tls::unverified()"
+                            .into(),
+                    ));
+                }
+                // Never fall back to plain text, as libpq's default `prefer` does.
+                config.ssl_mode(SslMode::Require);
+                Manager::from_config(config, tls, manager_config)
+            }
+        };
+        let mut pool = Pool::builder(manager)
+            .max_size(self.max_connections)
+            .wait_timeout(Some(self.wait_timeout))
+            .queue_mode(QueueMode::Lifo)
+            .runtime(Runtime::Tokio1);
+        if let Some(idle) = self.idle_timeout {
+            pool = pool.pre_recycle(deadpool_postgres::Hook::sync_fn(move |_, metrics| {
+                if metrics.last_used() > idle {
+                    Err(deadpool_postgres::HookError::message(
+                        "idle for longer than the idle timeout",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }));
+        }
+        pool.build()
+            .map_err(|e| Error::InvalidConnection(format!("the connection pool: {e}")))
+    }
+}
+
+/// The connection string with `sslmode=verify-full` read as
+/// `sslmode=require`, and whether it said `verify-full`. tokio-postgres
+/// does not parse `verify-full`, and the Store's default TLS setting
+/// already verifies the certificate chain and the host name, as
+/// `verify-full` asks. A URL names it as a query parameter, and a key=value
+/// string as `sslmode=verify-full`, with optional spaces around `=` and
+/// optional single quotes around the value. Text inside another key's
+/// quoted value is left alone.
+fn accept_verify_full(connection: &str) -> (Cow<'_, str>, bool) {
+    let is_url = connection.starts_with("postgres://") || connection.starts_with("postgresql://");
+    let bytes = connection.as_bytes();
+    let quoted = (!is_url).then(|| quoted_bytes(bytes));
+    let mut at = 0;
+    while let Some(found) = connection[at..].find("sslmode") {
+        let start = at + found;
+        at = start + "sslmode".len();
+        let before = start.checked_sub(1).map(|i| bytes[i]);
+        let starts_token = match &quoted {
+            None => matches!(before, Some(b'?' | b'&')),
+            Some(quoted) => !quoted[start] && before.is_none_or(|b| b.is_ascii_whitespace()),
+        };
+        if !starts_token {
+            continue;
+        }
+        let rest = &connection[at..];
+        let after_key = if is_url { rest } else { rest.trim_start() };
+        let Some(value) = after_key.strip_prefix('=') else {
+            continue;
+        };
+        let value = if is_url { value } else { value.trim_start() };
+        let (quoted, value) = match value.strip_prefix('\'') {
+            Some(v) => (true, v),
+            None => (false, value),
+        };
+        let Some(tail) = value.strip_prefix("verify-full") else {
+            continue;
+        };
+        let tail = if quoted {
+            match tail.strip_prefix('\'') {
+                Some(t) => t,
+                None => continue,
+            }
+        } else {
+            tail
+        };
+        let ends_token = if is_url {
+            tail.is_empty() || tail.starts_with('&') || tail.starts_with('#')
+        } else {
+            tail.is_empty() || tail.starts_with(|c: char| c.is_ascii_whitespace())
+        };
+        if !ends_token {
+            continue;
+        }
+        let rewritten = format!("{}sslmode=require{}", &connection[..start], tail);
+        return (Cow::Owned(rewritten), true);
+    }
+    (Cow::Borrowed(connection), false)
 }
 
 /// How the Store uses TLS.
@@ -124,7 +305,8 @@ impl Tls {
         if matches!(self.0, Mode::Plaintext) {
             return Ok(None);
         }
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        // The library never installs a process-wide default provider (ADR-0021).
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let builder = ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .map_err(|e| Error::InvalidConnection(format!("TLS: {e}")))?;
@@ -209,5 +391,66 @@ impl ServerCertVerifier for AnyCertificate {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Which bytes of a key=value string are inside a single-quoted value,
+/// where a backslash escapes the next byte.
+fn quoted_bytes(bytes: &[u8]) -> Vec<bool> {
+    let mut inside = false;
+    let mut escaped = false;
+    bytes
+        .iter()
+        .map(|&b| {
+            let was = inside;
+            if escaped {
+                escaped = false;
+            } else if inside && b == b'\\' {
+                escaped = true;
+            } else if b == b'\'' {
+                inside = !inside;
+            }
+            was || inside
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accept_verify_full;
+
+    #[test]
+    fn sslmode_verify_full_reads_as_require_in_a_url_or_a_key_value_string() {
+        for (given, read) in [
+            (
+                "host=db sslmode=verify-full user=u",
+                "host=db sslmode=require user=u",
+            ),
+            ("host=db sslmode = 'verify-full'", "host=db sslmode=require"),
+            ("sslmode=verify-full", "sslmode=require"),
+            (
+                "postgres://u@db/x?sslmode=verify-full",
+                "postgres://u@db/x?sslmode=require",
+            ),
+            (
+                "postgresql://u@db/x?application_name=a&sslmode=verify-full&connect_timeout=5",
+                "postgresql://u@db/x?application_name=a&sslmode=require&connect_timeout=5",
+            ),
+        ] {
+            let (rewritten, verify_full) = accept_verify_full(given);
+            assert_eq!((rewritten.as_ref(), verify_full), (read, true), "{given}");
+        }
+        for untouched in [
+            "host=db sslmode=require",
+            "host=db application_name=sslmode=verify-full",
+            "host=db application_name='x sslmode=verify-full'",
+            "host=db application_name='it\\'s sslmode=verify-full'",
+            "host=db sslmode=verify-fuller",
+            "postgres://db/x?xsslmode=verify-full",
+            "postgres://db/x?sslmode=verify-ca",
+        ] {
+            let (rewritten, verify_full) = accept_verify_full(untouched);
+            assert_eq!((rewritten.as_ref(), verify_full), (untouched, false));
+        }
     }
 }

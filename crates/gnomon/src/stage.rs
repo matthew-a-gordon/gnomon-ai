@@ -1,9 +1,9 @@
 //! Stage records (ADR-0011, `0003_reads_and_writes.sql`).
 //!
 //! The Pipeline's `add_episode` commits each stage's output together with the
-//! stage's record, so a retry resumes at the first unfinished stage. A
-//! [`Caller::recording`](crate::Caller::recording) Caller writes stage records
-//! in the transaction of its next Store call, so the record and the output
+//! stage's record, so a retry resumes at the first unfinished stage. A stage
+//! writes its records with [`Transaction::write_stages`](crate::Transaction::write_stages)
+//! in the transaction that writes its output, so the record and the output
 //! commit or fail together. The optional server queue claims due records
 //! with [`Caller::claim_stage`](crate::Caller::claim_stage).
 //!

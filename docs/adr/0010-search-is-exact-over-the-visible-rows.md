@@ -24,7 +24,7 @@ We chose this because, under RLS, only a leakproof condition can be an index con
 - HNSW with iterative scans, routed by visible-set size to an exact path for small Tenants. That means two plan shapes, and recall that falls as the table grows.
 - A table hash-partitioned by Tenant. The partition count is fixed in the migration chain (ADR-0006), recall falls as partitions grow, and a small Scope inside a large Tenant is still post-filtered.
 - Extension fast paths: pgvectorscale labels, VectorChord, AlloyDB ScaNN, pg_search. Each needs its own conformance suite, and on Supabase and DigitalOcean they buy little or nothing.
-- A `SECURITY DEFINER` full-text function using GIN. RLS would stop being the barrier between Tenants on that call (ADR-0009).
+- A `SECURITY DEFINER` full-text function using GIN. A definer owned by the tables' owner or by a `BYPASSRLS` role escapes row-level security, so its own Tenant check would be the only barrier between Tenants on that call. A definer that stays under row-level security, as gnomon's do (ADR-0009), gains nothing: `@@` is not leakproof, so it still cannot be an index condition.
 - BM25 statistics per Tenant. Ranking would reveal how often a term appears in Scopes the caller cannot read.
 - An embedding per Node with a time filter. A past read would rank a Node by what it says now.
 - `halfvec`. Measured no faster than full vectors, at 7.1 GB more storage.

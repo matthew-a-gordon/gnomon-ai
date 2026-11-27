@@ -36,8 +36,8 @@
 -- time. The As-of instants decide only which Versions are returned.
 --
 -- Who writes. One trigger function, `gnomon.maintain_search_index`, writes
--- the token rows and the counts. It is the fourth kind of definer ADR-0009
--- allows, owned by the NOLOGIN `gnomon_definer`, and it is granted to no
+-- the token rows and the counts. It is a definer owned by the NOLOGIN
+-- `gnomon_definer` (ADR-0009), and it is granted to no
 -- role. No caller can execute it or attach it to a table of its own, because
 -- both need EXECUTE. Callers hold SELECT on the search tables and no write
 -- privilege, so no caller's statement, nor a trigger of a caller's own, can
@@ -79,10 +79,15 @@
 -- reopens is the one that stood just before the Episode first touched its
 -- Node or Edge, so its text owes nothing to the erased Episode. It is indexed
 -- again from its text as it stands, with no Sentence, and so is a Version
--- that was current then and that the Episode never closed. The definer may read
--- and delete the token rows of an Edge the running Erasure reaches in a
--- Scope the caller cannot see (see 0005). It may change the counts
--- only of a Scope whose changes its own transaction recorded.
+-- that was current then and that the Episode never closed. Erasure deletes
+-- token rows as `gnomon_eraser`, in every Scope of the Tenant. Some belong
+-- to an erased Edge of a Scope the caller cannot see (see 0005). The search
+-- index trigger then runs as its own owner, `gnomon_definer`, and needs no
+-- more than its usual rights for that: it records the count changes of its
+-- own transaction in any Scope of the Tenant, and changes the counts only
+-- of a Scope whose changes its own transaction recorded. Everything else it
+-- reads and writes, it reads and writes in the caller's Scopes, which hold
+-- every Version an Erasure inserts or reopens.
 --
 -- The vector branch. The Pipeline stores an embedding of a Version's search text after the
 -- write commits. A consumer searches with a query embedding at a valid-at
@@ -121,9 +126,10 @@
 -- Where pgvector lives. pgvector is in `public` on most hosts and in
 -- `extensions` on Supabase. The functions that use it name its types,
 -- operators and functions without a schema, under the path this file sets
--- (see pgvector's names below), which each keeps. The functions run as the
--- caller, so 0001 grants the caller roles USAGE on that schema when they
--- lack it, and fails when the role that applies it cannot grant that.
+-- (see pgvector's names below), which each keeps. The read functions run as
+-- the caller and the store functions as `gnomon_writer`, so 0001 grants
+-- those roles USAGE on that schema when they lack it, and fails when the
+-- role that applies it cannot grant that.
 --
 -- The dimension. The vector columns are of type `vector` and the bit
 -- columns `bit varying`, untyped by width, and a check holds each to
@@ -181,10 +187,10 @@
 -- Version of a Scope by text would cost an Erasure a scan of the Scope or the
 -- write path an index on the text hash. No embedding row names an Episode,
 -- and an embedding reaches its Episodes through its Version's Citations, so
--- `gnomon.erase_episode_rows` needs nothing more. The definer may read and
--- delete the embeddings of an Edge the running Erasure reaches in a Scope the
--- caller cannot see, and read the quantized rows of that Scope that share their texts, so that
--- it keeps a full vector another Version there still uses.
+-- `gnomon.erase_episode_rows` needs nothing more. The eraser reads and
+-- deletes them in every Scope of the Tenant, so it keeps a full vector
+-- another Version of the same Scope still uses, whether or not the caller
+-- can see that Scope.
 --
 -- Resolution. The Pipeline or a consumer matches a mention against the Nodes the graph
 -- already has (GLOSSARY: Resolution). The call searches the current names
@@ -211,8 +217,8 @@
 -- text, so the search index trigger, `gnomon.maintain_search_index`, writes
 -- them, as it writes the token rows (ADR-0009). It calls
 -- `gnomon.index_search_text`, which writes a Version's name rows with its
--- token rows. Callers hold SELECT
--- on the table and no insert or delete. A Version is closed by an update of
+-- token rows. Callers hold SELECT on the table and no write privilege, and
+-- the writer role updates only the bits, through `gnomon.store_name_embedding`. A Version is closed by an update of
 -- its Recorded-time end, which reaches its name rows through the foreign key
 -- `(tenant_id, scope, version_id, recorded_to)` with ON UPDATE CASCADE, as it
 -- reaches its quantized row. A Version deleted by the
@@ -275,9 +281,8 @@
 -- uses it. A Version an Erasure reopens gets its name rows again from its
 -- text, through the search index trigger, as it gets its token rows. No name
 -- row names an Episode, so `gnomon.erase_episode_rows` needs nothing more.
--- The definer may read the name rows of a Scope the caller cannot see that
--- share a text with an Edge the running Erasure reaches there, so that it
--- keeps a full vector a name there still uses.
+-- The eraser reads the name rows of every Scope of the Tenant, so it keeps
+-- a full vector a name of that Scope still uses.
 --
 -- Neighbourhood search and fusion. A consumer runs one Search call, `gnomon.search`, and gets one fused,
 -- ranked list of the Versions, Summaries and Communities that match its
@@ -386,18 +391,17 @@
 -- `gnomon.maintain_search_index`, also fires when a Summary or a Community is inserted and when its token rows are written or
 -- deleted, and writes those rows and their count changes as it writes a
 -- Version's. Callers hold SELECT on the token rows and no write privilege.
--- The embedding functions are invokers that check the call's Tenant and
--- Scope. Callers may insert an embedding row and nothing more, and a trigger
--- sets its bits and time columns from the stored row, whatever the caller
--- supplied. Closing a Summary or Community reaches its embedding row's
+-- The embedding functions run as `gnomon_writer` and check the call's
+-- Tenant and Scope. The writer role may insert an embedding row and nothing
+-- more, and a trigger sets its bits and time columns from the stored row,
+-- whatever the insert supplied. Closing a Summary or Community reaches its embedding row's
 -- Recorded-time end through the foreign key
 -- `(tenant_id, scope, ..., recorded_to)` with ON UPDATE CASCADE.
 --
 -- Erasure (ADR-0003). `gnomon.erase_summaries_and_communities`, which every
 -- Erasure that removes a Summary or Community calls, deletes their token
 -- rows and embedding rows first, and the counts go down at commit. The
--- definer reads and deletes the token and embedding rows of a Summary in a
--- Scope the caller cannot see when the running Erasure reaches that Summary.
+-- eraser reads and deletes them in every Scope of the Tenant.
 -- A row the transaction that wrote it deletes takes them
 -- with it through the foreign keys.
 --
@@ -428,8 +432,9 @@
 -- replaced Sentence's old embedding must not stay: vector Search would find
 -- the Version by a text it no longer has, and once the Version was embedded
 -- again no row would use the old full vector, so no Erasure would ever find
--- it (ADR-0003). Callers hold no DELETE on the embedding tables, so the
--- search index trigger, the fourth definer (ADR-0009), also deletes them
+-- it (ADR-0003). No caller and not the writer role holds DELETE on the
+-- embedding tables, so the
+-- search index trigger, a definer (ADR-0009), also deletes them
 -- when a Sentence is stored. That is the Version's quantized row of a text it
 -- no longer has, and that text's full vector unless a quantized row or a name
 -- row of the Scope still uses it. It touches only rows of the stored
@@ -778,7 +783,7 @@ create trigger version_index_search_text after insert on gnomon.version
 -- reopens. A caller's update closes a Version, whose rows stay.
 create trigger version_reindex_search_text after update on gnomon.version
   referencing new table as changed
-  for each statement when (gnomon.running_as_definer())
+  for each statement when (gnomon.running_as_eraser())
   execute function gnomon.maintain_search_index();
 
 create trigger sentence_index_search_text_insert after insert on gnomon.sentence
@@ -932,8 +937,8 @@ create function gnomon.embedding_vector(p_embedding real[])
   end
   $fn$;
 
--- A quantized row as the Store derives it (see the header). It runs as the
--- caller, under RLS.
+-- A quantized row as the Store derives it (see the header). It runs as
+-- `gnomon_writer`, under RLS.
 create function gnomon.embedding_bit_derive() returns trigger
   language plpgsql security invoker set search_path from current
   as $fn$
@@ -987,7 +992,7 @@ create function gnomon.store_embedding(
   p_embedding real[]
 )
   returns void
-  language plpgsql volatile security invoker set search_path from current
+  language plpgsql volatile security definer set search_path from current
   as $fn$
   declare
     v_vector vector := gnomon.embedding_vector(p_embedding);
@@ -999,6 +1004,7 @@ create function gnomon.store_embedding(
       raise exception using errcode = 'GNW01',
         message = pg_catalog.format('Version %s is not visible to the caller', p_version_id);
     end if;
+    perform gnomon.refuse_read_only_scope(v_scope);
     insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
       values (p_tenant_id, v_scope, p_text_hash, v_vector)
       on conflict (tenant_id, scope, text_hash) do nothing;
@@ -1296,7 +1302,7 @@ create function gnomon.store_name_embedding(
   p_embedding real[]
 )
   returns void
-  language plpgsql volatile security invoker set search_path from current
+  language plpgsql volatile security definer set search_path from current
   as $fn$
   declare
     v_vector vector := gnomon.embedding_vector(p_embedding);
@@ -1309,6 +1315,7 @@ create function gnomon.store_name_embedding(
       raise exception using errcode = 'GNW01',
         message = pg_catalog.format('Node %s is not visible to the caller', p_node_id);
     end if;
+    perform gnomon.refuse_read_only_scope(v_scope);
     if not exists (select from gnomon.node_name n
                    where n.tenant_id = p_tenant_id and n.scope = v_scope
                      and n.text_hash = v_hash and n.node_id = p_node_id
@@ -1665,7 +1672,7 @@ create function gnomon.search_full_text_branch(
 
 -- An embedding row as the Store derives it: of a Summary or Community the
 -- caller can see in that Scope, with its bits and the row's time columns,
--- whatever the caller supplied. It runs as the caller, under RLS.
+-- whatever the insert supplied. It runs as `gnomon_writer`, under RLS.
 create function gnomon.derived_embedding_derive() returns trigger
   language plpgsql security invoker set search_path from current
   as $fn$
@@ -1749,7 +1756,7 @@ create function gnomon.store_summary_embedding(
   p_embedding real[]
 )
   returns void
-  language sql volatile security invoker set search_path = pg_catalog, pg_temp
+  language sql volatile security definer set search_path = pg_catalog, pg_temp
   as $fn$
     select gnomon.store_derived_embedding(p_tenant_id, 'summary', p_summary_id, p_embedding)
   $fn$;
@@ -1760,7 +1767,7 @@ create function gnomon.store_community_embedding(
   p_embedding real[]
 )
   returns void
-  language sql volatile security invoker set search_path = pg_catalog, pg_temp
+  language sql volatile security definer set search_path = pg_catalog, pg_temp
   as $fn$
     select gnomon.store_derived_embedding(p_tenant_id, 'community', p_community_id, p_embedding)
   $fn$;
@@ -2361,14 +2368,14 @@ create function gnomon.search(
   $$;
 
 -- Stores the Sentence of Edge Version `p_version_id`, replacing any stored
--- before. It runs as the caller, under RLS.
+-- before. It runs as `gnomon_writer`, under its policies (ADR-0009).
 create function gnomon.store_sentence(
   p_tenant_id uuid,
   p_version_id uuid,
   p_sentence text
 )
   returns void
-  language plpgsql volatile security invoker set search_path = pg_catalog, pg_temp
+  language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
   as $$
   declare
     v_scope text;
@@ -2390,6 +2397,7 @@ create function gnomon.store_sentence(
           'a Sentence states what an Edge Version says, and %s is not an Edge Version the '
           'caller can see', p_version_id);
     end if;
+    perform gnomon.refuse_read_only_scope(v_scope);
     insert into gnomon.sentence as s (tenant_id, scope, version_id, sentence)
       values (p_tenant_id, v_scope, p_version_id, p_sentence)
       on conflict (tenant_id, scope, version_id)

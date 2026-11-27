@@ -326,7 +326,7 @@ async fn another_tenant_and_another_scope_read_no_summary_or_community() {
             .is_empty()
     );
     let other = support::tenant();
-    let stranger = w.store.as_worker(other, Scope::new(SCOPE));
+    let stranger = w.store.as_worker(other, Scope::new(SCOPE), None);
     assert!(
         stranger
             .read_summaries(other, a, as_of)
@@ -658,7 +658,7 @@ async fn erasing_a_node_removes_its_summaries_in_every_scope_even_one_the_caller
         0
     );
     assert_eq!(rows_naming(&w, "community_member", "node_id", x.0).await, 0);
-    // The reach is only to a Summary of the Node the Erasure listed: y's
+    // The Erasure removes only the Summaries of the Node it erased: y's
     // Summary in billing, which the worker cannot see either, stands, and so
     // does every row that does not draw on x.
     for (table, id) in [
@@ -673,15 +673,6 @@ async fn erasing_a_node_removes_its_summaries_in_every_scope_even_one_the_caller
         rows_naming(&w, "summary_citation", "summary_id", y_billing.0).await,
         1
     );
-    // The Erasure's list is empty again.
-    let left: i64 =
-        w.db.admin()
-            .await
-            .query_typed("select count(*) from gnomon.erasure_reach", &[])
-            .await
-            .unwrap()[0]
-            .get(0);
-    assert_eq!(left, 0);
 }
 
 #[tokio::test]
@@ -787,7 +778,7 @@ async fn a_node_an_erasure_would_leave_bare_stays_while_a_summary_that_cites_ano
 }
 
 #[tokio::test]
-async fn a_summary_write_commits_the_recorded_stage_records_with_it() {
+async fn a_summary_commits_with_the_stage_records_of_its_transaction() {
     let w = World::new().await;
     let f = w.episode(at(2024, 1, 1), None).await;
     let a = w
@@ -798,13 +789,15 @@ async fn a_summary_write_commits_the_recorded_stage_records_with_it() {
             json!({ "plan": "pro" }),
         )
         .await;
-    let recording = w
-        .caller()
-        .recording(vec![gnomon::StageWrite::pending(f, "summaries")]);
-    recording
-        .write_summary(w.tenant, &summary(SCOPE, a, "with its stage", &[f]))
+    let caller = w.caller();
+    let mut tx = caller.transaction(w.tenant).await.unwrap();
+    tx.write_summary(&summary(SCOPE, a, "with its stage", &[f]))
         .await
         .unwrap();
+    tx.write_stages(&[gnomon::StageWrite::pending(f, "summaries")])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let stages: Vec<String> = w
         .stage_records_of(SCOPE, f)
         .await

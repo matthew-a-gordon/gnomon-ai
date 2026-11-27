@@ -1,6 +1,5 @@
--- gnomon 0005: Erasure. Erase Episode and the Erasure of a Node, an Edge or
--- a Scope, and the policies through which an Erasure reaches rows in Scopes
--- the caller cannot see (ADR-0003, ADR-0009).
+-- gnomon 0005: Erasure. Erase Episode, the Erasure of a Node, an Edge or a
+-- Scope, and the list of the Episodes behind a Node (ADR-0003, ADR-0009).
 --
 -- Erase Episode. Erasure physically deletes an Episode and leaves no tombstone (ADR-0003).
 -- In one transaction it deletes the Episode, its Contributions, its
@@ -9,11 +8,31 @@
 -- closed, from the Contributions that remain (ADR-0007). It is the only route
 -- that deletes or rewrites committed history.
 --
--- Erasure is one of the four SECURITY DEFINER groups ADR-0009 allows,
--- beside Kind registration, the merge-rule setter and the search index
--- trigger. Like them it is owned by the NOLOGIN `gnomon_definer` and checks
--- the Tenant against `gnomon.tenant_id()`. The files grant it to no caller
--- role: each deployment grants it to the roles it chooses.
+-- Who runs it. The four Erasure functions are SECURITY DEFINER, owned by
+-- `gnomon_eraser`, a NOLOGIN role that owns no table, cannot bypass RLS and
+-- has no members (ADR-0009, #83). Its policies check the Tenant against
+-- `gnomon.tenant_id()` and nothing else. So an Erasure removes what depends
+-- on what it erases in every Scope of the caller's Tenant, even a Scope the
+-- caller may not write or read. It removes nothing of another Tenant. The
+-- files grant the four to no caller role: each deployment grants them to
+-- the roles it chooses.
+--
+-- Since no policy limits an Erasure to the caller's Scopes, each function
+-- checks them itself:
+--
+--   * The Scope of the named Episode, Node or Edge, or the named Scope, must
+--     be one the caller may read (`gnomon.allowed_scopes()`) and write
+--     (`gnomon.writable_scopes()`, #81). One it cannot read gets the error
+--     an absent one gets, so a caller learns nothing of a hidden Scope. One
+--     it may only read is refused with `insufficient_privilege`.
+--   * A result names only Nodes and Edges in Scopes the caller can read.
+--   * Every other query names its Scope, or reads by IDs that came from a
+--     row of the named Scope, so the Tenant policy alone never widens what
+--     the named item is.
+--
+-- The accepted cost is that a bug in an Erasure could remove rows in
+-- another Scope of the same Tenant. Another Tenant's rows stay out of reach
+-- of every query an Erasure runs, because the policies check the Tenant.
 --
 -- Recompute is replay, from prototype 4 (`prototype/recompute-cost`,
 -- FINDINGS.md). For each Node and Edge the Episode touched:
@@ -71,13 +90,11 @@
 -- so with no Version, is erased with it. A Node left so stays as a bare
 -- identity while any Edge joins it, and is erased with its last Edge
 -- (ADR-0007). An endpoint of an Edge the Erasure erases goes too when nothing
--- is left of it and no other Edge joins it. A Node no Edge joins and the
--- Episode never touched is left alone, bare or not.
---
--- Erasure acts in the caller's Tenant and Scopes only. The definer role is
--- under RLS, with the same Tenant and Scope policies as the callers. An endpoint Node in a Scope the caller cannot see is never
--- erased and stays bare. A Node joined by an Edge in a Scope the caller
--- cannot see stays too, because the Edge still joins it.
+-- is left of it: no Contribution, statement or Version, no other Edge, and
+-- no Summary or Community that names it. That holds in whichever Scope the
+-- Node is, so the same request removes the same rows for every caller
+-- (ADR-0007). A Node no Edge joins and the Episode never touched is left
+-- alone, bare or not.
 --
 -- Locks (ADR-0007). An Erasure takes these, for the rest of its transaction:
 --
@@ -117,11 +134,13 @@
 -- `max_locks_per_transaction` first. Prototype 4 needed 1024 for 500 Nodes
 -- on a server with few connections.
 --
--- The guard triggers (ADR-0009) refuse every caller's delete or rewrite of
--- committed history. Erasure passes them because it runs as `gnomon_definer`.
--- `gnomon.running_as_definer()` is true only when the current user is that
--- role. No caller role can become it, because it has no members and never
--- logs in, and no setting a caller can change affects the check. The
+-- No caller writes a table, and the writer role's policies refuse every
+-- delete or rewrite of committed history (#81). Erasure writes it because
+-- it runs as `gnomon_eraser`, whose policies have no such condition, and
+-- passes the triggers that check a write. `gnomon.running_as_eraser()` is
+-- true only when the current user is that role. No caller role can become
+-- it, because it has no members and never logs in, and no setting a caller
+-- can change affects the check. The
 -- Versions, Citations, statements and Contributions the replay writes carry
 -- the Recorded times of the steps they replay. Their transaction mark,
 -- `written_in`, and the `closed_in` of each Version the replay closes are
@@ -158,9 +177,9 @@
 --
 -- Each erased Edge goes as in Erase Episode: its rows, the Sentence of each of
 -- its Versions (ADR-0013), and then each endpoint it leaves with nothing. Such
--- an endpoint is erased when no row names it and no other Edge joins it, and
--- only when it is in a Scope the caller can see. One in a Scope the caller
--- cannot see stays as a bare identity, as it does after Erase Episode.
+-- an endpoint is erased when no row names it and no other Edge joins it, in
+-- whichever Scope it is, as after Erase Episode. The result names it only
+-- when the caller can read its Scope.
 --
 -- None of them recomputes anything, because no Version that survives was
 -- derived from what they erase. A Contribution, statement or Citation names an
@@ -171,28 +190,16 @@
 -- erased Node or Edge is that Node's or Edge's, so it goes with it.
 --
 -- An Edge lives in one Scope and may join a Node in any Scope of the Tenant
--- that its writer could see. Erasing a Node, or the Nodes of
--- a Scope, erases every Edge that joins them, whatever the Edge's Scope, even
--- one the caller cannot see, because the foreign key on the Node would refuse
--- the Node's delete while it stood. Erasing a Scope removes nothing else
--- outside it but those Edges' rows and the endpoints they leave bare.
+-- that its writer could see. Erasing a Node, or the Nodes of a Scope, erases
+-- every Edge that joins them, whatever the Edge's Scope, even one the caller
+-- cannot see, because the foreign key on the Node would refuse the Node's
+-- delete while it stood. It erases every Summary of them in every Scope
+-- too. Erasing a Scope removes nothing else outside it but those Edges' and
+-- Summaries' rows and the endpoints the Edges leave with nothing.
 --
--- These three are Erasure, the first of the definers ADR-0009 names. Like
--- Erase Episode they are SECURITY DEFINER, owned by the NOLOGIN
--- `gnomon_definer`, check the Tenant against `gnomon.tenant_id()` and are
--- granted to no caller role. The Node, Edge or Scope must be one the caller
--- can see, and the definer reads under the caller's Tenant and Scope
--- policies.
---
--- Reaching Edges the caller cannot see. The definer gets one more policy on
--- each table that holds an Edge's rows: it may read and delete a row of an
--- Edge, in any Scope of the Tenant, that joins a Node its own Erasure is
--- erasing, and that Edge's rows. Its Erasure lists those Nodes, and then those
--- Edges, in `gnomon.erasure_reach`, marked with its own transaction, and
--- deletes the list before it returns. No caller role may read or write that
--- table, so no caller can widen what the definer reaches, and a row is visible
--- only to the transaction that wrote it. Nodes get no such policy, so a bare
--- endpoint in a Scope the caller cannot see is never erased.
+-- Like Erase Episode these three are SECURITY DEFINER, owned by
+-- `gnomon_eraser`, and granted to no caller role. The Node, Edge or Scope
+-- must be one the caller can read and write, as the header says.
 --
 -- Locks (ADR-0007), in the order Erase Episode takes them:
 --
@@ -214,9 +221,8 @@
 -- than the table has free fails with SQLSTATE 53200 and erases nothing.
 --
 -- An Erasure tells the caller only of what it can see. Its result names the
--- Edges it erased in the caller's Scopes, and not those of other Scopes, so a
--- caller learns no ID from a Scope it cannot see. Every Node it names is in
--- the caller's Scopes already.
+-- Nodes and Edges it erased in the caller's Scopes, and not those of other
+-- Scopes, so a caller learns no ID from a Scope it cannot see.
 --
 -- Unlike Erase Episode, these Erasures run in any transaction and need no
 -- check that a later transaction wrote first. They replay nothing and keep no
@@ -225,8 +231,7 @@
 -- then erases what it wrote too.
 --
 -- Copies of the erased bytes stay in dead tuples and index pages until
--- Postgres vacuums the tables (ADR-0003), and so do the dead rows of
--- `gnomon.erasure_reach`, which hold the IDs of what was erased.
+-- Postgres vacuums the tables (ADR-0003).
 --
 -- These Erasures reach the tables beyond the graph's own in three places,
 -- and only there:
@@ -242,8 +247,20 @@
 --                                  Scope's Erasure calls for each of its
 --                                  Episodes.
 --
--- Every table of Edge rows has the `*_erasure_reach` policies below, so an
--- Erasure reaches it in every Scope. A table added later needs them too.
+-- Every table of the graph has the `<table>_eraser` policy of 0001, so an
+-- Erasure reaches it in every Scope of the Tenant. A table added later
+-- needs it too.
+--
+-- The Episodes behind a Node. Erase Node and Erase Edge keep the Episodes,
+-- so a person's name can remain in an Episode's text after their Node is
+-- erased (ADR-0003). `gnomon.list_node_episodes` lists each Episode once,
+-- with its Scope, that the Node or an Edge that joins it was derived from:
+-- the Contributions, statements and bound statements of the Node and of
+-- each such Edge, the Citations of their Versions, current and closed, and
+-- the Citations of the Node's Summaries, current and closed. Communities are
+-- left out, because they cite Episodes about other Nodes too. It is an
+-- invoker, so it lists only what the caller can read: a worker reads one
+-- Scope, and the call is repeated for each.
 
 -- During an Erasure a Version still changes only in its Recorded-time end.
 -- One the replay closes is marked closed by no transaction, and one it
@@ -269,7 +286,7 @@ create function gnomon.version_erasure_update() returns trigger
   $$;
 
 create trigger version_erasure_update before update on gnomon.version
-  for each row when (gnomon.running_as_definer())
+  for each row when (gnomon.running_as_eraser())
   execute function gnomon.version_erasure_update();
 
 -- Erasure (ADR-0003). Every row derived from the text of a Version an
@@ -406,7 +423,7 @@ create function gnomon.replay_versions(
     v_whole boolean;
     v_statement bigint;
   begin
-    if not gnomon.running_as_definer() then
+    if not gnomon.running_as_eraser() then
       raise exception using errcode = 'insufficient_privilege',
         message = 'only Erasure replays history';
     end if;
@@ -538,6 +555,40 @@ create function gnomon.replay_versions(
   end
   $$;
 
+-- Erases each of the Nodes `p_candidates` that holds nothing: no
+-- Contribution, statement, bound statement or Version, no Edge that joins it
+-- and no Summary or Community that names it. It does so in whichever Scope
+-- the Node is (see the header), and returns the erased Nodes the caller can
+-- read, in order of ID.
+create function gnomon.erase_empty_nodes(p_tenant_id uuid, p_candidates uuid[])
+  returns uuid[]
+  language sql volatile security invoker set search_path = pg_catalog, pg_temp
+  as $$
+    with gone as (
+      delete from gnomon.node n
+        where n.tenant_id = p_tenant_id and n.id = any(p_candidates)
+          and not exists (select from gnomon.contribution c
+                          where c.tenant_id = n.tenant_id and c.node_id = n.id)
+          and not exists (select from gnomon.statement s
+                          where s.tenant_id = n.tenant_id and s.node_id = n.id)
+          and not exists (select from gnomon.bound_statement b
+                          where b.tenant_id = n.tenant_id and b.node_id = n.id)
+          and not exists (select from gnomon.version v
+                          where v.tenant_id = n.tenant_id and v.node_id = n.id)
+          and not exists (select from gnomon.edge e
+                          where e.tenant_id = n.tenant_id
+                            and (e.source_id = n.id or e.target_id = n.id))
+          and not exists (select from gnomon.summary s
+                          where s.tenant_id = n.tenant_id and s.node_id = n.id)
+          and not exists (select from gnomon.community_member m
+                          where m.tenant_id = n.tenant_id and m.node_id = n.id)
+        returning n.id, n.scope
+    )
+    select coalesce(pg_catalog.array_agg(g.id order by g.id), '{}')
+    from gone g
+    where g.scope = any(gnomon.allowed_scopes())
+  $$;
+
 -- Erase Episode. It returns when the Erasure ran, the Nodes and Edges it
 -- recomputed, and the Nodes and Edges it erased because nothing was left of
 -- them, each list in order of ID. The header says what it deletes, which
@@ -565,7 +616,6 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
     v_lock uuid[];
     v_locked uuid[] := '{}';
     v_row_locked boolean := false;
-    v_candidates uuid[];
     v_id uuid;
   begin
     if p_tenant_id is null or p_tenant_id is distinct from gnomon.tenant_id() then
@@ -573,12 +623,17 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
         message = 'Erasure may erase only in the caller''s own Tenant';
     end if;
     perform pg_catalog.pg_advisory_xact_lock(gnomon.node_lock_key(p_tenant_id, p_episode_id));
+    -- The eraser's policies show every Scope of the Tenant, so a hidden
+    -- Episode is refused here as an absent one is.
     select e.scope into v_scope
-      from gnomon.episode e where e.tenant_id = p_tenant_id and e.id = p_episode_id;
+      from gnomon.episode e
+      where e.tenant_id = p_tenant_id and e.id = p_episode_id
+        and e.scope = any(gnomon.allowed_scopes());
     if not found then
       raise exception using errcode = 'GNW01',
         message = format('Episode %s is not visible to the caller', p_episode_id);
     end if;
+    perform gnomon.refuse_read_only_scope(v_scope);
 
     -- The locks of every Node and Edge the Episode touched and of their
     -- Edges' endpoints, in order of ID, then the Episode's row, as a write
@@ -764,41 +819,14 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
                           where b.tenant_id = e.tenant_id and b.edge_id = e.id)
           and not exists (select from gnomon.version v
                           where v.tenant_id = e.tenant_id and v.edge_id = e.id)
-        returning e.id, e.source_id, e.target_id
+        returning e.id, e.scope, e.source_id, e.target_id
     )
-    select coalesce(array_agg(g.id), '{}'),
+    select coalesce(array_agg(g.id) filter (where g.scope = any(gnomon.allowed_scopes())), '{}'),
            coalesce(array_agg(g.source_id) || array_agg(g.target_id), '{}')
       into v_edges, v_nodes
       from gone g;
-    -- A Node is erased one at a time, so that one joined by an Edge in a Scope
-    -- the caller cannot see, which RLS hides from the check above the delete
-    -- but not from the foreign key, stays as a bare identity and the rest of
-    -- the Erasure goes on.
-    v_candidates := array(select distinct u.id from unnest(v_touched || v_nodes) u(id)
-                          order by u.id);
-    v_nodes := '{}';
-    foreach v_id in array v_candidates loop
-      begin
-        delete from gnomon.node n
-          where n.tenant_id = p_tenant_id and n.id = v_id
-            and not exists (select from gnomon.contribution c
-                            where c.tenant_id = n.tenant_id and c.node_id = n.id)
-            and not exists (select from gnomon.statement s
-                            where s.tenant_id = n.tenant_id and s.node_id = n.id)
-            and not exists (select from gnomon.bound_statement b
-                            where b.tenant_id = n.tenant_id and b.node_id = n.id)
-            and not exists (select from gnomon.version v
-                            where v.tenant_id = n.tenant_id and v.node_id = n.id)
-            and not exists (select from gnomon.edge e
-                            where e.tenant_id = n.tenant_id
-                              and (e.source_id = n.id or e.target_id = n.id));
-        if found then
-          v_nodes := v_nodes || v_id;
-        end if;
-      exception when foreign_key_violation then
-        null;
-      end;
-    end loop;
+    -- In whichever Scope it is (see the header).
+    v_nodes := gnomon.erase_empty_nodes(p_tenant_id, v_touched || v_nodes);
 
     erased_at := t;
     erased_nodes := array(select u.id from unnest(v_nodes) u(id) order by u.id);
@@ -815,69 +843,9 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
   end
   $$;
 
--- Whether the running Erasure listed one of `p_ids`.
-create function gnomon.erasure_reaches(p_tenant_id uuid, p_ids uuid[]) returns boolean
-  language sql stable security invoker set search_path = pg_catalog, pg_temp
-  as $$
-    select exists (
-      select from gnomon.erasure_reach r
-      where r.tenant_id = p_tenant_id and r.written_in = pg_current_xact_id_if_assigned()
-        and r.id = any(p_ids)
-    )
-  $$;
-
--- Whether a Version belongs to an Edge the running Erasure listed.
-create function gnomon.erasure_reaches_version(p_tenant_id uuid, p_version_id uuid)
-  returns boolean
-  language sql stable security invoker set search_path = pg_catalog, pg_temp
-  as $$
-    select exists (
-      select from gnomon.version v
-      where v.tenant_id = p_tenant_id and v.id = p_version_id and v.edge_id is not null
-        and gnomon.erasure_reaches(p_tenant_id, array[v.edge_id])
-    )
-  $$;
-
-do $$
-declare
-  t text;
-begin
-  foreach t in array array['contribution', 'version', 'statement', 'bound_statement'] loop
-    execute format(
-      'create policy %1$s_erasure_reach_read on gnomon.%1$I for select to gnomon_definer
-         using (tenant_id = gnomon.tenant_id() and edge_id is not null
-                and gnomon.erasure_reaches(tenant_id, array[edge_id]))', t);
-    execute format(
-      'create policy %1$s_erasure_reach_delete on gnomon.%1$I for delete to gnomon_definer
-         using (tenant_id = gnomon.tenant_id() and edge_id is not null
-                and gnomon.erasure_reaches(tenant_id, array[edge_id]))', t);
-  end loop;
-  foreach t in array array['citation', 'sentence'] loop
-    execute format(
-      'create policy %1$s_erasure_reach_read on gnomon.%1$I for select to gnomon_definer
-         using (tenant_id = gnomon.tenant_id()
-                and gnomon.erasure_reaches_version(tenant_id, version_id))', t);
-    execute format(
-      'create policy %1$s_erasure_reach_delete on gnomon.%1$I for delete to gnomon_definer
-         using (tenant_id = gnomon.tenant_id()
-                and gnomon.erasure_reaches_version(tenant_id, version_id))', t);
-  end loop;
-end
-$$;
-
--- The definer's reach into Scopes the caller cannot see, for reading and
--- deleting only: an Edge that joins a listed Node, and the rows of a listed
--- Edge.
-create policy edge_erasure_reach_read on gnomon.edge for select to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches(tenant_id, array[id, source_id, target_id]));
-
-create policy edge_erasure_reach_delete on gnomon.edge for delete to gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and gnomon.erasure_reaches(tenant_id, array[id]));
-
 -- Deletes every row of the Nodes and Edges `p_ids`: first the Summaries of
--- these Nodes, in every Scope the Erasure reaches, and the Communities that
--- hold them, then what derives from their Versions' text, then their own
+-- these Nodes, in every Scope of the Tenant, and the Communities that hold
+-- them, then what derives from their Versions' text, then their own
 -- rows.
 create function gnomon.erase_versioned_rows(p_tenant_id uuid, p_ids uuid[])
   returns void
@@ -935,11 +903,11 @@ create function gnomon.erase_graph(
     -- erases no Episode, so it has none to lock.
     v_episodes_locked boolean := p_scope is null;
     v_candidates uuid[];
-    v_bare uuid[] := '{}';
+    v_bare uuid[];
     v_seen_edges uuid[];
     v_id uuid;
   begin
-    if not gnomon.running_as_definer() then
+    if not gnomon.running_as_eraser() then
       raise exception using errcode = 'insufficient_privilege',
         message = 'only Erasure erases Nodes, Edges and Scopes';
     end if;
@@ -967,9 +935,6 @@ create function gnomon.erase_graph(
           select n.id from gnomon.node n
             where p_scope is not null and n.tenant_id = p_tenant_id and n.scope = p_scope
         ) x order by x.id);
-      insert into gnomon.erasure_reach (tenant_id, id)
-        select p_tenant_id, x.id from unnest(v_nodes) x(id)
-        on conflict do nothing;
       v_edges := array(
         select distinct x.id from (
           select unnest(p_edges) as id
@@ -981,9 +946,6 @@ create function gnomon.erase_graph(
             where e.tenant_id = p_tenant_id
               and (e.source_id = any(v_nodes) or e.target_id = any(v_nodes))
         ) x order by x.id);
-      insert into gnomon.erasure_reach (tenant_id, id)
-        select p_tenant_id, x.id from unnest(v_edges) x(id)
-        on conflict do nothing;
       v_lock := array(
         select distinct l.id from (
           select unnest(v_nodes || v_edges) as id
@@ -1043,38 +1005,14 @@ create function gnomon.erase_graph(
     end loop;
     delete from gnomon.node n where n.tenant_id = p_tenant_id and n.id = any(v_nodes);
 
-    -- Each endpoint left with nothing, one at a time, as Erase Episode erases
-    -- one, as Erase Episode's loop does: a Node in a Scope the caller cannot see is not visible to the
-    -- delete and stays, and one that an Edge in such a Scope still joins
-    -- fails the foreign key and stays.
-    foreach v_id in array v_candidates loop
-      begin
-        delete from gnomon.node n
-          where n.tenant_id = p_tenant_id and n.id = v_id
-            and not exists (select from gnomon.contribution c
-                            where c.tenant_id = n.tenant_id and c.node_id = n.id)
-            and not exists (select from gnomon.statement s
-                            where s.tenant_id = n.tenant_id and s.node_id = n.id)
-            and not exists (select from gnomon.bound_statement b
-                            where b.tenant_id = n.tenant_id and b.node_id = n.id)
-            and not exists (select from gnomon.version v
-                            where v.tenant_id = n.tenant_id and v.node_id = n.id)
-            and not exists (select from gnomon.edge e
-                            where e.tenant_id = n.tenant_id
-                              and (e.source_id = n.id or e.target_id = n.id));
-        if found then
-          v_bare := v_bare || v_id;
-        end if;
-      exception when foreign_key_violation then
-        null;
-      end;
-    end loop;
-
-    delete from gnomon.erasure_reach r
-      where r.tenant_id = p_tenant_id and r.written_in = pg_current_xact_id();
+    -- Each endpoint left with nothing, in whichever Scope it is, as Erase
+    -- Episode erases one.
+    v_bare := gnomon.erase_empty_nodes(p_tenant_id, v_candidates);
 
     erased_at := transaction_timestamp();
     erased_episodes := v_episodes;
+    -- Every Node of `v_nodes` is the named one or one of the named Scope,
+    -- which the caller can read.
     erased_nodes := array(select u.id from unnest(v_nodes || v_bare) u(id) order by u.id);
     erased_edges := v_seen_edges;
     return next;
@@ -1105,13 +1043,19 @@ create function gnomon.erase_node(p_tenant_id uuid, p_node_id uuid)
   )
   language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
   as $$
+  declare
+    v_scope text;
   begin
     perform gnomon.erasure_check_tenant(p_tenant_id);
-    if not exists (select from gnomon.node n
-                   where n.tenant_id = p_tenant_id and n.id = p_node_id) then
+    select n.scope into v_scope
+      from gnomon.node n
+      where n.tenant_id = p_tenant_id and n.id = p_node_id
+        and n.scope = any(gnomon.allowed_scopes());
+    if not found then
       raise exception using errcode = 'GNW01',
         message = format('Node %s is not visible to the caller', p_node_id);
     end if;
+    perform gnomon.refuse_read_only_scope(v_scope);
     return query select * from gnomon.erase_graph(p_tenant_id, null, array[p_node_id], '{}');
   end
   $$;
@@ -1126,16 +1070,21 @@ create function gnomon.erase_edge(p_tenant_id uuid, p_edge_id uuid)
   )
   language plpgsql volatile security definer set search_path = pg_catalog, pg_temp
   as $$
+  declare
+    v_scope text;
   begin
     perform gnomon.erasure_check_tenant(p_tenant_id);
-    -- The caller's own policy decides, not the reach an Erasure in the same
-    -- transaction might still hold.
-    if not exists (select from gnomon.edge e
-                   where e.tenant_id = p_tenant_id and e.id = p_edge_id
-                     and e.scope = any(gnomon.allowed_scopes())) then
+    -- The eraser's policies show every Scope of the Tenant, so a hidden Edge
+    -- is refused here as an absent one is.
+    select e.scope into v_scope
+      from gnomon.edge e
+      where e.tenant_id = p_tenant_id and e.id = p_edge_id
+        and e.scope = any(gnomon.allowed_scopes());
+    if not found then
       raise exception using errcode = 'GNW01',
         message = format('Edge %s is not visible to the caller', p_edge_id);
     end if;
+    perform gnomon.refuse_read_only_scope(v_scope);
     return query select * from gnomon.erase_graph(p_tenant_id, null, '{}', array[p_edge_id]);
   end
   $$;
@@ -1156,99 +1105,14 @@ create function gnomon.erase_scope(p_tenant_id uuid, p_scope text)
       raise exception using errcode = 'GNW01',
         message = format('Scope %s is not visible to the caller', p_scope);
     end if;
+    perform gnomon.refuse_read_only_scope(p_scope);
     return query select * from gnomon.erase_graph(p_tenant_id, p_scope, '{}', '{}');
   end
   $$;
 
--- The definer's reach into Scopes the caller cannot see, as on the other
--- tables of an Edge: it reads and deletes the token
--- rows of a listed Edge's Versions.
-create policy search_token_erasure_reach_read on gnomon.search_token
-  for select to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches_version(tenant_id, version_id));
-
-create policy search_token_erasure_reach_delete on gnomon.search_token
-  for delete to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches_version(tenant_id, version_id));
-
--- Whether a text of a Version of an Edge the running Erasure listed, its
--- properties' or its Sentence's, has hash `p_text_hash` in Scope `p_scope`.
-create function gnomon.erasure_reaches_text(p_tenant_id uuid, p_scope text, p_text_hash text)
-  returns boolean
-  language sql stable security invoker set search_path = pg_catalog, pg_temp
-  as $$
-    select exists (
-      select from gnomon.erasure_reach r
-      join gnomon.version v
-        on v.tenant_id = r.tenant_id and v.scope = p_scope and v.edge_id = r.id
-      left join gnomon.sentence s
-        on s.tenant_id = v.tenant_id and s.scope = v.scope and s.version_id = v.id
-      where r.tenant_id = p_tenant_id and r.written_in = pg_current_xact_id_if_assigned()
-        and (v.text_hash = p_text_hash or gnomon.sentence_text_hash(s.sentence) = p_text_hash)
-    )
-  $$;
-
--- The definer's reach into Scopes the caller cannot see, as on the other
--- tables of an Edge: it reads and deletes the
--- quantized rows of a listed Edge's Versions and the full vectors of their
--- texts, and reads the quantized rows that share those texts.
-create policy embedding_bit_erasure_reach_read on gnomon.embedding_bit
-  for select to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and (gnomon.erasure_reaches_version(tenant_id, version_id)
-              or gnomon.erasure_reaches_text(tenant_id, scope, text_hash)));
-
-create policy embedding_bit_erasure_reach_delete on gnomon.embedding_bit
-  for delete to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches_version(tenant_id, version_id));
-
-create policy embedding_erasure_reach_read on gnomon.embedding
-  for select to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches_text(tenant_id, scope, text_hash));
-
-create policy embedding_erasure_reach_delete on gnomon.embedding
-  for delete to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches_text(tenant_id, scope, text_hash));
-
--- Whether a Summary is of a Node the running Erasure listed.
-create function gnomon.erasure_reaches_summary(p_tenant_id uuid, p_summary_id uuid)
-  returns boolean
-  language sql stable security invoker set search_path = pg_catalog, pg_temp
-  as $$
-    select exists (
-      select from gnomon.summary s
-      where s.tenant_id = p_tenant_id and s.id = p_summary_id
-        and gnomon.erasure_reaches(p_tenant_id, array[s.node_id])
-    )
-  $$;
-
--- The definer's reach into Scopes the caller cannot see, for reading and
--- deleting only: a Summary of a listed Node, and its Citations (see the
--- header).
-create policy summary_erasure_reach_read on gnomon.summary for select to gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and gnomon.erasure_reaches(tenant_id, array[node_id]));
-
-create policy summary_erasure_reach_delete on gnomon.summary for delete to gnomon_definer
-  using (tenant_id = gnomon.tenant_id() and gnomon.erasure_reaches(tenant_id, array[node_id]));
-
-create policy summary_citation_erasure_reach_read on gnomon.summary_citation
-  for select to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches_summary(tenant_id, summary_id));
-
-create policy summary_citation_erasure_reach_delete on gnomon.summary_citation
-  for delete to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches_summary(tenant_id, summary_id));
-
 -- Deletes the Summaries `p_summaries` and the Communities `p_communities`
 -- with their Citations and members, their token rows and embedding rows
--- first, while the Erasure's reach still finds a Summary of another Scope.
+-- first.
 create function gnomon.erase_summaries_and_communities(
   p_tenant_id uuid,
   p_summaries uuid[],
@@ -1278,32 +1142,46 @@ create function gnomon.erase_summaries_and_communities(
   end
   $$;
 
--- The definer's reach into a Scope the caller cannot see (see the header).
-create policy node_name_erasure_reach_read on gnomon.node_name
-  for select to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches_text(tenant_id, scope, text_hash));
-
--- The definer's reach: the token rows of a Summary of a
--- Node the running Erasure listed, in any Scope of the Tenant.
-create policy derived_search_token_erasure_reach_read on gnomon.derived_search_token
-  for select to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches_summary(tenant_id, summary_id));
-
-create policy derived_search_token_erasure_reach_delete on gnomon.derived_search_token
-  for delete to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches_summary(tenant_id, summary_id));
-
-create policy derived_embedding_erasure_reach_read on gnomon.derived_embedding
-  for select to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches_summary(tenant_id, summary_id));
-
-create policy derived_embedding_erasure_reach_delete on gnomon.derived_embedding
-  for delete to gnomon_definer
-  using (tenant_id = gnomon.tenant_id()
-         and gnomon.erasure_reaches_summary(tenant_id, summary_id));
+-- The Episodes behind a Node (see the header): each Episode once, with its
+-- Scope, in order of ID. An invoker, under the caller's policies, so it
+-- names only Episodes the caller can read. The Node itself need not be one
+-- the caller can read, because an Edge of the caller's Scope may join a Node
+-- of another.
+create function gnomon.list_node_episodes(p_tenant_id uuid, p_node_id uuid)
+  returns table (episode_id uuid, scope text)
+  language sql stable security invoker set search_path = pg_catalog, pg_temp
+  as $$
+    with versioned as (
+      select p_node_id as id
+      union
+      select e.id from gnomon.edge e
+        where e.tenant_id = p_tenant_id and e.source_id = p_node_id
+      union
+      select e.id from gnomon.edge e
+        where e.tenant_id = p_tenant_id and e.target_id = p_node_id
+    ),
+    cited as (
+      select c.episode_id from gnomon.contribution c
+        where c.tenant_id = p_tenant_id and c.versioned_id in (select id from versioned)
+      union
+      select s.episode_id from gnomon.statement s
+        where s.tenant_id = p_tenant_id and s.versioned_id in (select id from versioned)
+      union
+      select b.episode_id from gnomon.bound_statement b
+        where b.tenant_id = p_tenant_id and b.versioned_id in (select id from versioned)
+      union
+      select c.episode_id from gnomon.citation c
+        join gnomon.version v on v.tenant_id = c.tenant_id and v.id = c.version_id
+        where c.tenant_id = p_tenant_id and v.versioned_id in (select id from versioned)
+      union
+      select c.episode_id from gnomon.summary_citation c
+        join gnomon.summary s on s.tenant_id = c.tenant_id and s.id = c.summary_id
+        where c.tenant_id = p_tenant_id and s.node_id = p_node_id
+    )
+    select e.id, e.scope
+    from cited x
+    join gnomon.episode e on e.tenant_id = p_tenant_id and e.id = x.episode_id
+    order by e.id
+  $$;
 
 insert into gnomon.schema_version (version, name) values (5, '0005_erasure');

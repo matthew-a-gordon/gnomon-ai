@@ -386,7 +386,7 @@ async fn build(texts: usize, name: &str) {
             .await
             .unwrap();
         store
-            .as_worker(tenant, gnomon::Scope::new(SCOPE))
+            .as_worker(tenant, gnomon::Scope::new(SCOPE), None)
             .register_kind(&gnomon::NewKind {
                 tenant: Some(tenant),
                 name: "company".into(),
@@ -399,7 +399,7 @@ async fn build(texts: usize, name: &str) {
             .unwrap();
         // The Edges' Episode.
         store
-            .as_worker(tenant, gnomon::Scope::new(SCOPE))
+            .as_worker(tenant, gnomon::Scope::new(SCOPE), None)
             .record_episode(&gnomon::NewEpisode {
                 tenant: Some(tenant),
                 scope: gnomon::Scope::new(SCOPE),
@@ -512,4 +512,87 @@ async fn embeddings(db: &TestDb, sql: &str, tenant: gnomon::TenantId) {
         }
         tx.commit().await.unwrap();
     }
+}
+
+/// The rows that make a Store large for the patch cases (#84): for each of
+/// `nodes` Nodes of the Scope, one Episode, two Contributions, two Versions
+/// (the first closed by the second) and a Citation of each Version. None of
+/// them is a Node a case writes. They are inserted as the superuser with
+/// `session_replication_role = replica`, so no trigger runs, and analyzed.
+const UNRELATED_ROWS_SQL: &str = "
+begin;
+set local session_replication_role = replica;
+create temporary table unrelated on commit drop as
+  select i,
+         md5('unrelated node ' || i)::uuid as node,
+         md5('unrelated episode ' || i)::uuid as episode,
+         timestamptz '2021-01-01 00:00:00+00' + (i % 1500) * interval '1 day' as reference_time,
+         timestamptz '2024-01-01 00:00:00+00' + (i % 50000) * interval '1 minute' as recorded_at,
+         timestamptz '2020-01-01 00:00:00+00' + (i % 2000) * interval '1 day' as valid_from
+  from generate_series(1, {{nodes}}) i;
+insert into gnomon.node (tenant_id, scope, id, kind)
+  select '{{tenant}}', '{{scope}}', node, 'node' from unrelated;
+insert into gnomon.episode (tenant_id, scope, id, content, reference_time, recorded_at)
+  select '{{tenant}}', '{{scope}}', episode, 'an unrelated Episode ' || i, reference_time,
+         recorded_at
+  from unrelated;
+insert into gnomon.contribution (tenant_id, scope, node_id, episode_id, property, value,
+                                 valid_from, valid_from_precision, valid_to, valid_to_precision,
+                                 recorded_at, episode_reference_time, episode_recorded_at)
+  select '{{tenant}}', '{{scope}}', u.node, u.episode, 'name',
+         to_jsonb('unrelated ' || u.i || ' ' || k), u.valid_from, 'instant', 'infinity', 'unknown',
+         u.recorded_at + k * interval '1 second', u.reference_time, u.recorded_at
+  from unrelated u, generate_series(1, 2) k;
+insert into gnomon.version (tenant_id, scope, id, node_id, props, valid_from,
+                            valid_from_precision, valid_to, valid_to_precision,
+                            recorded_from, recorded_to, merge_rule, closed_in)
+  select '{{tenant}}', '{{scope}}', md5('unrelated version ' || u.i || ' ' || k)::uuid, u.node,
+         jsonb_build_object('name', 'unrelated ' || u.i || ' ' || k),
+         u.valid_from, 'instant', 'infinity', 'unknown',
+         u.recorded_at + k * interval '1 second',
+         case k when 1 then u.recorded_at + 2 * interval '1 second' else 'infinity' end,
+         'recency', case k when 1 then '0'::xid8 end
+  from unrelated u, generate_series(1, 2) k;
+insert into gnomon.citation (tenant_id, scope, version_id, episode_id, property, recorded_at,
+                             episode_reference_time, episode_recorded_at)
+  select '{{tenant}}', '{{scope}}', md5('unrelated version ' || u.i || ' ' || k)::uuid,
+         u.episode, 'name', u.recorded_at + k * interval '1 second', u.reference_time,
+         u.recorded_at
+  from unrelated u, generate_series(1, 2) k;
+commit;
+analyze;
+";
+
+/// The tables [`add_unrelated_rows`] fills.
+pub const UNRELATED_TABLES: [&str; 5] = ["node", "episode", "contribution", "version", "citation"];
+
+/// Makes the Store of `db` large: [`UNRELATED_ROWS_SQL`] for `nodes` Nodes
+/// in `scope` of `tenant`. Returns the rows each of [`UNRELATED_TABLES`]
+/// then holds.
+pub async fn add_unrelated_rows(
+    db: &TestDb,
+    tenant: gnomon::TenantId,
+    scope: &str,
+    nodes: usize,
+) -> Vec<(&'static str, i64)> {
+    let admin = db.admin().await;
+    admin
+        .batch_execute(
+            &UNRELATED_ROWS_SQL
+                .replace("{{tenant}}", &tenant.0.to_string())
+                .replace("{{scope}}", scope)
+                .replace("{{nodes}}", &nodes.to_string()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("unrelated rows: {e:?}"));
+    let mut counts = vec![];
+    for table in UNRELATED_TABLES {
+        let n: i64 = admin
+            .query_typed(&format!("select count(*) from gnomon.{table}"), &[])
+            .await
+            .unwrap()[0]
+            .get(0);
+        counts.push((table, n));
+    }
+    counts
 }

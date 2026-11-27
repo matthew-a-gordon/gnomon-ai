@@ -311,7 +311,7 @@ async fn setup() -> (TestDb, Store, TenantId) {
         .await
         .unwrap();
     let tenant = support::tenant();
-    let caller = store.as_worker(tenant, Scope::new(SCOPES[0]));
+    let caller = store.as_worker(tenant, Scope::new(SCOPES[0]), None);
     caller
         .register_kind(&NewKind {
             tenant: Some(tenant),
@@ -638,7 +638,7 @@ async fn check(
                 }
                 let scope = Scope::new(SCOPES[case.episodes[e].scope]);
                 let done = store
-                    .as_worker(tenant, scope)
+                    .as_worker(tenant, scope, None)
                     .erase_episode(tenant, episodes[e])
                     .await
                     .unwrap();
@@ -652,7 +652,7 @@ async fn check(
                     continue;
                 }
                 store
-                    .as_worker(tenant, Scope::new(SCOPES[NODE_SCOPES[n]]))
+                    .as_worker(tenant, Scope::new(SCOPES[NODE_SCOPES[n]]), None)
                     .erase_node(tenant, nodes[n])
                     .await
                     .unwrap();
@@ -664,7 +664,7 @@ async fn check(
                     continue;
                 }
                 store
-                    .as_worker(tenant, Scope::new(SCOPES[EDGES[k].scope]))
+                    .as_worker(tenant, Scope::new(SCOPES[EDGES[k].scope]), None)
                     .erase_edge(tenant, edges[k])
                     .await
                     .unwrap();
@@ -677,7 +677,7 @@ async fn check(
                 }
                 let scope = Scope::new(SCOPES[s]);
                 store
-                    .as_worker(tenant, scope.clone())
+                    .as_worker(tenant, scope.clone(), None)
                     .erase_scope(tenant, &scope)
                     .await
                     .unwrap();

@@ -1,6 +1,7 @@
-# What runs here and when is recorded in ADR-0020. The three job names are the
-# required status checks of the ruleset on main, so renaming a job also means
-# changing the ruleset.
+# What runs here and when is recorded in ADR-0020. The job names test-pg17,
+# test-supabase and lint are the required status checks of the ruleset on main,
+# so renaming one also means changing the ruleset. The advisories job is not
+# required, because the RustSec database it reads changes daily.
 #
 # The workflow does not run on pushes to main, because the ruleset requires an
 # up-to-date branch and so the pull request run tests what lands there. It caches
@@ -93,4 +94,25 @@ jobs:
 
       - run: cargo fmt --all --check
 
+      # deny.toml holds the rules. This step runs before Clippy, which would
+      # rewrite an out-of-date Cargo.lock, and --locked fails on one. The
+      # action's commit pins the cargo-deny version.
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2, cargo-deny 0.21.0
+        with:
+          arguments: --all-features --locked
+          command: check bans licenses sources
+
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  advisories:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2, cargo-deny 0.21.0
+        with:
+          arguments: --all-features --locked
+          command: check advisories

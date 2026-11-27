@@ -804,9 +804,7 @@ async fn the_same_erasure_on_the_same_starting_data_always_removes_the_same_rows
     let tables: Vec<String> = gnomon_tables(&w.db.admin().await)
         .await
         .into_iter()
-        // No caller reads the list an Erasure of a Node, an Edge or a Scope
-        // keeps while it runs, which is empty once it returns.
-        .filter(|t| t != "schema_version" && t != "tenancy" && t != "erasure_reach")
+        .filter(|t| t != "schema_version" && t != "tenancy")
         // The BM25 counts change when the Erasure commits, not inside it.
         // `assert_only_removed` checks them against the token rows.
         .filter(|t| !support::erasure::BM25_COUNT_TABLES.contains(&t.as_str()))
@@ -890,7 +888,7 @@ async fn a_write_to_an_affected_node_waits_for_the_erasure_to_commit_and_one_to_
         let other = w.db.store().await;
         async move {
             other
-                .as_worker(tenant, Scope::new(SCOPE))
+                .as_worker(tenant, Scope::new(SCOPE), None)
                 .write_node(
                     tenant,
                     affected,
@@ -904,7 +902,7 @@ async fn a_write_to_an_affected_node_waits_for_the_erasure_to_commit_and_one_to_
         let other = w.db.store().await;
         async move {
             other
-                .as_worker(tenant, Scope::new(SCOPE))
+                .as_worker(tenant, Scope::new(SCOPE), None)
                 .create_edge(
                     &NewEdge {
                         tenant: Some(tenant),
@@ -922,7 +920,7 @@ async fn a_write_to_an_affected_node_waits_for_the_erasure_to_commit_and_one_to_
     // The unaffected write completes while the Erasure is still open.
     tokio::time::timeout(
         Duration::from_secs(10),
-        other.as_worker(tenant, Scope::new(SCOPE)).write_node(
+        other.as_worker(tenant, Scope::new(SCOPE), None).write_node(
             tenant,
             unaffected,
             &Patch::new(later, ValidTime::UNKNOWN, values(json!({ "name": "free" }))),
@@ -1173,7 +1171,7 @@ async fn a_node_an_edge_in_a_scope_the_caller_cannot_see_still_joins_stays_bare(
         .node("account", e, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
         .await;
     // A worker of another Scope joins a with an Edge of its own.
-    let billing = w.store.as_worker(w.tenant, Scope::new("billing"));
+    let billing = w.store.as_worker(w.tenant, Scope::new("billing"), None);
     let f = billing
         .record_episode(&NewEpisode {
             tenant: Some(w.tenant),

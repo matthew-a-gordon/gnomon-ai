@@ -4,16 +4,14 @@
 #
 #   crates/gnomon/tests/support/pooler/run-lane-4.sh [extra cargo nextest arguments]
 #
-# LANE4_POOLERS picks the runs, in order (default: all three):
+# LANE4_POOLERS picks the runs, in order (default: both):
 #
 #   pgbouncer         PgBouncer in front of a plain pgvector/pgvector:pg17
-#                     container, with unnamed statements, the Store's default.
-#   pgbouncer-named   The same PgBouncer, with GNOMON_TEST_NAMED_STATEMENTS=1.
-#                     PgBouncer 1.21 and later support named statements when
-#                     max_prepared_statements is above 0. It has defaulted to
-#                     200 since 1.24.
+#                     container.
 #   supavisor         The Supabase CLI local stack with only the database and
-#                     Supavisor running, with unnamed statements.
+#                     Supavisor running.
+#
+# The Store sends every statement unnamed, so both run at their defaults.
 #
 # In every run GNOMON_TEST_DATABASE_URL points at the pooler, so the Store and
 # every raw login-role connection go through it, and
@@ -40,7 +38,7 @@ workdir=crates/gnomon/tests/support/pooler
 pgbouncer_image=edoburu/pgbouncer@sha256:8638aa563607256d3c7440437534195f1066a92b68015d89ae9d6b935b444a6d
 cli=(npx --yes supabase@3.2.0)
 password=gnomon-test
-poolers=${LANE4_POOLERS:-pgbouncer pgbouncer-named supavisor}
+poolers=${LANE4_POOLERS:-pgbouncer supavisor}
 
 stop_pgbouncer() {
   docker rm -f "$name-pgbouncer" "$name-postgres" >/dev/null 2>&1 || true
@@ -154,30 +152,25 @@ for run in $poolers; do
   case $run in
     pgbouncer)
       start_pgbouncer
-      echo "== lane 4: the suite through PgBouncer, unnamed statements"
-      GNOMON_TEST_NAMED_STATEMENTS=0 cargo nextest run --workspace "$@"
-      ;;
-    pgbouncer-named)
-      start_pgbouncer
-      echo "== lane 4: the suite through PgBouncer, named statements"
-      GNOMON_TEST_NAMED_STATEMENTS=1 cargo nextest run --workspace "$@"
+      echo "== lane 4: the suite through PgBouncer"
+      cargo nextest run --workspace "$@"
       ;;
     supavisor)
       stop_pgbouncer
       start_supavisor
-      echo "== lane 4: the suite through Supavisor, unnamed statements"
+      echo "== lane 4: the suite through Supavisor"
       # The CLI stack's Postgres allows 100 connections, and Supavisor's own
       # metadata pool holds 27 of them. Each test database is a pool of its
       # own, with an auth_query connection beside its server connections,
       # and the harness connects straight to the server for setup, so a run
       # with nextest's default of one test per CPU exhausts the server. Eight
       # at a time stays near 60. Supavisor's settings stay at their defaults.
-      GNOMON_TEST_NAMED_STATEMENTS=0 cargo nextest run --workspace \
+      cargo nextest run --workspace \
         --test-threads "${LANE4_SUPAVISOR_TEST_THREADS:-8}" "$@"
       stop_supavisor
       ;;
     *)
-      echo "LANE4_POOLERS: unknown run $run; use pgbouncer, pgbouncer-named or supavisor" >&2
+      echo "LANE4_POOLERS: unknown run $run; use pgbouncer or supavisor" >&2
       exit 2
       ;;
   esac

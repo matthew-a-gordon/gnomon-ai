@@ -1,7 +1,7 @@
 //! Seam 1, the Erasure of a Node, an Edge or a Scope (ADR-0003, ADR-0005,
 //! ADR-0009, ADR-0013): each deletes what it names, every Edge that joins an
 //! erased Node whatever the Edge's Scope, and each endpoint those Edges leave
-//! with nothing in a Scope the caller sees, through the Rust core's Store API
+//! with nothing whatever its Scope, through the Rust core's Store API
 //! against real Postgres. The oracle test is erase_oracle.rs, and the
 //! adversarial cases live in sql_boundary.rs.
 
@@ -9,11 +9,11 @@ mod support;
 
 use std::time::Duration;
 
-use gnomon::{Bound, EndOfValidity, NewEdge, Patch, Scope, ValidTime};
+use gnomon::{Bound, EndOfValidity, EpisodeId, NewEdge, NodeId, Patch, Scope, ValidTime};
 use serde_json::json;
 use support::erasure::{
-    Residue, SCOPE, World, assert_no_residue, assert_only_removed, at, every_row,
-    tables_with_a_scope, values,
+    ALL_SCOPES, Residue, SCOPE, World, assert_no_residue, assert_only_removed, at, every_row,
+    every_row_tables, rows_of, tables_with_a_scope, values,
 };
 use tokio_postgres::types::Type;
 use uuid::Uuid;
@@ -108,7 +108,7 @@ async fn erasing_an_edge_removes_its_rows_and_its_bare_endpoint_and_nothing_else
 }
 
 #[tokio::test]
-async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_the_bare_endpoints_the_caller_sees()
+async fn erasing_a_node_erases_every_edge_that_joins_it_and_every_bare_endpoint_whatever_their_scope()
  {
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
@@ -162,7 +162,7 @@ async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_t
     )
     .await;
     // A bare company of hr, which the worker cannot see, joined to x by an
-    // Edge of hr.
+    // Edge of hr. It holds nothing else, so it goes with that Edge.
     let hr_bare = w.bare_node_in("hr", "company").await;
     let to_hr = w.edge_in("hr", x, hr_bare, hr, json!({ "share": 4 })).await;
     // A bare company of support, joined to x by an Edge of billing.
@@ -226,11 +226,11 @@ async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_t
     )
     .await;
     let mut gone = ids.clone();
-    gone.push(support_bare.0);
+    gone.extend([support_bare.0, hr_bare.0]);
     gone.extend(&versions);
     assert_only_removed(&admin, &before, &gone).await;
-    // The bare company of hr stays: the worker cannot see hr.
-    assert!(w.exists("node", hr_bare.0).await);
+    // The bare company of hr goes too, though the result does not name it.
+    assert!(!w.exists("node", hr_bare.0).await);
     assert!(w.exists("node", acme.0).await);
     assert!(w.exists("node", initech.0).await);
     assert!(w.exists("edge", untouched.0).await);
@@ -299,7 +299,8 @@ async fn erasing_a_scope_removes_every_row_in_it_and_every_edge_that_joins_its_n
         .unwrap();
 
     // Edges into billing from support and hr, and out of billing to a bare
-    // company of support and a bare company of hr, which the user cannot see.
+    // company of support and a bare company of hr, which the user cannot
+    // see. Both bare companies go with their Edges.
     let sa = w
         .node("account", s1, ValidTime::UNKNOWN, json!({ "plan": "pro" }))
         .await;
@@ -402,9 +403,12 @@ async fn erasing_a_scope_removes_every_row_in_it_and_every_edge_that_joins_its_n
     .await;
     // Nothing else outside billing changed: the rows that went are those
     // that name what the Erasure erased.
-    let gone = [episode_ids, node_ids, edge_ids, versions].concat();
+    let gone = [episode_ids, node_ids, edge_ids, versions, vec![hr_bare.0]].concat();
     assert_only_removed(&admin, &before, &gone).await;
-    assert!(w.exists("node", hr_bare.0).await, "hr's bare company stays");
+    assert!(
+        !w.exists("node", hr_bare.0).await,
+        "hr's bare company stays, though nothing but billing's Edge joined it"
+    );
     assert!(w.exists("node", ha.0).await);
     assert!(w.exists("edge", kept.0).await);
     assert_eq!(
@@ -451,7 +455,7 @@ async fn writes_to_what_an_erasure_erases_wait_for_it_and_writes_elsewhere_do_no
         let other = w.db.store().await;
         async move {
             other
-                .as_worker(tenant, Scope::new("billing"))
+                .as_worker(tenant, Scope::new("billing"), None)
                 .write_node(
                     tenant,
                     acme,
@@ -547,9 +551,10 @@ async fn an_episode_recorded_in_a_scope_while_its_erasure_waits_is_erased_on_the
         .await;
 
     // A write to Acme holds Acme's lock, so the Erasure waits there after it
-    // has locked billing's Episodes.
-    let mut client = w.db.login().await;
-    let holder = w.raw(&mut client).await;
+    // has locked billing's Episodes. The operator takes the lock a write
+    // would, because no caller may run the write path's helpers.
+    let mut client = w.db.admin().await;
+    let holder = client.transaction().await.unwrap();
     holder
         .query_typed(
             "select pg_advisory_xact_lock(gnomon.node_lock_key($1, $2))",
@@ -562,7 +567,7 @@ async fn an_episode_recorded_in_a_scope_while_its_erasure_waits_is_erased_on_the
         let other = w.db.store().await;
         async move {
             other
-                .as_worker(tenant, Scope::new("billing"))
+                .as_worker(tenant, Scope::new("billing"), None)
                 .erase_scope(tenant, &Scope::new("billing"))
                 .await
         }
@@ -659,7 +664,8 @@ async fn without_the_grant_no_erasure_runs_and_what_is_erased_cannot_be_erased_a
 }
 
 #[tokio::test]
-async fn erasing_an_edge_leaves_a_bare_endpoint_in_a_scope_the_caller_cannot_see() {
+async fn erasing_an_edge_erases_a_bare_endpoint_in_a_scope_the_caller_cannot_see_and_names_only_the_one_it_sees()
+ {
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
     // Two bare endpoints: an account of support, and a company of hr, which
@@ -673,15 +679,348 @@ async fn erasing_an_edge_leaves_a_bare_endpoint_in_a_scope_the_caller_cannot_see
     let erasure = w.erase_edge(edge).await;
 
     assert_eq!(erasure.erased_edges, vec![edge]);
+    // Both endpoints held nothing but the Edge, so both go, whatever their
+    // Scope (ADR-0007). The result names only the one the worker sees.
     assert_eq!(
         erasure.erased_nodes,
         vec![account],
-        "only the visible one goes"
+        "the result names only the Node the caller sees"
     );
     assert!(!w.exists("edge", edge.0).await);
     assert!(!w.exists("node", account.0).await);
     assert!(
-        w.exists("node", hr_bare.0).await,
-        "a bare Node of a Scope the caller cannot see stays"
+        !w.exists("node", hr_bare.0).await,
+        "a bare Node of a Scope the caller cannot see is erased too"
+    );
+}
+
+/// What an Erasure is asked to erase.
+enum Request {
+    Episode(Uuid),
+    Node(Uuid),
+    Edge(Uuid),
+    Scope(&'static str),
+}
+
+/// Runs `request` as a user who reads and writes `scopes`, in a transaction
+/// that rolls back, and returns every row left after it, read past RLS in
+/// the same transaction, with the Nodes the result names.
+async fn rows_after(w: &World, scopes: &[&str], request: &Request) -> (Vec<String>, Vec<Uuid>) {
+    let mut admin = w.db.admin().await;
+    let tables = every_row_tables(&admin).await;
+    let tx = admin.transaction().await.unwrap();
+    tx.batch_execute("set local role authenticated")
+        .await
+        .unwrap();
+    let claims = json!({
+        "role": "authenticated",
+        "app_metadata": { "tenant_id": w.tenant.0.to_string(), "scopes": scopes }
+    })
+    .to_string();
+    tx.query_typed(
+        "select set_config('request.jwt.claims', $1, true)",
+        &[(&claims, Type::TEXT)],
+    )
+    .await
+    .unwrap();
+    let t = &w.tenant.0;
+    let (function, id, scope) = match request {
+        Request::Episode(id) => ("erase_episode", Some(id), None),
+        Request::Node(id) => ("erase_node", Some(id), None),
+        Request::Edge(id) => ("erase_edge", Some(id), None),
+        Request::Scope(scope) => ("erase_scope", None, Some(scope)),
+    };
+    let sql = format!("select erased_nodes from gnomon.{function}($1, $2)");
+    let rows = match (id, scope) {
+        (Some(id), _) => {
+            tx.query_typed(&sql, &[(t, Type::UUID), (id, Type::UUID)])
+                .await
+        }
+        (_, scope) => {
+            tx.query_typed(&sql, &[(t, Type::UUID), (scope.unwrap(), Type::TEXT)])
+                .await
+        }
+    }
+    .unwrap();
+    let named: Vec<Uuid> = rows[0].get(0);
+    tx.batch_execute("reset role").await.unwrap();
+    let left = rows_of(&tx, &tables).await;
+    tx.rollback().await.unwrap();
+    (left, named)
+}
+
+#[tokio::test]
+async fn callers_with_different_readable_scopes_remove_the_same_rows_with_the_same_request() {
+    let w = World::new().await;
+    w.db.grant_erasure("authenticated").await;
+    let e = w.episode(at(2024, 1, 1), None).await;
+    let billing = w
+        .episode_in("billing", at(2024, 1, 2), "billing's Episode")
+        .await;
+    let hr = w.episode_in("hr", at(2024, 1, 3), "hr's Episode").await;
+    // x, an account of support that e wrote, joined to a company of billing
+    // by an Edge of billing, and to a bare company of hr by an Edge of hr.
+    let x = w
+        .node("account", e, ValidTime::UNKNOWN, json!({ "plan": "basic" }))
+        .await;
+    let acme = w
+        .node_in("billing", "company", billing, json!({ "name": "Acme" }))
+        .await;
+    w.edge_in("billing", x, acme, billing, json!({ "share": 3 }))
+        .await;
+    let hr_bare = w.bare_node_in("hr", "company").await;
+    w.edge_in("hr", x, hr_bare, hr, json!({ "share": 4 })).await;
+    // An Edge of support that only e states, to a bare company of billing:
+    // erasing e, the Edge or x leaves that company with nothing.
+    let billing_bare = w.bare_node_in("billing", "company").await;
+    let edge = w
+        .edge_in(SCOPE, x, billing_bare, e, json!({ "share": 5 }))
+        .await;
+
+    for (request, what) in [
+        (Request::Episode(e.0), "Erase Episode"),
+        (Request::Node(x.0), "Erase Node"),
+        (Request::Edge(edge.0), "Erase Edge"),
+        (Request::Scope(SCOPE), "Erase Scope"),
+    ] {
+        let (narrow, narrow_named) = rows_after(&w, &[SCOPE], &request).await;
+        let (wide, wide_named) = rows_after(&w, ALL_SCOPES, &request).await;
+        assert!(
+            narrow == wide,
+            "{what} removed other rows for a caller of support alone than for a caller of \
+             every Scope"
+        );
+        // The bare company of billing goes in each, and only the caller who
+        // reads billing is told.
+        let gone = |rows: &[String], id: Uuid| !rows.iter().any(|r| r.contains(&id.to_string()));
+        assert!(
+            gone(&narrow, billing_bare.0),
+            "{what} left billing's bare company"
+        );
+        assert!(
+            !narrow_named.contains(&billing_bare.0),
+            "{what} named a Node of billing to a caller of support: {narrow_named:?}"
+        );
+        assert!(
+            wide_named.contains(&billing_bare.0),
+            "{what} did not name billing's bare company to a caller who reads billing: \
+             {wide_named:?}"
+        );
+    }
+}
+
+/// The Episodes the list names, in its order, with their Scopes.
+async fn episodes_behind(
+    caller: gnomon::Caller<'_>,
+    w: &World,
+    node: NodeId,
+) -> Vec<(EpisodeId, String)> {
+    caller
+        .list_node_episodes(w.tenant, node)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.episode, e.scope.as_str().to_owned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_episodes_behind_a_node_are_each_one_its_node_edges_and_summaries_cite_and_none_the_caller_cannot_read()
+ {
+    let w = World::new().await;
+    let support = |day: u32, what: &'static str| w.episode_saying(at(2024, 1, day), None, what);
+    // Each Episode reaches x one way.
+    let value = support(1, "x's plan").await;
+    let replacing = support(2, "x's new plan").await;
+    let ending = support(3, "x's plan ends").await;
+    let bounding = support(4, "when x's plan began").await;
+    let joining = support(5, "x owns part of Initech").await;
+    let summarizing = support(6, "a summary of x").await;
+    let edge_ending = support(10, "x's share of Initech ends").await;
+    let edge_bounding = support(11, "when x's share of Initech began").await;
+    let first_summarizing = support(12, "the first summary of x").await;
+    // These reach x only through what the list leaves out.
+    let grouping = support(7, "a community holding x").await;
+    let initech_own = support(8, "Initech's name").await;
+    let _unrelated = support(9, "nothing about x").await;
+
+    let x = w
+        .node(
+            "account",
+            value,
+            ValidTime::UNKNOWN,
+            json!({ "plan": "basic" }),
+        )
+        .await;
+    // `replacing` closes the Version `value` alone supplied.
+    w.write(x, replacing, ValidTime::UNKNOWN, json!({ "plan": "gold" }))
+        .await;
+    w.caller()
+        .end_node_validity(
+            w.tenant,
+            x,
+            &EndOfValidity {
+                episode: ending,
+                at: Bound::At(at(2030, 1, 1)),
+            },
+        )
+        .await
+        .unwrap();
+    let current = w.read(x, at(2024, 6, 1)).await.unwrap();
+    w.caller()
+        .state_bound(
+            w.tenant,
+            x,
+            &gnomon::BoundStatement {
+                episode: bounding,
+                version: current.id,
+                side: gnomon::BoundSide::Start,
+                bound: Bound::At(at(2020, 1, 1)),
+            },
+        )
+        .await
+        .unwrap();
+    let initech = w
+        .node(
+            "company",
+            initech_own,
+            ValidTime::UNKNOWN,
+            json!({ "name": "Initech" }),
+        )
+        .await;
+    let to_initech = w
+        .edge(
+            x,
+            initech,
+            joining,
+            ValidTime::UNKNOWN,
+            json!({ "share": 7 }),
+        )
+        .await;
+    // A bound and an End of validity of the Edge, each from an Episode that
+    // states nothing else.
+    let edge_version = w.current_edge_version(to_initech, at(2024, 6, 1)).await;
+    w.caller()
+        .state_edge_bound(
+            w.tenant,
+            to_initech,
+            &gnomon::BoundStatement {
+                episode: edge_bounding,
+                version: edge_version,
+                side: gnomon::BoundSide::Start,
+                bound: Bound::At(at(2020, 1, 1)),
+            },
+        )
+        .await
+        .unwrap();
+    w.caller()
+        .end_edge_validity(
+            w.tenant,
+            to_initech,
+            &EndOfValidity {
+                episode: edge_ending,
+                at: Bound::At(at(2031, 1, 1)),
+            },
+        )
+        .await
+        .unwrap();
+    // A Summary of x, then the one that replaces it, which closes the first.
+    let cite = |e: EpisodeId| vec![gnomon::DerivedCitation::of(e)];
+    for (content, episode) in [
+        ("x is an account", first_summarizing),
+        ("x is a gold account", summarizing),
+    ] {
+        w.seeing(ALL_SCOPES)
+            .write_summary(
+                w.tenant,
+                &gnomon::NewSummary {
+                    scope: Scope::new(SCOPE),
+                    node: x,
+                    content: content.into(),
+                    as_of_valid: at(2024, 6, 1),
+                    citations: cite(episode),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    w.seeing(ALL_SCOPES)
+        .write_community(
+            w.tenant,
+            &gnomon::NewCommunity {
+                scope: Scope::new(SCOPE),
+                replaces: vec![],
+                members: vec![x, initech],
+                content: "x and Initech".into(),
+                as_of_valid: at(2024, 6, 1),
+                citations: cite(grouping),
+            },
+        )
+        .await
+        .unwrap();
+    // billing, which the support worker cannot read: an Edge from x and a
+    // Summary of x, and the Episodes behind billing's own company.
+    let billing_joining = w
+        .episode_in("billing", at(2024, 2, 1), "x owns part of Acme")
+        .await;
+    let billing_summarizing = w
+        .episode_in("billing", at(2024, 2, 2), "billing's summary of x")
+        .await;
+    let acme_own = w.episode_in("billing", at(2024, 2, 3), "Acme's name").await;
+    let acme = w
+        .node_in("billing", "company", acme_own, json!({ "name": "Acme" }))
+        .await;
+    w.edge_in("billing", x, acme, billing_joining, json!({ "share": 3 }))
+        .await;
+    w.seeing(ALL_SCOPES)
+        .write_summary(
+            w.tenant,
+            &gnomon::NewSummary {
+                scope: Scope::new("billing"),
+                node: x,
+                content: "billing's x".into(),
+                as_of_valid: at(2024, 6, 1),
+                citations: cite(billing_summarizing),
+            },
+        )
+        .await
+        .unwrap();
+
+    let in_support: Vec<(EpisodeId, String)> = [
+        value,
+        replacing,
+        ending,
+        bounding,
+        joining,
+        edge_ending,
+        edge_bounding,
+        first_summarizing,
+        summarizing,
+    ]
+    .into_iter()
+    .map(|e| (e, SCOPE.to_owned()))
+    .collect();
+    let in_billing: Vec<(EpisodeId, String)> = [billing_joining, billing_summarizing]
+        .into_iter()
+        .map(|e| (e, "billing".to_owned()))
+        .collect();
+    let sorted = |mut v: Vec<(EpisodeId, String)>| {
+        v.sort_by_key(|(e, _)| e.0);
+        v
+    };
+    // The support worker reads support alone, and is told nothing of billing.
+    assert_eq!(
+        episodes_behind(w.caller(), &w, x).await,
+        sorted(in_support.clone())
+    );
+    // billing's worker cannot read x, and lists what billing holds of it.
+    assert_eq!(
+        episodes_behind(w.worker_in("billing"), &w, x).await,
+        sorted(in_billing.clone())
+    );
+    // A user of both reads each Episode once.
+    assert_eq!(
+        episodes_behind(w.seeing(&[SCOPE, "billing"]), &w, x).await,
+        sorted([in_support, in_billing].concat())
     );
 }

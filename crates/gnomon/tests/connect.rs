@@ -21,7 +21,8 @@ async fn by_default_the_store_refuses_a_server_whose_certificate_it_does_not_tru
     )
     .await;
 
-    match Store::connect(&db.login_url_through(proxy), &ConnectOptions::default()).await {
+    match support::connect_and_check(&db.login_url_through(proxy), &ConnectOptions::default()).await
+    {
         Err(e) => assert!(
             support::chain(&e).contains("UnknownIssuer"),
             "expected an untrusted certificate, got {}",
@@ -42,7 +43,7 @@ async fn the_store_connects_over_tls_to_a_server_whose_certificate_chains_to_a_t
     .await;
     let options = ConnectOptions::default().tls(Tls::trust_pem(ca.pem.as_bytes()).unwrap());
 
-    let store = Store::connect(&db.login_url_through(proxy), &options)
+    let store = support::connect_and_check(&db.login_url_through(proxy), &options)
         .await
         .expect("the Store trusts the CA it was given");
     let t = support::tenant();
@@ -64,7 +65,7 @@ async fn the_store_refuses_a_trusted_certificate_that_names_another_host() {
     .await;
     let options = ConnectOptions::default().tls(Tls::trust_pem(ca.pem.as_bytes()).unwrap());
 
-    match Store::connect(&db.login_url_through(proxy), &options).await {
+    match support::connect_and_check(&db.login_url_through(proxy), &options).await {
         Err(e) => assert!(
             support::chain(&e).contains("not valid for name"),
             "expected a certificate for another name, got {}",
@@ -79,7 +80,8 @@ async fn by_default_the_store_never_falls_back_to_plain_text_when_the_server_ref
     let db = TestDb::migrated().await;
     let proxy = tls::proxy(db.server_addr().await, Answer::Refuse).await;
 
-    match Store::connect(&db.login_url_through(proxy), &ConnectOptions::default()).await {
+    match support::connect_and_check(&db.login_url_through(proxy), &ConnectOptions::default()).await
+    {
         Err(e) => assert!(
             support::chain(&e).contains("TLS"),
             "expected a refused TLS request, got {}",
@@ -112,7 +114,7 @@ async fn turning_certificate_verification_off_takes_an_explicit_setting() {
     .await;
 
     let options = ConnectOptions::default().tls(Tls::unverified());
-    Store::connect(&db.login_url_through(proxy), &options)
+    support::connect_and_check(&db.login_url_through(proxy), &options)
         .await
         .expect("an unverified certificate is accepted when verification is turned off");
 }
@@ -121,7 +123,57 @@ async fn turning_certificate_verification_off_takes_an_explicit_setting() {
 async fn plain_text_takes_an_explicit_setting() {
     let db = TestDb::migrated().await;
     let options = ConnectOptions::default().tls(Tls::plaintext());
-    Store::connect(&db.login_url(), &options)
+    support::connect_and_check(&db.login_url(), &options)
         .await
         .expect("the Store connects in plain text when TLS is turned off");
+}
+
+#[tokio::test]
+async fn sslmode_verify_full_in_the_connection_string_is_accepted_and_still_verifies_the_host() {
+    let db = TestDb::migrated().await;
+    let ca = TestCa::new();
+    let options = ConnectOptions::default().tls(Tls::trust_pem(ca.pem.as_bytes()).unwrap());
+
+    let proxy = tls::proxy(
+        db.server_addr().await,
+        Answer::Tls(ca.server_cert(&["127.0.0.1"])),
+    )
+    .await;
+    let url = format!("{} sslmode=verify-full", db.login_url_through(proxy));
+    support::connect_and_check(&url, &options)
+        .await
+        .expect("sslmode=verify-full asks for what the Store does");
+
+    let proxy = tls::proxy(
+        db.server_addr().await,
+        Answer::Tls(ca.server_cert(&["db.example.test"])),
+    )
+    .await;
+    let url = format!("{} sslmode=verify-full", db.login_url_through(proxy));
+    match support::connect_and_check(&url, &options).await {
+        Err(e) => assert!(
+            support::chain(&e).contains("not valid for name"),
+            "expected a certificate for another name, got {}",
+            support::chain(&e)
+        ),
+        Ok(_) => panic!("sslmode=verify-full accepted a certificate issued for another host"),
+    }
+}
+
+#[tokio::test]
+async fn sslmode_verify_full_contradicts_turning_verification_or_tls_off() {
+    let db = TestDb::migrated().await;
+    let url = format!("{} sslmode=verify-full", db.login_url());
+    for (tls, setting) in [
+        (Tls::unverified(), "Tls::unverified()"),
+        (Tls::plaintext(), "Tls::plaintext()"),
+    ] {
+        match Store::connect(&url, &ConnectOptions::default().tls(tls)).await {
+            Err(gnomon::Error::InvalidConnection(m)) => {
+                assert!(m.contains("verify-full") && m.contains(setting), "{m}")
+            }
+            Err(other) => panic!("expected the settings to be refused, got {other:?}"),
+            Ok(_) => panic!("sslmode=verify-full was accepted with {setting}"),
+        }
+    }
 }

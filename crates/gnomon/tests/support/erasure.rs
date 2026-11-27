@@ -88,7 +88,7 @@ impl World {
     }
 
     pub fn caller(&self) -> gnomon::Caller<'_> {
-        self.store.as_worker(self.tenant, Scope::new(SCOPE))
+        self.store.as_worker(self.tenant, Scope::new(SCOPE), None)
     }
 
     pub fn claims(&self) -> String {
@@ -219,7 +219,7 @@ impl World {
 
     /// The worker of a Scope, which may erase in that Scope only.
     pub fn worker_in(&self, scope: &str) -> gnomon::Caller<'_> {
-        self.store.as_worker(self.tenant, Scope::new(scope))
+        self.store.as_worker(self.tenant, Scope::new(scope), None)
     }
 
     pub async fn episode_in(
@@ -900,7 +900,12 @@ pub async fn assert_search_counts_match_the_token_rows(admin: &Client) {
 /// checks against the token rows instead, and the full vectors, which it
 /// checks with [`assert_no_unused_full_vector`].
 pub async fn every_row(admin: &Client) -> Vec<String> {
-    let tables: Vec<String> = gnomon_tables(admin)
+    rows_of(admin, &every_row_tables(admin).await).await
+}
+
+/// The tables [`every_row`] reads.
+pub async fn every_row_tables(admin: &Client) -> Vec<String> {
+    gnomon_tables(admin)
         .await
         .into_iter()
         .filter(|t| {
@@ -909,8 +914,7 @@ pub async fn every_row(admin: &Client) -> Vec<String> {
                 && t != FULL_VECTORS
                 && !BM25_COUNT_TABLES.contains(&t.as_str())
         })
-        .collect();
-    rows_of(admin, &tables).await
+        .collect()
 }
 
 /// Checks that an Erasure removed exactly the rows that name one of `ids` in
