@@ -225,17 +225,31 @@ pub fn target_from_env() -> Target {
     }
 }
 
+/// A command that runs the Supabase CLI: the installed one that
+/// `GNOMON_TEST_SUPABASE_CLI` names, or else the pinned one through `npx`.
+/// Whoever sets the variable installs the pinned version, as CI does.
+fn supabase_cli() -> Command {
+    match std::env::var_os("GNOMON_TEST_SUPABASE_CLI") {
+        Some(installed) if !installed.is_empty() => Command::new(installed),
+        _ => {
+            let mut npx = Command::new("npx");
+            npx.args(["--yes", SUPABASE_CLI]);
+            npx
+        }
+    }
+}
+
 /// Runs `supabase migration up` with the pinned CLI, applying the
 /// migrations in `workdir/supabase/migrations` that the database at `url`
 /// has not applied yet. Returns the CLI's output.
 pub fn supabase_migration_up(workdir: &Path, url: &str) -> Result<String, String> {
-    let run = Command::new("npx")
-        .args(["--yes", SUPABASE_CLI, "migration", "up", "--yes"])
+    let run = supabase_cli()
+        .args(["migration", "up", "--yes"])
         .arg("--workdir")
         .arg(workdir)
         .arg(format!("--remote={url}"))
         .output()
-        .expect("npx runs; see docs/testing.md");
+        .expect("the Supabase CLI runs; see docs/testing.md");
     let output = format!(
         "{}{}",
         String::from_utf8_lossy(&run.stdout),

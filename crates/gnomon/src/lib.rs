@@ -29,7 +29,7 @@ pub use edge::{
 };
 pub use gap::{Gap, GapCursor, GapPage};
 pub use kind::{
-    Kind, KindOf, MergeRule, NewKind, DIFFERENT_FROM_KIND, ROOT_EDGE_KIND, ROOT_NODE_KIND,
+    DIFFERENT_FROM_KIND, Kind, KindOf, MergeRule, NewKind, ROOT_EDGE_KIND, ROOT_NODE_KIND,
     SAME_AS_KIND,
 };
 pub use node::{

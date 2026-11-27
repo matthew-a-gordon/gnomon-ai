@@ -9,9 +9,9 @@ mod support;
 use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
     AsOf, Bound, BoundChange, BoundSide, BoundStatement, EpisodeId, NewEpisode, NewNode, NodeId,
-    NodeVersion, Patch, Precision, Scope, Store, TenantId, ValidTime, ROOT_NODE_KIND,
+    NodeVersion, Patch, Precision, ROOT_NODE_KIND, Scope, Store, TenantId, ValidTime,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use support::TestDb;
 
 const SCOPE: &str = "support";
@@ -206,8 +206,8 @@ async fn a_bound_at_the_precision_of_an_instant_is_never_uncertain() {
 }
 
 #[tokio::test]
-async fn stating_an_unknown_start_is_a_refinement_that_keeps_the_text_hash_and_the_old_version_readable(
-) {
+async fn stating_an_unknown_start_is_a_refinement_that_keeps_the_text_hash_and_the_old_version_readable()
+ {
     let w = World::new().await;
     let (node, first) = w.node("Acme", ValidTime::UNKNOWN).await;
     let earlier = w

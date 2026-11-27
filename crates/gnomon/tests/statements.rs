@@ -12,7 +12,7 @@ use gnomon::{
     NewKind, NewNode, NodeId, NodeVersion, Patch, Retraction, Scope, StatementKind, Store,
     TenantId, ValidTime, WriteOutcome, WriteStatus,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use support::TestDb;
 use tokio_postgres::types::Type;
 
@@ -287,8 +287,8 @@ impl World {
 }
 
 #[tokio::test]
-async fn a_correction_replaces_the_earlier_version_for_the_same_valid_time_and_it_stays_readable_before(
-) {
+async fn a_correction_replaces_the_earlier_version_for_the_same_valid_time_and_it_stays_readable_before()
+ {
     let w = World::new().await;
     let first = w.episode(at(2024, 1, 1), None).await;
     let vt = ValidTime::between(at(2024, 1, 1), at(2024, 6, 1));
@@ -321,8 +321,8 @@ async fn a_correction_replaces_the_earlier_version_for_the_same_valid_time_and_i
 }
 
 #[tokio::test]
-async fn an_end_of_validity_closes_what_the_version_stated_at_the_stated_valid_time_and_it_stays_current_before(
-) {
+async fn an_end_of_validity_closes_what_the_version_stated_at_the_stated_valid_time_and_it_stays_current_before()
+ {
     let w = World::new().await;
     let first = w.episode(at(2024, 1, 1), None).await;
     let node = w
@@ -424,9 +424,11 @@ async fn each_of_the_three_records_the_episode_that_made_it() {
         .list_citations(w.tenant, corrected.opened[0])
         .await
         .unwrap();
-    assert!(cited
-        .iter()
-        .any(|c| c.episode == correcting && c.property == "plan"));
+    assert!(
+        cited
+            .iter()
+            .any(|c| c.episode == correcting && c.property == "plan")
+    );
 }
 
 #[tokio::test]
@@ -522,8 +524,8 @@ async fn with_ranked_merge_on_a_lower_authority_statement_does_not_end_a_higher_
 }
 
 #[tokio::test]
-async fn with_ranked_merge_on_a_lower_authority_end_of_validity_of_an_edge_loses_where_a_higher_authority_says_it_holds(
-) {
+async fn with_ranked_merge_on_a_lower_authority_end_of_validity_of_an_edge_loses_where_a_higher_authority_says_it_holds()
+ {
     let w = World::new().await;
     w.set_rule("owns", MergeRule::Ranked).await;
     let high = w.episode(at(2024, 1, 1), Some(10)).await;
@@ -587,8 +589,8 @@ async fn with_ranked_merge_on_a_lower_authority_end_of_validity_of_an_edge_loses
 }
 
 #[tokio::test]
-async fn a_held_statement_is_found_by_the_episodes_rows_and_takes_effect_when_the_higher_authority_episode_is_erased(
-) {
+async fn a_held_statement_is_found_by_the_episodes_rows_and_takes_effect_when_the_higher_authority_episode_is_erased()
+ {
     let w = World::new().await;
     w.set_rule("account", MergeRule::Ranked).await;
     let (node, low, _) = held_end(&w).await;
@@ -670,12 +672,13 @@ async fn deleting_the_lower_authority_episodes_rows_removes_the_held_statement()
 
     // Delete what the Episode owns, as Retract Episode will.
     w.erase_rows_of(low).await;
-    assert!(w
-        .caller()
-        .list_node_statements(w.tenant, node)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        w.caller()
+            .list_node_statements(w.tenant, node)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         w.count(
             "select count(*) from gnomon.contribution where episode_id = $1",

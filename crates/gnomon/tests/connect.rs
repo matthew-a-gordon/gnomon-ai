@@ -8,8 +8,8 @@
 mod support;
 
 use gnomon::{ConnectOptions, Store, Tls};
-use support::tls::{self, Answer, TestCa};
 use support::TestDb;
+use support::tls::{self, Answer, TestCa};
 
 #[tokio::test]
 async fn by_default_the_store_refuses_a_server_whose_certificate_it_does_not_trust() {

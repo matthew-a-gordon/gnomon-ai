@@ -255,7 +255,7 @@ async fn check_schema(
             return Err(Error::SchemaVersion {
                 expected: SCHEMA_VERSION,
                 found: None,
-            })
+            });
         }
         Err(e) => return Err(e.into()),
     };

@@ -13,7 +13,7 @@ use gnomon::{
     AsOf, EpisodeId, Error, KindOf, NewEpisode, NewKind, NewNode, NodeId, Patch, Scope, Store,
     TenantId, ValidTime, VersionId,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use support::TestDb;
 
 async fn store(db: &TestDb) -> Store {

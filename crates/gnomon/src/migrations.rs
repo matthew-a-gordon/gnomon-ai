@@ -279,7 +279,7 @@ fn export_set(
                 return Err(ExportError::Duplicate {
                     name: m.name,
                     files: found.into_iter().cloned().collect(),
-                })
+                });
             }
         }
     }
@@ -335,7 +335,7 @@ fn export_set(
     Ok(written)
 }
 
-fn io_error_at(path: &Path) -> impl FnOnce(std::io::Error) -> ExportError {
+fn io_error_at(path: &Path) -> impl FnOnce(std::io::Error) -> ExportError + use<> {
     let path = path.to_owned();
     move |source| ExportError::Io { path, source }
 }
@@ -351,7 +351,7 @@ impl Files {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Files { names: Vec::new() })
+                return Ok(Files { names: Vec::new() });
             }
             Err(e) => return Err(io_error_at(dir)(e)),
         };
@@ -485,7 +485,7 @@ impl Target {
 /// Alembic revision files: writing gnomon's, and reading enough of any
 /// revision to find the chain's head.
 mod alembic {
-    use super::{io_error_at, ExportError, Files, Migration};
+    use super::{ExportError, Files, Migration, io_error_at};
     use std::path::Path;
 
     pub(super) fn revision_id(m: &Migration) -> String {

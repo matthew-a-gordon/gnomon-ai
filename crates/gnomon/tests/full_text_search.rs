@@ -8,9 +8,9 @@ mod support;
 use gnomon::{AsOf, Caller, FullTextCandidate, KindOf, NewKind, ValidTime, Versioned};
 use gnomon::{NewEdge, NewNode, Patch, Scope};
 use serde_json::json;
-use support::erasure::{assert_search_counts_match_the_token_rows, at, values, World, SCOPE};
-use tokio_postgres::types::Type;
+use support::erasure::{SCOPE, World, assert_search_counts_match_the_token_rows, at, values};
 use tokio_postgres::Client;
+use tokio_postgres::types::Type;
 
 /// Registers the Kinds these tests search, beside the `account`, `company`
 /// and `owns` of the shared World:
@@ -646,8 +646,8 @@ async fn erasing_an_episode_removes_its_words_and_their_counts() {
 }
 
 #[tokio::test]
-async fn erasing_a_node_lowers_the_counts_of_a_scope_the_caller_cannot_see_and_an_erased_scope_leaves_none(
-) {
+async fn erasing_a_node_lowers_the_counts_of_a_scope_the_caller_cannot_see_and_an_erased_scope_leaves_none()
+ {
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
     let acct = w

@@ -9,7 +9,7 @@ use gnomon::{
     NewNode, NodeId, NodeVersion, Patch, Scope, StageOutcome, StageRecord, StageUsage, StageWrite,
     Store, TenantId, ValidTime, VersionId,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, GenericClient};
 use uuid::Uuid;

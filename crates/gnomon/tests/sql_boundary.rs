@@ -10,8 +10,8 @@ mod support;
 use chrono::{TimeZone, Utc};
 use gnomon::{EpisodeId, NewEpisode, Scope, Store, TenantId};
 use serde_json::json;
-use support::erasure::BM25_COUNT_TABLES;
 use support::TestDb;
+use support::erasure::BM25_COUNT_TABLES;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Transaction};
@@ -642,8 +642,7 @@ async fn the_caller_roles_cannot_bypass_rls() {
 // Kind registration, a definer function (ADR-0009). The migrations grant it
 // to no one, so the deployment decides who may register Kinds.
 
-const REGISTER_PERSON: &str =
-    "select gnomon.register_kind($1, 'person', 'node', null, '{\"properties\": {\"role\": {\"type\": \"string\"}}}', '{}', null, null)";
+const REGISTER_PERSON: &str = "select gnomon.register_kind($1, 'person', 'node', null, '{\"properties\": {\"role\": {\"type\": \"string\"}}}', '{}', null, null)";
 
 /// The Kinds of `tenant`, counted past RLS.
 async fn kind_rows(db: &TestDb, tenant: Uuid) -> i64 {
@@ -1079,8 +1078,16 @@ async fn a_caller_may_delete_only_the_versions_and_citations_its_own_transaction
 async fn a_caller_cannot_rewrite_the_history_of_a_version() {
     let n = nodes().await;
     let statements = [
-        ("update gnomon.version set recorded_to = now() where id = $1", n.closed, "move a closed end to now"),
-        ("update gnomon.version set recorded_to = 'infinity' where id = $1", n.closed, "reopen a closed Version"),
+        (
+            "update gnomon.version set recorded_to = now() where id = $1",
+            n.closed,
+            "move a closed end to now",
+        ),
+        (
+            "update gnomon.version set recorded_to = 'infinity' where id = $1",
+            n.closed,
+            "reopen a closed Version",
+        ),
         (
             "update gnomon.version set recorded_to = recorded_to + interval '1 second' where id = $1",
             n.closed,
@@ -1096,15 +1103,51 @@ async fn a_caller_cannot_rewrite_the_history_of_a_version() {
             n.open,
             "close an open Version in the future",
         ),
-        ("update gnomon.version set props = '{\"name\": \"forged\"}' where id = $1", n.open, "rewrite the values"),
-        ("update gnomon.version set recorded_from = '2000-01-01' where id = $1", n.open, "move the start of Recorded time"),
-        ("update gnomon.version set valid_from = '2000-01-01' where id = $1", n.open, "move Valid time"),
-        ("update gnomon.version set closed_in = null where id = $1", n.closed, "clear the closing mark"),
-        ("update gnomon.contribution set value = '\"forged\"' where node_id = $1", n.n1, "rewrite a Contribution"),
-        ("delete from gnomon.contribution where node_id = $1", n.n1, "delete a Contribution"),
-        ("update gnomon.citation set place = 'forged' where version_id = $1", n.open, "rewrite a Citation"),
-        ("update gnomon.node set kind = 'other' where id = $1", n.n1, "change a Node's Kind"),
-        ("delete from gnomon.node where id = $1", n.n1, "delete a Node"),
+        (
+            "update gnomon.version set props = '{\"name\": \"forged\"}' where id = $1",
+            n.open,
+            "rewrite the values",
+        ),
+        (
+            "update gnomon.version set recorded_from = '2000-01-01' where id = $1",
+            n.open,
+            "move the start of Recorded time",
+        ),
+        (
+            "update gnomon.version set valid_from = '2000-01-01' where id = $1",
+            n.open,
+            "move Valid time",
+        ),
+        (
+            "update gnomon.version set closed_in = null where id = $1",
+            n.closed,
+            "clear the closing mark",
+        ),
+        (
+            "update gnomon.contribution set value = '\"forged\"' where node_id = $1",
+            n.n1,
+            "rewrite a Contribution",
+        ),
+        (
+            "delete from gnomon.contribution where node_id = $1",
+            n.n1,
+            "delete a Contribution",
+        ),
+        (
+            "update gnomon.citation set place = 'forged' where version_id = $1",
+            n.open,
+            "rewrite a Citation",
+        ),
+        (
+            "update gnomon.node set kind = 'other' where id = $1",
+            n.n1,
+            "change a Node's Kind",
+        ),
+        (
+            "delete from gnomon.node where id = $1",
+            n.n1,
+            "delete a Node",
+        ),
     ];
     for role in [USER, WORKER] {
         for (sql, target, what) in statements {
@@ -1821,12 +1864,48 @@ async fn a_caller_inserting_directly_cannot_skip_the_kinds_rules() {
          select $1, 'support', $2, $5, '2030-01-01', 'instant', '2030-01-02', 'instant', 'recency'
          where $3::uuid is not null and $4::text is not null";
     let attempts = [
-        (contribution, n.n1, "age", json!(1), "Kind \"node\" has no property \"age\""),
-        (contribution, n.n1, "name", json!(7), "the value 7 of property \"name\" does not satisfy Kind \"node\""),
-        (contribution, person, "age", json!("forty"), "the value \"forty\" of property \"age\" does not satisfy Kind \"person\""),
-        (version, n.n1, "-", json!({ "age": 1 }), "Kind \"node\" has no property \"age\""),
-        (version, person, "-", json!({ "age": 1.5 }), "the value 1.5 of property \"age\" does not satisfy Kind \"person\""),
-        (version, person, "-", json!({ "name": "Ada" }), "the write leaves required property \"age\" of Kind \"person\" without a value over [2030-01-01 00:00:00+00, 2030-01-02 00:00:00+00)"),
+        (
+            contribution,
+            n.n1,
+            "age",
+            json!(1),
+            "Kind \"node\" has no property \"age\"",
+        ),
+        (
+            contribution,
+            n.n1,
+            "name",
+            json!(7),
+            "the value 7 of property \"name\" does not satisfy Kind \"node\"",
+        ),
+        (
+            contribution,
+            person,
+            "age",
+            json!("forty"),
+            "the value \"forty\" of property \"age\" does not satisfy Kind \"person\"",
+        ),
+        (
+            version,
+            n.n1,
+            "-",
+            json!({ "age": 1 }),
+            "Kind \"node\" has no property \"age\"",
+        ),
+        (
+            version,
+            person,
+            "-",
+            json!({ "age": 1.5 }),
+            "the value 1.5 of property \"age\" does not satisfy Kind \"person\"",
+        ),
+        (
+            version,
+            person,
+            "-",
+            json!({ "name": "Ada" }),
+            "the write leaves required property \"age\" of Kind \"person\" without a value over [2030-01-01 00:00:00+00, 2030-01-02 00:00:00+00)",
+        ),
     ];
     for role in [USER, WORKER] {
         for (sql, node, property, value, message) in &attempts {
@@ -2716,7 +2795,9 @@ async fn a_refinement_leaves_committed_history_as_it_was_and_gives_callers_no_ne
         let got: Vec<bool> = (0..11).map(|i| rights[0].get(i)).collect();
         assert_eq!(
             got,
-            [false, false, false, true, false, false, false, true, false, false, false],
+            [
+                false, false, false, true, false, false, false, true, false, false, false
+            ],
             "{role}"
         );
     }
@@ -2867,8 +2948,8 @@ async fn a_caller_cannot_file_a_bound_statement_under_another_nodes_name() {
 // Versions already granted.
 
 #[tokio::test]
-async fn no_caller_may_set_a_merge_rule_until_the_deployment_grants_it_and_then_only_in_its_own_tenant(
-) {
+async fn no_caller_may_set_a_merge_rule_until_the_deployment_grants_it_and_then_only_in_its_own_tenant()
+ {
     let n = nodes().await;
     let set = "select gnomon.set_merge_rule($1, 'person', 'ranked')";
     n.w.db.grant_kind_registration(USER).await;
@@ -3747,12 +3828,12 @@ async fn second_support_node(e: &Edges) -> Uuid {
         .await
         .unwrap()
         .0
-         .0
+        .0
 }
 
 #[tokio::test]
-async fn a_caller_cannot_join_a_node_of_another_tenant_or_hidden_scope_or_a_node_to_itself_with_a_reserved_edge(
-) {
+async fn a_caller_cannot_join_a_node_of_another_tenant_or_hidden_scope_or_a_node_to_itself_with_a_reserved_edge()
+ {
     let e = edges().await;
     let (t1, n1, n2) = (e.n.w.t1, e.n.n1, e.n.n2);
     for role in [USER, WORKER] {
@@ -4018,14 +4099,19 @@ async fn no_caller_can_register_rewrite_or_remove_a_reserved_kind_even_with_the_
                 "select gnomon.register_kind($1, 'duplicate_of', 'edge', $2, '{}', '{}', null, null)",
                 "specialize it",
             ),
-            ("select gnomon.set_merge_rule($1, $2, 'ranked')", "set its merge rule"),
+            (
+                "select gnomon.set_merge_rule($1, $2, 'ranked')",
+                "set its merge rule",
+            ),
         ] {
             tx.batch_execute("savepoint attempt").await.unwrap();
             let r = tx
                 .execute_typed(sql, &[(&w.t1, Type::UUID), (&kind, Type::TEXT)])
                 .await;
             assert_code(r, gnomon::INVALID_KIND, &format!("{what}: {kind}"));
-            tx.batch_execute("rollback to savepoint attempt").await.unwrap();
+            tx.batch_execute("rollback to savepoint attempt")
+                .await
+                .unwrap();
         }
         for (sql, what) in [
             (
@@ -4325,8 +4411,8 @@ async fn a_caller_cannot_forge_a_contribution_that_does_not_belong_to_the_statem
 }
 
 #[tokio::test]
-async fn a_caller_cannot_end_or_retract_in_another_tenant_or_scope_or_a_version_that_is_not_current(
-) {
+async fn a_caller_cannot_end_or_retract_in_another_tenant_or_scope_or_a_version_that_is_not_current()
+ {
     let n = nodes().await;
     let (t1, t2) = (n.w.t1, n.w.t2);
     for role in [USER, WORKER] {
@@ -4637,8 +4723,8 @@ async fn a_caller_cannot_retract_an_episode_of_another_tenant_or_a_scope_it_cann
 }
 
 #[tokio::test]
-async fn a_caller_cannot_mark_an_episode_retracted_without_its_retractions_or_change_or_delete_the_mark(
-) {
+async fn a_caller_cannot_mark_an_episode_retracted_without_its_retractions_or_change_or_delete_the_mark()
+ {
     let n = nodes().await;
     let t1 = n.w.t1;
     for role in [USER, WORKER] {
@@ -5232,7 +5318,7 @@ async fn graph() -> Graph {
             .await
             .unwrap()
             .0
-             .0
+            .0
         }
     };
     let billing_edge = edge("billing", billing_node.0, billing_node.0, n.w.t1_billing).await;
@@ -5252,7 +5338,7 @@ async fn graph() -> Graph {
         .await
         .unwrap()
         .0
-         .0;
+        .0;
     n.w.db.grant_erasure(WORKER).await;
     Graph {
         billing_node: billing_node.0,
@@ -5308,8 +5394,8 @@ async fn a_caller_role_without_the_grant_cannot_erase_a_node_an_edge_or_a_scope(
 }
 
 #[tokio::test]
-async fn a_caller_with_the_grant_cannot_erase_another_tenants_node_edge_or_scope_or_one_it_cannot_see(
-) {
+async fn a_caller_with_the_grant_cannot_erase_another_tenants_node_edge_or_scope_or_one_it_cannot_see()
+ {
     let g = graph().await;
     let (t1, t2) = (g.n.w.t1, g.n.w.t2);
     let before = row_count(&g.n.w.db).await;
@@ -6354,8 +6440,8 @@ fn assert_refused_write(result: Result<impl std::fmt::Debug, tokio_postgres::Err
 }
 
 #[tokio::test]
-async fn a_caller_cannot_write_an_embedding_of_another_tenant_or_scope_or_attach_another_scopes_text(
-) {
+async fn a_caller_cannot_write_an_embedding_of_another_tenant_or_scope_or_attach_another_scopes_text()
+ {
     let ew = embedded_world().await;
     let w = &ew.w;
     let before = embedding_rows(&w.db).await;
@@ -6787,8 +6873,8 @@ async fn summary_and_community_rows(db: &TestDb) -> Vec<i64> {
 }
 
 #[tokio::test]
-async fn a_caller_cannot_rewrite_or_delete_a_committed_summary_or_community_or_what_it_cites_or_holds(
-) {
+async fn a_caller_cannot_rewrite_or_delete_a_committed_summary_or_community_or_what_it_cites_or_holds()
+ {
     let d = summarized().await;
     let t1 = d.g.n.w.t1;
     let before = summary_and_community_rows(&d.g.n.w.db).await;
@@ -6856,8 +6942,8 @@ async fn a_caller_cannot_rewrite_or_delete_a_committed_summary_or_community_or_w
 }
 
 #[tokio::test]
-async fn a_caller_inserting_directly_cannot_choose_the_recorded_time_or_skip_the_scope_and_citation_checks(
-) {
+async fn a_caller_inserting_directly_cannot_choose_the_recorded_time_or_skip_the_scope_and_citation_checks()
+ {
     let d = summarized().await;
     let w = &d.g.n.w;
     let (t1, n1) = (w.t1, d.g.n.n1);
@@ -7154,8 +7240,8 @@ async fn a_caller_sees_and_writes_no_summary_or_community_of_another_tenant_or_s
 }
 
 #[tokio::test]
-async fn no_caller_reaches_a_summary_through_the_erasure_reach_and_an_erasure_reaches_only_its_nodes_summaries(
-) {
+async fn no_caller_reaches_a_summary_through_the_erasure_reach_and_an_erasure_reaches_only_its_nodes_summaries()
+ {
     let d = summarized().await;
     let w = &d.g.n.w;
     let t1 = w.t1;
@@ -7450,8 +7536,12 @@ async fn a_caller_cannot_write_the_name_rows_directly_with_another_scopes_data_o
         "update gnomon.node_name set q = null where name = 'plain'".to_owned(),
         // The Store's function, for a Node of another Scope or Tenant, and
         // for a name the caller's own Node does not have.
-        format!("select gnomon.store_name_embedding('{t1}', '{billing_node}', 'zebra billing', {v})"),
-        format!("select gnomon.store_name_embedding('{t2}', '{other_tenant_node}', 'zebra support', {v})"),
+        format!(
+            "select gnomon.store_name_embedding('{t1}', '{billing_node}', 'zebra billing', {v})"
+        ),
+        format!(
+            "select gnomon.store_name_embedding('{t2}', '{other_tenant_node}', 'zebra support', {v})"
+        ),
         format!("select gnomon.store_name_embedding('{t1}', '{own_node}', 'zebra billing', {v})"),
         // The functions that derive the name rows, called directly.
         format!("select gnomon.index_node_names('{t1}', array['{own_version}'::uuid])"),
@@ -7517,8 +7607,8 @@ async fn a_caller_cannot_write_the_name_rows_directly_with_another_scopes_data_o
 }
 
 #[tokio::test]
-async fn callers_hold_only_select_and_a_bits_update_on_the_name_table_and_the_definer_no_more_than_it_needs(
-) {
+async fn callers_hold_only_select_and_a_bits_update_on_the_name_table_and_the_definer_no_more_than_it_needs()
+ {
     let w = world().await;
     let admin = w.db.admin().await;
     for role in [USER, WORKER, support::LOGIN_ROLE, "gnomon_definer"] {
@@ -7944,8 +8034,8 @@ async fn a_caller_cannot_write_the_summary_search_rows_or_forge_an_embedding_of_
 }
 
 #[tokio::test]
-async fn callers_hold_only_select_on_the_summary_token_rows_and_select_and_insert_on_their_embeddings(
-) {
+async fn callers_hold_only_select_on_the_summary_token_rows_and_select_and_insert_on_their_embeddings()
+ {
     let w = world().await;
     let admin = w.db.admin().await;
     for (table, caller, definer) in [
@@ -8396,12 +8486,27 @@ async fn a_caller_stores_a_sentence_only_of_an_edge_version_it_sees_by_the_funct
         // Its own Sentence it may store and replace, and change nothing else
         // about it: not its Tenant, Scope or Version, and not by a delete.
         let own: [(&str, &str); 6] = [
-            ("update gnomon.sentence set tenant_id = $2 where version_id = $1", "its Tenant"),
-            ("update gnomon.sentence set scope = 'billing' where version_id = $1 and $2::uuid is not null", "its Scope"),
-            ("update gnomon.sentence set version_id = $2 where version_id = $1", "its Version"),
-            ("delete from gnomon.sentence where version_id = $1 and $2::uuid is not null", "a delete"),
+            (
+                "update gnomon.sentence set tenant_id = $2 where version_id = $1",
+                "its Tenant",
+            ),
+            (
+                "update gnomon.sentence set scope = 'billing' where version_id = $1 and $2::uuid is not null",
+                "its Scope",
+            ),
+            (
+                "update gnomon.sentence set version_id = $2 where version_id = $1",
+                "its Version",
+            ),
+            (
+                "delete from gnomon.sentence where version_id = $1 and $2::uuid is not null",
+                "a delete",
+            ),
             ("truncate gnomon.sentence", "a truncate"),
-            ("update gnomon.sentence set sentence = '' where version_id = $1 and $2::uuid is not null", "an empty text"),
+            (
+                "update gnomon.sentence set sentence = '' where version_id = $1 and $2::uuid is not null",
+                "an empty text",
+            ),
         ];
         for (sql, what) in own {
             let mut client = w.db.login().await;

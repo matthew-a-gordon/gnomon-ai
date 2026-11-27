@@ -8,10 +8,10 @@ mod support;
 
 use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
-    AsOf, EpisodeId, NewEpisode, NewNode, Patch, Scope, Store, TenantId, ValidTime, WriteStatus,
-    ROOT_NODE_KIND,
+    AsOf, EpisodeId, NewEpisode, NewNode, Patch, ROOT_NODE_KIND, Scope, Store, TenantId, ValidTime,
+    WriteStatus,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use support::TestDb;
 
 const SCOPE: &str = "support";
@@ -989,88 +989,4 @@ async fn futures_join_all<F: std::future::Future>(
     })
     .await;
     outputs.into_iter().map(Option::unwrap).collect()
-}
-
-/// A smoke check, not the performance suite (#21): a bounded patch to a Node
-/// with 100 Contributions, through the Store API, each call its own
-/// transaction with its commit. The `prototype/recompute-cost` branch
-/// measured about 3 ms at p50 with fsync off. The bound asserted is loose on
-/// purpose, because the suite shares one server across parallel tests: the
-/// test prints the p50 to quote.
-#[tokio::test]
-async fn a_bounded_patch_on_a_node_with_100_contributions_stays_under_a_loose_p50_bound() {
-    let w = World::new().await;
-    let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-    let days = |d: i64| start + chrono::Duration::days(d);
-    let mut nodes = Vec::new();
-    for n in 0..10i64 {
-        let ep = w.episode(days(0)).await;
-        let (node, _) = w
-            .create(&Patch::new(
-                ep,
-                ValidTime::since(days(0)),
-                values(json!({ "name": "start", "aliases": ["s"] })),
-            ))
-            .await;
-        // 49 more writes of two properties each: 100 Contributions.
-        for i in 1..50i64 {
-            let ep = w.episode(days(i % 7)).await;
-            let from = (i * 37 + n * 11) % 330;
-            let patch = Patch::new(
-                ep,
-                ValidTime::between(days(from), days(from + 10 + (i * 13) % 50)),
-                values(
-                    json!({ "name": format!("n{}", i % 5), "aliases": [format!("a{}", i % 3)] }),
-                ),
-            );
-            w.write(node, &patch).await;
-        }
-        if n == 0 {
-            let count = w
-                .rows_for(
-                    "select count(*) from gnomon.contribution where node_id = $1",
-                    node,
-                )
-                .await;
-            assert_eq!(count[0].get::<_, i64>(0), 100);
-        }
-        nodes.push(node);
-    }
-
-    let mut times = Vec::new();
-    for round in 0..5i64 {
-        for (n, node) in nodes.iter().enumerate() {
-            let ep = w.episode(days(8)).await;
-            let from = (round * 61 + n as i64 * 29) % 330;
-            let patch = Patch::new(
-                ep,
-                ValidTime::between(days(from), days(from + 14)),
-                name(&format!("patch {round}")),
-            );
-            let t0 = std::time::Instant::now();
-            w.write(*node, &patch).await;
-            times.push(t0.elapsed());
-        }
-    }
-    // The overhead of a call: an As-of read, four round trips and an index
-    // probe.
-    let mut reads = Vec::new();
-    for node in nodes.iter().cycle().take(50) {
-        let t0 = std::time::Instant::now();
-        w.read(*node, AsOf::current(days(100))).await;
-        reads.push(t0.elapsed());
-    }
-    reads.sort();
-    println!(
-        "As-of read of the same Nodes: p50 {:?}",
-        reads[reads.len() / 2]
-    );
-    times.sort();
-    let p50 = times[times.len() / 2];
-    let p95 = times[times.len() * 95 / 100];
-    println!(
-        "bounded patch on 100 Contributions: p50 {p50:?}, p95 {p95:?}, n = {}",
-        times.len()
-    );
-    assert!(p50 < std::time::Duration::from_millis(50), "p50 {p50:?}");
 }

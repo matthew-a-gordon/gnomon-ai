@@ -7,8 +7,8 @@
 
 mod support;
 
-use gnomon::{Error, Kind, KindOf, NewKind, Store, TenantId, ROOT_EDGE_KIND, ROOT_NODE_KIND};
-use serde_json::{json, Map, Value};
+use gnomon::{Error, Kind, KindOf, NewKind, ROOT_EDGE_KIND, ROOT_NODE_KIND, Store, TenantId};
+use serde_json::{Map, Value, json};
 use support::TestDb;
 use tokio_postgres::types::Type;
 

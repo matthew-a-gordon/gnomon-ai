@@ -17,18 +17,18 @@
 
 mod support;
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
-    AsOf, NewEpisode, NewNode, Patch, Scope, SearchRequest, Store, TenantId, ValidTime,
-    ROOT_NODE_KIND,
+    AsOf, NewEpisode, NewNode, Patch, ROOT_NODE_KIND, Scope, SearchRequest, Store, TenantId,
+    ValidTime,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
+use support::TestDb;
 use support::perf::{self, Dataset, Record, Stats};
 use support::vectors::Rng;
-use support::TestDb;
+use tokio::sync::Mutex;
 
 /// The budgets of ADR-0010: the whole fused Search at p95.
 const SEARCH_BUDGET_50K: f64 = 100.0;
@@ -51,14 +51,12 @@ fn prototype_4_p50(contributions: usize) -> f64 {
 const SEARCH_WARM_UP: usize = 10;
 const SEARCH_SAMPLES: usize = 100;
 
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
-fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// Held for the whole of each case, so the cases never overlap. A case that
+/// panics releases it, and the next one still runs.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::const_new(());
 
 async fn fused_search_case(case: &str, visible_target: usize, budget_ms: f64) {
-    let _one = one_at_a_time();
+    let _one = ONE_AT_A_TIME.lock().await;
     let data = Dataset::get(perf::texts_for_visible(visible_target)).await;
     println!(
         "{case}: {} texts, {} Versions, {} visible now",
@@ -83,7 +81,7 @@ async fn fused_search_case(case: &str, visible_target: usize, budget_ms: f64) {
     let mut text_times = vec![];
     for i in 0..SEARCH_WARM_UP + SEARCH_SAMPLES {
         let (text, q) = data.query_for(&mut rng, &centres);
-        let request = SearchRequest::text(&text, current.clone()).with_embedding(&q);
+        let request = SearchRequest::text(&text, current).with_embedding(&q);
         let started = Instant::now();
         let results = caller.search(data.tenant(), &request, 10).await.unwrap();
         let took = started.elapsed();
@@ -94,13 +92,13 @@ async fn fused_search_case(case: &str, visible_target: usize, budget_ms: f64) {
             if i % 4 == 0 {
                 let t = Instant::now();
                 caller
-                    .search_vector(data.tenant(), &q, current.clone(), 10)
+                    .search_vector(data.tenant(), &q, current, 10)
                     .await
                     .unwrap();
                 vector_times.push(t.elapsed());
                 let t = Instant::now();
                 caller
-                    .search_full_text(data.tenant(), &text, current.clone(), 10)
+                    .search_full_text(data.tenant(), &text, current, 10)
                     .await
                     .unwrap();
                 text_times.push(t.elapsed());
@@ -248,7 +246,7 @@ const WARM_UP_NODES: i64 = 3;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bounded_patch_write_costs_1_to_11_ms_at_p50_and_grows_with_the_nodes_contributions() {
-    let _one = one_at_a_time();
+    let _one = ONE_AT_A_TIME.lock().await;
     let db = TestDb::migrated().await;
     let store = Store::connect(&db.login_url(), &support::connect_options())
         .await
@@ -256,7 +254,7 @@ async fn a_bounded_patch_write_costs_1_to_11_ms_at_p50_and_grows_with_the_nodes_
     let w = Writes {
         tenant: support::tenant(),
         store,
-        db: db,
+        db,
     };
     let record = Record::start("bounded_patch_write", &w.db.name).await;
     let mut cells = vec![];

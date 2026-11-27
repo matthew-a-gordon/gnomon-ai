@@ -420,12 +420,14 @@ async fn no_call_carries_its_claims_into_the_next_call_on_the_same_connection() 
                 .unwrap(),
             None
         );
-        assert!(store
-            .as_worker(t1, Scope::new("support"))
-            .read_episode(t1, id)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .as_worker(t1, Scope::new("support"))
+                .read_episode(t1, id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }
 
@@ -485,8 +487,8 @@ fn transactions(sent: &[Sent]) -> Vec<Vec<String>> {
 }
 
 #[tokio::test]
-async fn every_call_sends_only_unnamed_statements_inside_one_transaction_that_sets_role_and_claims_locally(
-) {
+async fn every_call_sends_only_unnamed_statements_inside_one_transaction_that_sets_role_and_claims_locally()
+ {
     let db = TestDb::migrated().await;
     let (proxy, log) = wire::record(db.server_addr().await).await;
     // The default statement mode, whatever GNOMON_TEST_NAMED_STATEMENTS says.
@@ -604,8 +606,8 @@ fn calls_after_connect(sent: &[Sent]) -> Vec<Vec<String>> {
 }
 
 #[tokio::test]
-async fn a_batch_as_of_read_of_many_nodes_and_a_traversal_are_each_one_call_whatever_the_number_of_nodes(
-) {
+async fn a_batch_as_of_read_of_many_nodes_and_a_traversal_are_each_one_call_whatever_the_number_of_nodes()
+ {
     let db = TestDb::migrated().await;
     let t = tenant();
     let scope = "support";

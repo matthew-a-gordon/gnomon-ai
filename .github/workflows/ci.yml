@@ -1,0 +1,96 @@
+# What runs here and when is recorded in ADR-0020. The three job names are the
+# required status checks of the ruleset on main, so renaming a job also means
+# changing the ruleset.
+#
+# The workflow does not run on pushes to main, because the ruleset requires an
+# up-to-date branch and so the pull request run tests what lands there. It caches
+# no build, so each run builds from nothing. The one cache is the Bun runtime that
+# Supabase's action saves for itself.
+#
+# This repository is public. The token only reads, the workflow uses no secret,
+# the trigger is pull_request and never pull_request_target, and every
+# third-party action is pinned to a commit SHA.
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: "0" # the test profile inherits it
+
+jobs:
+  test-pg17:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps: &test-steps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: nextest@0.9.152
+          fallback: none
+
+      # For uvx. The action caches on GitHub's runners unless told not to.
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.13.7"
+          enable-cache: false
+
+      # The test harness holds the one pin of the CLI's version. Without a
+      # version the action would install the latest release.
+      - name: Read the pinned Supabase CLI version
+        id: supabase-cli
+        run: |
+          version=$(sed -n 's/^pub const SUPABASE_CLI: &str = "supabase@\(.*\)";$/\1/p' crates/gnomon/tests/support/mod.rs)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: supabase/setup-cli@689adcfb80d947100a1eab127289b97d1fb07b13 # v3.2.0
+        with:
+          version: ${{ steps.supabase-cli.outputs.version }}
+
+      # The harness would pull this inside the first tests that need it, and
+      # that time would count against those tests' limits.
+      - name: Pull the test database image
+        run: docker pull "$TEST_IMAGE_REF"
+
+      - run: cargo nextest run --workspace
+        env:
+          GNOMON_TEST_SUPABASE_CLI: supabase
+
+    env:
+      GNOMON_TEST_IMAGE: pgvector
+      # The image tests/support/server.rs names for GNOMON_TEST_IMAGE.
+      TEST_IMAGE_REF: pgvector/pgvector:pg17
+
+  test-supabase:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps: *test-steps
+    env:
+      GNOMON_TEST_IMAGE: supabase
+      TEST_IMAGE_REF: public.ecr.aws/supabase/postgres:17.12.0.000
+
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - run: cargo fmt --all --check
+
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings

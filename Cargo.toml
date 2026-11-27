@@ -1,9 +1,9 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/gnomon"]
 
 [workspace.package]
-edition = "2021"
-rust-version = "1.89"
+edition = "2024"
+rust-version = "1.93.1"
 license = "Apache-2.0"
 repository = "https://github.com/matthew-a-gordon/gnomon-ai"

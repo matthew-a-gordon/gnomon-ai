@@ -11,12 +11,12 @@ mod support;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use gnomon::{
-    AsOf, Bound, EpisodeId, NewEpisode, NewNode, NodeId, Patch, Scope, Store, TenantId, ValidTime,
-    ROOT_NODE_KIND,
+    AsOf, Bound, EpisodeId, NewEpisode, NewNode, NodeId, Patch, ROOT_NODE_KIND, Scope, Store,
+    TenantId, ValidTime,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use support::TestDb;
 
 const SCOPE: &str = "support";
@@ -112,10 +112,10 @@ fn oracle(sequence: &[Vec<Write>], txs: usize, d: f64) -> Option<Map<String, Val
                     .map(|v| ((w.reference_day, t, i), v))
             })
             .max_by_key(|(k, _)| *k);
-        if let Some((_, v)) = winner {
-            if !v.is_null() {
-                out.insert(property.into(), v);
-            }
+        if let Some((_, v)) = winner
+            && !v.is_null()
+        {
+            out.insert(property.into(), v);
         }
     }
     (!out.is_empty()).then_some(out)
@@ -238,13 +238,14 @@ async fn check(store: &Store, tenant: TenantId, sequence: &[Vec<Write>]) -> (Vec
             // Bounds fall on whole days and the points on half days, so two
             // neighbouring points with equal values lie in one Version
             // unless equal neighbours failed to merge.
-            if let (Some(p), Some(v)) = (&previous, &version) {
-                if p.values == v.values && p.id != v.id {
-                    wrong.push(format!(
-                        "after transaction {k}, Versions {} and {} meet at day {d} with equal values",
-                        p.id, v.id
-                    ));
-                }
+            if let (Some(p), Some(v)) = (&previous, &version)
+                && p.values == v.values
+                && p.id != v.id
+            {
+                wrong.push(format!(
+                    "after transaction {k}, Versions {} and {} meet at day {d} with equal values",
+                    p.id, v.id
+                ));
             }
             previous = version;
         }

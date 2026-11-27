@@ -14,8 +14,8 @@ use gnomon::{
     GapPage, NewCommunity, NewSummary, NodeId, Precision, Scope, ValidTime, VersionId,
 };
 use serde_json::json;
-use support::erasure::{at, World, SCOPE};
-use support::vectors::{sentence_hash, Rng};
+use support::erasure::{SCOPE, World, at};
+use support::vectors::{Rng, sentence_hash};
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
@@ -217,18 +217,22 @@ async fn each_kind_of_gap_is_listed_until_it_is_repaired() {
         .store_embedding(w.tenant, edge_version, &values_hash, &rng.unit())
         .await
         .unwrap();
-    assert!(gaps(&w)
-        .await
-        .iter()
-        .any(|g| matches!(g, Gap::SentenceEmbedding { .. })));
+    assert!(
+        gaps(&w)
+            .await
+            .iter()
+            .any(|g| matches!(g, Gap::SentenceEmbedding { .. }))
+    );
     w.caller()
         .store_embedding(w.tenant, edge_version, &hash, &rng.unit())
         .await
         .unwrap();
-    assert!(!gaps(&w)
-        .await
-        .iter()
-        .any(|g| matches!(g, Gap::SentenceEmbedding { .. })));
+    assert!(
+        !gaps(&w)
+            .await
+            .iter()
+            .any(|g| matches!(g, Gap::SentenceEmbedding { .. }))
+    );
 
     // The Node Versions' texts and the names, one at a time.
     w.caller()
@@ -456,12 +460,13 @@ async fn a_community_whose_replacement_an_erasure_removed_is_listed_until_its_no
     let mut replaces: Vec<CommunityId> = current.iter().map(|c| c.id).collect();
     replaces.push(regrouped);
     community(&w, replaces, vec![bob], f).await;
-    assert!(w
-        .caller()
-        .read_communities(w.tenant, ada, AsOf::current(at(2024, 6, 1)))
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        w.caller()
+            .read_communities(w.tenant, ada, AsOf::current(at(2024, 6, 1)))
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(communities(gaps(&w).await), vec![]);
 }
 

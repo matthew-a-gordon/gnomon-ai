@@ -24,13 +24,13 @@ mod support;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use gnomon::{
     AsOf, Bound, EdgeId, EpisodeId, KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NodeId, Patch,
-    Scope, Store, TenantId, ValidTime, ROOT_EDGE_KIND, ROOT_NODE_KIND,
+    ROOT_EDGE_KIND, ROOT_NODE_KIND, Scope, Store, TenantId, ValidTime,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
-use serde_json::{json, Map, Value};
-use support::erasure::{assert_no_residue, Residue};
+use serde_json::{Map, Value, json};
 use support::TestDb;
+use support::erasure::{Residue, assert_no_residue};
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
@@ -292,10 +292,10 @@ fn oracle(
                     .map(|v| ((authority, s.reference_day, t, i), v))
             })
             .max_by_key(|(k, _)| *k);
-        if let Some((_, v)) = winner {
-            if !v.is_null() {
-                out.insert(property.into(), v);
-            }
+        if let Some((_, v)) = winner
+            && !v.is_null()
+        {
+            out.insert(property.into(), v);
         }
     }
     (!out.is_empty()).then_some(out)
@@ -719,14 +719,15 @@ async fn check(
                              read {got:?}, oracle {expected:?}"
                         ));
                     }
-                    if let (Some(p), Some(v)) = (&previous[n], &version) {
-                        if p.values == v.values && p.id != v.id {
-                            wrong.push(format!(
-                                "{erased:?}, Node {n}, after transaction {txs}: Versions {} \
+                    if let (Some(p), Some(v)) = (&previous[n], &version)
+                        && p.values == v.values
+                        && p.id != v.id
+                    {
+                        wrong.push(format!(
+                            "{erased:?}, Node {n}, after transaction {txs}: Versions {} \
                                  and {} meet at day {d} with equal values",
-                                p.id, v.id
-                            ));
-                        }
+                            p.id, v.id
+                        ));
                     }
                     previous[n] = version;
                 }

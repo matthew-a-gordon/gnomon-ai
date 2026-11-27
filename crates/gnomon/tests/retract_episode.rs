@@ -12,7 +12,7 @@ use gnomon::{
     NewKind, NewNode, NodeId, NodeVersion, Patch, Scope, StatementKind, Store, TenantId, ValidTime,
     WriteOutcome, WriteStatus,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use support::TestDb;
 use tokio_postgres::types::Type;
 
@@ -373,12 +373,13 @@ async fn a_version_also_cited_by_another_episode_is_not_retracted() {
     let now = w.read(node, at(2024, 3, 1)).await.unwrap();
     assert_eq!(now.id, version.id, "the same Version, untouched");
     assert!(now.recorded_to.is_none());
-    assert!(w
-        .caller()
-        .list_node_statements(w.tenant, node)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        w.caller()
+            .list_node_statements(w.tenant, node)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -457,8 +458,8 @@ async fn a_version_the_retracted_episode_cites_twice_is_retracted_once() {
 }
 
 #[tokio::test]
-async fn as_of_reads_before_the_retraction_still_return_the_retracted_versions_and_nothing_is_deleted(
-) {
+async fn as_of_reads_before_the_retraction_still_return_the_retracted_versions_and_nothing_is_deleted()
+ {
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
     let node = w.account(e, ValidTime::since(at(2024, 1, 1)), "gold").await;
@@ -691,8 +692,8 @@ async fn a_held_correction_of_the_retracted_episode_stops_counting() {
 // Retract Episode.
 
 #[tokio::test]
-async fn with_ranked_merge_on_retracting_a_lower_authority_episode_leaves_the_version_a_higher_authority_supplied(
-) {
+async fn with_ranked_merge_on_retracting_a_lower_authority_episode_leaves_the_version_a_higher_authority_supplied()
+ {
     let w = World::new().await;
     w.set_rule("account", MergeRule::Ranked).await;
     let low = w.episode(at(2024, 9, 1), Some(0)).await;

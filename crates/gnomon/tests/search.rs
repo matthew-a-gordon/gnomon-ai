@@ -15,7 +15,7 @@ use gnomon::{
     Versioned,
 };
 use serde_json::json;
-use support::erasure::{at, World, ALL_SCOPES, SCOPE};
+use support::erasure::{ALL_SCOPES, SCOPE, World, at};
 use support::vectors::Rng;
 
 /// A valid-at instant after every `as_of_valid` the tests write.
@@ -172,8 +172,8 @@ async fn one_search_returns_versions_summaries_and_communities_fused_with_each_b
 }
 
 #[tokio::test]
-async fn a_summary_or_community_is_found_only_when_its_recorded_time_holds_known_at_and_valid_at_is_on_or_after_as_of_valid(
-) {
+async fn a_summary_or_community_is_found_only_when_its_recorded_time_holds_known_at_and_valid_at_is_on_or_after_as_of_valid()
+ {
     let w = World::new().await;
     let (acme, e) = named(&w, "Acme").await;
     let old = summary(&w, acme, "Acme sells gadgets.", &[e]).await;
@@ -294,8 +294,8 @@ fn sqlstate<T: std::fmt::Debug>(r: Result<T, gnomon::Error>) -> String {
 }
 
 #[tokio::test]
-async fn the_neighbourhood_keeps_the_fifty_most_mentioned_edges_per_node_to_its_depth_and_the_same_ones_each_time(
-) {
+async fn the_neighbourhood_keeps_the_fifty_most_mentioned_edges_per_node_to_its_depth_and_the_same_ones_each_time()
+ {
     let w = World::new().await;
     let (hub, _) = named(&w, "Hub").await;
     let mut edges = vec![];
@@ -391,9 +391,11 @@ async fn the_neighbourhood_keeps_the_fifty_most_mentioned_edges_per_node_to_its_
         .unwrap();
     assert_eq!(back.neighbourhood.unwrap().value, 1);
     // At depth 2 from the hub, the hub is not a result either.
-    assert!(!deeper
-        .iter()
-        .any(|r| matches!(r.hit, SearchHit::Version { of: Versioned::Node(n), .. } if n == hub)));
+    assert!(
+        !deeper.iter().any(
+            |r| matches!(r.hit, SearchHit::Version { of: Versioned::Node(n), .. } if n == hub)
+        )
+    );
 
     // No other depth.
     for depth in [0, 3] {
@@ -440,10 +442,12 @@ async fn with_no_seeds_the_neighbourhood_expands_from_the_top_node_hits_of_the_o
     assert!(plain.full_text.is_none() && plain.vector.is_none());
     assert_eq!(plain.neighbourhood.unwrap().value, 1);
     // The hub itself is a seed, not a neighbour.
-    assert!(find(&results, &node_hit(hub_version, hub))
-        .unwrap()
-        .neighbourhood
-        .is_none());
+    assert!(
+        find(&results, &node_hit(hub_version, hub))
+            .unwrap()
+            .neighbourhood
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -745,9 +749,10 @@ async fn an_episode_edge_or_summary_in_a_scope_the_caller_cannot_see_changes_no_
     let unseen = find(&before, &node_hit(x_version, x)).unwrap();
     assert_eq!(unseen.connectedness.count, 0);
     assert_ne!(both, before);
-    assert!(both
-        .iter()
-        .any(|r| matches!(r.hit, SearchHit::Summary { node, .. } if node == x)));
+    assert!(
+        both.iter()
+            .any(|r| matches!(r.hit, SearchHit::Summary { node, .. } if node == x))
+    );
 }
 
 #[tokio::test]
@@ -847,136 +852,12 @@ async fn erasure_removes_the_search_rows_of_every_summary_and_community_it_remov
         );
     }
     support::erasure::assert_search_counts_match_the_token_rows(&admin).await;
-    assert!(everyone(&w)
-        .search(w.tenant, &SearchRequest::text("anvils", current()), 10)
-        .await
-        .unwrap()
-        .is_empty());
-}
-
-/// A smoke check, not a performance test: ticket #21 owns those. It loads
-/// `GNOMON_SEARCH_SMOKE_ROWS` texts (default 2,000) into one Scope as
-/// prototype 5's generator lays them out, with their token rows, one Edge
-/// from each Node to another, each cited by an Episode, and prints the p50
-/// and p95 of 20 fused Searches by text and vector at the current belief,
-/// next to prototype 5's 66 ms p95 at 50,000 visible rows. It asserts no
-/// timing.
-#[tokio::test]
-async fn smoke_check_prints_the_time_of_a_fused_search() {
-    let rows: usize = std::env::var("GNOMON_SEARCH_SMOKE_ROWS")
-        .ok()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(2_000);
-    let w = World::new().await;
-    let mut rng = Rng::new(66);
-    let centres = support::vectors::subtopics(&mut rng, 20, 10);
-    let mut corpus = support::vectors::Corpus::default();
-    support::vectors::load(
-        &w.db,
-        &mut corpus,
-        w.tenant,
-        SCOPE,
-        rows,
-        &centres,
-        &mut rng,
-    )
-    .await;
-
-    let admin = w.db.admin().await;
-    // The token rows, which the loader's inserts with triggers off did not
-    // write, through the function the search index trigger calls, under the
-    // worker's claims so the count changes it records name the Tenant.
-    let mut tx_client = w.db.admin().await;
-    let tx = tx_client.transaction().await.unwrap();
-    tx.query_typed(
-        "select set_config('request.jwt.claims', $1, true)",
-        &[(&w.claims(), tokio_postgres::types::Type::TEXT)],
-    )
-    .await
-    .unwrap();
-    tx.execute_typed(
-        "select gnomon.index_search_text($1, array(select id from gnomon.version
-                                                  where tenant_id = $1), false)",
-        &[(&w.tenant.0, tokio_postgres::types::Type::UUID)],
-    )
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-    // One Edge from each Node to the next, current and valid always, each
-    // cited by one Episode.
-    let e = w.episode(at(2024, 1, 1), None).await;
-    let mut tx_client = w.db.admin().await;
-    let tx = tx_client.transaction().await.unwrap();
-    tx.batch_execute("set local session_replication_role = replica")
-        .await
-        .unwrap();
-    tx.execute_typed(
-        "with nodes as (
-           select id, row_number() over (order by id) as i from gnomon.node
-           where tenant_id = $1 and scope = $2 and kind = 'company'),
-         pairs as (
-           select gnomon.uuid_v7() as edge, a.id as source, b.id as target
-           from nodes a join nodes b on b.i = a.i % (select count(*) from nodes) + 1),
-         edges as (
-           insert into gnomon.edge (tenant_id, scope, id, kind, source_id, target_id)
-           select $1, $2, p.edge, 'edge', p.source, p.target from pairs p returning id),
-         versions as (
-           insert into gnomon.version (tenant_id, scope, id, edge_id, props, valid_from,
-                                       valid_from_precision, valid_to, valid_to_precision,
-                                       recorded_from, merge_rule)
-           select $1, $2, gnomon.uuid_v7(), x.id, '{}', '-infinity', 'unknown', 'infinity',
-                  'unknown', '2024-01-01', 'recency'
-           from edges x returning id)
-         insert into gnomon.citation (tenant_id, scope, version_id, episode_id, property,
-                                      recorded_at, episode_reference_time, episode_recorded_at)
-         select $1, $2, v.id, ep.id, 'holds', '2024-01-01', ep.reference_time, ep.recorded_at
-         from versions v cross join gnomon.episode ep where ep.tenant_id = $1 and ep.id = $3",
-        &[
-            (&w.tenant.0, tokio_postgres::types::Type::UUID),
-            (&SCOPE, tokio_postgres::types::Type::TEXT),
-            (&e.0, tokio_postgres::types::Type::UUID),
-        ],
-    )
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-    // Prototype 5 timed vacuumed tables, whose index-only scans need the
-    // visibility map.
-    admin.batch_execute("vacuum (analyze)").await.unwrap();
-
-    let visible = corpus.visible(&[SCOPE], now(), None);
-    let mut times = vec![];
-    for i in 0..21 {
-        let centre = rng.below(centres.len());
-        let q = rng.near(&centres[centre], 0.6);
-        // A name's number, which one text holds. Every name holds "text",
-        // and a word every text holds makes the full-text branch score every
-        // posting of the Scope (migration 0016), as prototype 5 avoided by
-        // querying mid-frequency words.
-        let text = format!("{}", rng.below(rows));
-        let started = std::time::Instant::now();
-        let results = search(
-            &w,
-            &SearchRequest::text(&text, current()).with_embedding(&q),
-            10,
-        )
-        .await;
-        let took = started.elapsed();
-        assert!(!results.is_empty());
-        // The first call warms the caches, as prototype 5 ran each query once
-        // untimed.
-        if i > 0 {
-            times.push(took.as_secs_f64() * 1000.0);
-        }
-    }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p = |q: f64| times[((times.len() as f64 * q).ceil() as usize).saturating_sub(1)];
-    println!(
-        "fused Search over {rows} texts, {} Versions, {visible} visible now: \
-         p50 {:.1} ms, p95 {:.1} ms (prototype 5: 66 ms p95 at 50,000 visible rows)",
-        corpus.versions.len(),
-        p(0.5),
-        p(0.95)
+    assert!(
+        everyone(&w)
+            .search(w.tenant, &SearchRequest::text("anvils", current()), 10)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 

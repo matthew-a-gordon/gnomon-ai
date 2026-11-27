@@ -11,11 +11,11 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_postgres::types::Type;
 
 use super::vectors::Rng;
-use super::{Server, TestDb, DEFAULT_DIMENSION};
+use super::{DEFAULT_DIMENSION, Server, TestDb};
 
 /// The Scope the data set lives in.
 pub const SCOPE: &str = "perf";
@@ -364,10 +364,10 @@ impl Dataset {
     pub fn query_for(&self, rng: &mut Rng, centres: &[Vec<f32>]) -> (String, Vec<f32>) {
         let c = rng.below(centres.len());
         let q = rng.near(&centres[c], 0.6);
-        // The word is a number that one text holds, as `search.rs`'s smoke
-        // check does. The generated texts have no word-frequency structure,
-        // so this suite cannot query the mid-frequency words prototype 5 did,
-        // and its full-text branch is cheaper than a real vocabulary's.
+        // The word is a number that one text holds. The generated texts have
+        // no word-frequency structure, so this suite cannot query the
+        // mid-frequency words prototype 5 did, and its full-text branch is
+        // cheaper than a real vocabulary's.
         (rng.below(self.texts).to_string(), q)
     }
 }
@@ -457,8 +457,8 @@ async fn build(texts: usize, name: &str) {
 }
 
 /// The token rows, which the inserts with triggers off did not write,
-/// through the function the search index trigger calls, as `search.rs`'s
-/// smoke check does, in chunks of versions.
+/// through the function the search index trigger calls, in chunks of
+/// versions.
 async fn index_search_text(db: &TestDb, tenant: gnomon::TenantId) {
     let claims = json!({ "role": "gnomon_worker",
         "app_metadata": { "tenant_id": tenant.0.to_string(), "scopes": [SCOPE] } })

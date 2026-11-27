@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{TimeZone, Utc};
 use gnomon::{Caller, EpisodeId, Error, NewEpisode, Scope, Store, TenantId};
-use support::{TestDb, LOGIN_ROLE};
+use support::{LOGIN_ROLE, TestDb};
 use tokio::sync::Barrier;
 
 /// More clients than the poolers' default pool of 20 server connections,
@@ -106,7 +106,7 @@ async fn run_caller(
                     return Err(format!(
                         "caller {i} round {round}: read caller {sibling}'s Episode in Scope {}",
                         e.scope
-                    ))
+                    ));
                 }
                 Err(e) => return Err(format!("caller {i} round {round}: {}", support::chain(&e))),
             }
@@ -120,7 +120,7 @@ async fn run_caller(
                     return Err(format!(
                         "caller {i} round {round}: a call in caller {stranger}'s Tenant \
                          ran with this caller's claims and read {found:?}"
-                    ))
+                    ));
                 }
                 Err(e) => return Err(format!("caller {i} round {round}: {}", support::chain(&e))),
             }

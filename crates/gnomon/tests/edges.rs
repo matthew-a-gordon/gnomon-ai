@@ -10,10 +10,10 @@ mod support;
 use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
     AsOf, Bound, BoundChange, BoundSide, BoundStatement, Direction, EdgeId, EpisodeId, Error,
-    KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId, Patch, Precision, Scope,
-    Store, TenantId, Traversal, ValidTime, WriteStatus, ROOT_EDGE_KIND, ROOT_NODE_KIND,
+    KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId, Patch, Precision,
+    ROOT_EDGE_KIND, ROOT_NODE_KIND, Scope, Store, TenantId, Traversal, ValidTime, WriteStatus,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use support::TestDb;
 
 const SCOPE: &str = "support";
@@ -397,8 +397,14 @@ async fn an_edge_write_states_only_the_edge_kinds_properties_and_never_the_built
         .await;
     let ep = w.episode(day(2)).await;
     for (v, message) in [
-        (json!({ "role": 7 }), "the value 7 of property \"role\" does not satisfy Kind \"works_at\""),
-        (json!({ "name": "Ada at Acme" }), "Kind \"works_at\" has no property \"name\""),
+        (
+            json!({ "role": 7 }),
+            "the value 7 of property \"role\" does not satisfy Kind \"works_at\"",
+        ),
+        (
+            json!({ "name": "Ada at Acme" }),
+            "Kind \"works_at\" has no property \"name\"",
+        ),
         (
             json!({ "holds": true }),
             "\"holds\" is built in: every write to an Edge states that the Edge holds over its Valid time",
@@ -410,7 +416,11 @@ async fn an_edge_write_states_only_the_edge_kinds_properties_and_never_the_built
     ] {
         match w
             .caller()
-            .write_edge(w.tenant, edge, &Patch::new(ep, ValidTime::UNKNOWN, values(v.clone())))
+            .write_edge(
+                w.tenant,
+                edge,
+                &Patch::new(ep, ValidTime::UNKNOWN, values(v.clone())),
+            )
             .await
         {
             Err(Error::InvalidWrite(m)) => assert_eq!(m, message, "{v}"),
@@ -954,12 +964,13 @@ async fn a_batch_as_of_read_returns_each_nodes_version_in_the_order_given() {
         .await
         .unwrap();
     assert_eq!(batch, single.into_iter().collect::<Vec<_>>());
-    assert!(w
-        .caller()
-        .read_nodes(w.tenant, &[], AsOf::current(day(20)))
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        w.caller()
+            .read_nodes(w.tenant, &[], AsOf::current(day(20)))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
