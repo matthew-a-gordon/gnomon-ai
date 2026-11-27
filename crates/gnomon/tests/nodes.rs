@@ -10,18 +10,14 @@ use gnomon::{
     AsOf, EpisodeId, NewEpisode, NewNode, Patch, ROOT_NODE_KIND, Scope, Store, TenantId, ValidTime,
     WriteStatus,
 };
-use jiff::{SignedDuration, Timestamp, civil::date, tz::TimeZone};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Map, Value, json};
 use support::TestDb;
 
 const SCOPE: &str = "support";
 
 fn day(d: i8) -> Timestamp {
-    date(2024, 1, d)
-        .at(0, 0, 0, 0)
-        .to_zoned(TimeZone::UTC)
-        .unwrap()
-        .timestamp()
+    support::utc(2024, 1, d)
 }
 
 fn values(v: Value) -> Map<String, Value> {

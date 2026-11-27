@@ -116,7 +116,8 @@ pub enum StageOutcome {
     /// The stage's output commits in the same transaction.
     Succeeded,
     /// The stage failed and is due again `after` from now, by the database's
-    /// clock.
+    /// clock. A delay that ends after [`jiff::Timestamp::MAX`] is refused
+    /// with [`Error::InvalidWrite`](crate::Error::InvalidWrite).
     Retry { error: StageError, after: Duration },
     /// The stage failed for the last time.
     Failed { error: StageError },

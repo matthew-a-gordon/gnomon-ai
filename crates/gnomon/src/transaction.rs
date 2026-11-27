@@ -1779,9 +1779,9 @@ fn object(values: Value) -> Map<String, Value> {
     }
 }
 
-/// A column that holds a time or a null. `timestamptz` reaches far past the
-/// year 9999, where a `Timestamp` ends, and `Row::get` panics on a value it
-/// cannot convert, so every time is decoded here.
+/// A column that holds a time or a null. `timestamptz` holds times outside
+/// the range of a `Timestamp`, and `Row::get` panics on a value it cannot
+/// convert, so every time is decoded here.
 fn time<'a, T: FromSql<'a>>(row: &'a Row, at: usize) -> Result<T, Error> {
     Ok(row.try_get(at)?)
 }
@@ -1930,6 +1930,17 @@ async fn write_stage(tx: &Transaction, write: &StageWrite) -> Result<(), Error> 
             outcome,
             usage,
         } => {
+            // `retry_at` is read back as a `Timestamp`, so a delay that
+            // ends past one would leave the Episode's records unreadable.
+            if let StageOutcome::Retry { after, .. } = outcome
+                && Timestamp::now().checked_add(*after).is_err()
+            {
+                return Err(Error::InvalidWrite(format!(
+                    "a retry delay of {} seconds ends after {}, the latest time gnomon can read",
+                    after.as_secs(),
+                    Timestamp::MAX
+                )));
+            }
             let (status, error, retry_after) = match outcome {
                 StageOutcome::Succeeded => (StageStatus::Succeeded, None, None),
                 StageOutcome::Retry { error, after } => {

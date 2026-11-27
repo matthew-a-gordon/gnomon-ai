@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use jiff::{SignedDuration, Timestamp, civil::date, tz::TimeZone};
+use jiff::{SignedDuration, Timestamp};
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
@@ -204,13 +204,7 @@ pub async fn load(
     centres: &[Vec<f32>],
     rng: &mut Rng,
 ) {
-    let utc = |y, m, d| {
-        date(y, m, d)
-            .at(0, 0, 0, 0)
-            .to_zoned(TimeZone::UTC)
-            .unwrap()
-            .timestamp()
-    };
+    let utc = |y, m, d| super::utc(y, m, d);
     let (r_start, r_end) = (utc(2024, 1, 1), utc(2026, 11, 1));
     let (mut node_ids, mut ids, mut node_of, mut props) = (vec![], vec![], vec![], vec![]);
     let (mut vf, mut vt, mut rf, mut rt) = (vec![], vec![], vec![], vec![]);
@@ -494,13 +488,7 @@ pub async fn load_names(
     centres: &[Vec<f32>],
     rng: &mut Rng,
 ) {
-    let utc = |y, m, d| {
-        date(y, m, d)
-            .at(0, 0, 0, 0)
-            .to_zoned(TimeZone::UTC)
-            .unwrap()
-            .timestamp()
-    };
+    let utc = |y, m, d| super::utc(y, m, d);
     let (mut node_ids, mut ids, mut node_of, mut props) = (vec![], vec![], vec![], vec![]);
     let (mut vf, mut vt, mut rf, mut rt) = (vec![], vec![], vec![], vec![]);
     let (mut current, mut replaced) = (vec![], vec![]);

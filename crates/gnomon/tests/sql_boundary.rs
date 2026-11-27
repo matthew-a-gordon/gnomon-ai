@@ -8,7 +8,6 @@
 mod support;
 
 use gnomon::{EpisodeId, NewEpisode, Scope, Store, TenantId};
-use jiff::{civil::date, tz::TimeZone};
 use serde_json::json;
 use support::TestDb;
 use support::erasure::BM25_COUNT_TABLES;
@@ -1633,13 +1632,7 @@ async fn the_write_patch_retract_and_erasure_paths_commit_versions_that_episodes
                 .unwrap(),
         );
     }
-    let day = |m: i8| {
-        date(2024, m, 1)
-            .at(0, 0, 0, 0)
-            .to_zoned(TimeZone::UTC)
-            .unwrap()
-            .timestamp()
-    };
+    let day = |m: i8| support::utc(2024, m, 1);
     let name = |e: EpisodeId, valid: gnomon::ValidTime, name: &str| {
         gnomon::Patch::new(e, valid, support::erasure::values(json!({ "name": name })))
     };

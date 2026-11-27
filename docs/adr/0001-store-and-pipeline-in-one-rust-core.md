@@ -25,9 +25,9 @@ gnomon has two parts. The Store holds the graph and its guarantees as SQL functi
 - Times in the public Rust API are `jiff` 0.2 types, and every instant is a `jiff::Timestamp`. gnomon used `chrono` first and moved off it (#105) when it became unmaintained (RUSTSEC-2026-0543), before the shared types and the bindings could raise the cost of the change. On 2026-11-27:
   - tokio-postgres 0.7.18, PyO3 0.30.1 and `schemars` 1.2.3 all converted `jiff` 0.2. None of them converted `jiff` 1.0. rust-postgres/rust-postgres#1405 was open, and a PyO3 maintainer expected 1.0 in 0.31 (PyO3/pyo3#6609).
   - `time` 0.3 was the other crate the advisory recommended. `schemars` did not convert it.
-  - napi 3.16.3 converted no `jiff` version, so gnomon writes the Node conversion. Its `chrono` conversion made a JS `Date` in whole milliseconds, which loses part of a `timestamptz`, so gnomon could not have relied on that either.
-  - `rmcp` 3.12.0 enabled `chrono` in its default features, so gnomon takes it without them. It also depends on `jiff` 1, so the dependency tree will hold two `jiff` versions.
+  - napi 3.16.3 converted no `jiff` version, so gnomon will write the Node conversion. Its `chrono` conversion made a JS `Date` in whole milliseconds, which loses part of a `timestamptz`, so gnomon could not have relied on that either.
+  - `rmcp` 3.12.0 enabled `chrono` in its default features, so gnomon must take it without them. It also depends on `jiff` 1, so the dependency tree will hold two `jiff` versions.
 - The move to `jiff` 1.0 is a second breaking change to the public API. #109 tracks it.
 - Valid time is UTC only, so gnomon enables no time zone database feature of `jiff`.
-- A `jiff::Timestamp` ends at the year 9999 and `timestamptz` goes much further. The Store functions can be called from SQL, so a later time can be stored. A read that meets one returns an error.
+- A `jiff::Timestamp` ends at 9999-12-30T22:00 UTC, and `timestamptz` goes much further. The Store functions can be called from SQL, so a time outside the range can be stored, and a call that reads one returns an error. The Rust API refuses a retry delay that would store one.
 - The bindings, the HTTP API, JWT verification and MCP are settled in ADR-0016 to ADR-0019. The bindings expose both APIs and start no background tasks. The server verifies worker tokens against an issuer of their own, and an MCP caller runs under RLS as any other caller does.

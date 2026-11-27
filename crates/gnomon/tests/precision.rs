@@ -10,18 +10,14 @@ use gnomon::{
     AsOf, Bound, BoundChange, BoundSide, BoundStatement, EpisodeId, NewEpisode, NewNode, NodeId,
     NodeVersion, Patch, Precision, ROOT_NODE_KIND, Scope, Store, TenantId, ValidTime,
 };
-use jiff::{SignedDuration, Timestamp, civil::date, tz::TimeZone};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Map, Value, json};
 use support::TestDb;
 
 const SCOPE: &str = "support";
 
-fn at(y: i16, m: i8, d: i8, h: i8) -> Timestamp {
-    date(y, m, d)
-        .at(h, 0, 0, 0)
-        .to_zoned(TimeZone::UTC)
-        .unwrap()
-        .timestamp()
+fn at(y: i16, m: i8, d: i8, h: i64) -> Timestamp {
+    support::utc(y, m, d) + SignedDuration::from_hours(h)
 }
 
 fn values(v: Value) -> Map<String, Value> {

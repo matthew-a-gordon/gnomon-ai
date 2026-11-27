@@ -4,9 +4,11 @@
 
 mod support;
 
+use std::time::Duration;
+
 use gnomon::{
-    AsOf, EpisodeId, Error, NewEpisode, NewNode, Patch, ROOT_NODE_KIND, Scope, Store, TenantId,
-    ValidTime,
+    AsOf, EpisodeId, Error, NewEpisode, NewNode, Patch, ROOT_NODE_KIND, Scope, StageError,
+    StageOutcome, StageStatus, StageWrite, Store, TenantId, ValidTime,
 };
 use jiff::Timestamp;
 use serde_json::{Map, Value, json};
@@ -116,17 +118,70 @@ async fn a_time_finer_than_a_microsecond_is_stored_truncated_toward_the_year_200
 }
 
 #[tokio::test]
-async fn a_reference_time_after_the_year_9999_fails_the_read_with_an_error() {
+async fn a_stored_time_outside_the_range_of_a_timestamp_fails_the_read_with_an_error() {
     let w = World::new().await;
-    let rows = w
-        .sql(
-            "select gnomon.record_episode($1, 'support', 'far ahead', '10000-01-01T00:00:00Z',
-                                          null)",
+    // A `Timestamp` ends at 9999-12-30T22:00 UTC, so the last day of 9999,
+    // a common stand-in for "no end", is already past it.
+    for time in [
+        "9999-12-31T00:00:00Z",
+        "10000-01-01T00:00:00Z",
+        "infinity",
+        "-infinity",
+    ] {
+        let rows = w
+            .sql(&format!(
+                "select gnomon.record_episode($1, '{SCOPE}', 'out of range', '{time}', null)"
+            ))
+            .await;
+        let id = EpisodeId(rows[0].get(0));
+
+        assert_time_out_of_range(w.caller().read_episode(w.tenant, id).await);
+    }
+}
+
+#[tokio::test]
+async fn a_retry_delay_that_ends_past_the_range_of_a_timestamp_is_refused() {
+    let w = World::new().await;
+    let episode = w.episode(instant("2024-01-01T00:00:00Z")).await;
+    let caller = w.caller();
+    caller
+        .write_stages(w.tenant, &[StageWrite::pending(episode, "graph")])
+        .await
+        .unwrap();
+    let claim = caller
+        .claim_stage(w.tenant, Some(episode), Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("the stage is due");
+
+    // Ten thousand years, as a caller might write "never".
+    let never = Duration::from_secs(10_000 * 365 * 24 * 3600);
+    let refused = caller
+        .write_stages(
+            w.tenant,
+            &[StageWrite::Finish {
+                episode,
+                stage: "graph".into(),
+                attempt: claim.attempts,
+                outcome: StageOutcome::Retry {
+                    error: StageError {
+                        code: "model_unavailable".into(),
+                        status: None,
+                    },
+                    after: never,
+                },
+                usage: vec![],
+            }],
         )
         .await;
-    let id = EpisodeId(rows[0].get(0));
 
-    assert_time_out_of_range(w.caller().read_episode(w.tenant, id).await);
+    assert!(
+        matches!(refused, Err(Error::InvalidWrite(_))),
+        "{refused:?}"
+    );
+    // Nothing was saved, so the stage records still read.
+    let stages = caller.stage_records(w.tenant, episode).await.unwrap();
+    assert_eq!(stages[0].status, StageStatus::Running);
 }
 
 #[tokio::test]

@@ -75,6 +75,13 @@ pub fn chain(e: &dyn std::error::Error) -> String {
     out
 }
 
+/// The start of a day in UTC.
+pub fn utc(y: i16, m: i8, d: i8) -> jiff::Timestamp {
+    jiff::tz::Offset::UTC
+        .to_timestamp(jiff::civil::date(y, m, d).at(0, 0, 0, 0))
+        .expect("the day is in range")
+}
+
 /// A new Tenant, unknown to every other test.
 pub fn tenant() -> gnomon::TenantId {
     gnomon::TenantId(uuid::Uuid::new_v4())

@@ -12,7 +12,7 @@ use gnomon::{
     AsOf, EpisodeId, Error, KindOf, NewEpisode, NewKind, NewNode, NodeId, Patch, Scope, Store,
     TenantId, ValidTime, VersionId,
 };
-use jiff::{Timestamp, civil::date, tz::TimeZone};
+use jiff::Timestamp;
 use serde_json::{Map, Value, json};
 use support::TestDb;
 
@@ -266,11 +266,7 @@ fn values(v: Value) -> Map<String, Value> {
 }
 
 fn day(d: i8) -> jiff::Timestamp {
-    date(2024, 1, d)
-        .at(0, 0, 0, 0)
-        .to_zoned(TimeZone::UTC)
-        .unwrap()
-        .timestamp()
+    support::utc(2024, 1, d)
 }
 
 #[tokio::test]

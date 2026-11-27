@@ -11,7 +11,7 @@ use gnomon::{
     NewKind, NewNode, NodeId, NodeVersion, Patch, Scope, StatementKind, Store, TenantId, ValidTime,
     WriteOutcome, WriteStatus,
 };
-use jiff::{Timestamp, civil::date, tz::TimeZone};
+use jiff::Timestamp;
 use serde_json::{Map, Value, json};
 use support::TestDb;
 use tokio_postgres::types::Type;
@@ -19,11 +19,7 @@ use tokio_postgres::types::Type;
 const SCOPE: &str = "support";
 
 fn at(y: i16, m: i8, d: i8) -> Timestamp {
-    date(y, m, d)
-        .at(0, 0, 0, 0)
-        .to_zoned(TimeZone::UTC)
-        .unwrap()
-        .timestamp()
+    support::utc(y, m, d)
 }
 
 fn values(v: Value) -> Map<String, Value> {

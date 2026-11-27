@@ -8,7 +8,7 @@ use gnomon::{
     NewNode, NodeId, NodeVersion, Patch, Scope, StageOutcome, StageRecord, StageUsage, StageWrite,
     Store, TenantId, ValidTime, VersionId,
 };
-use jiff::{Timestamp, civil::date, tz::TimeZone};
+use jiff::Timestamp;
 use serde_json::{Map, Value, json};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, GenericClient};
@@ -23,11 +23,7 @@ pub const SCOPE: &str = "support";
 pub const ALL_SCOPES: &[&str] = &[SCOPE, "billing", "hr"];
 
 pub fn at(y: i16, m: i8, d: i8) -> Timestamp {
-    date(y, m, d)
-        .at(0, 0, 0, 0)
-        .to_zoned(TimeZone::UTC)
-        .unwrap()
-        .timestamp()
+    super::utc(y, m, d)
 }
 
 pub fn values(v: Value) -> Map<String, Value> {

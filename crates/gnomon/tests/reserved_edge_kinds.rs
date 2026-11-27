@@ -14,7 +14,7 @@ use gnomon::{
     NewEdge, NewEpisode, NewKind, NewNode, NodeId, Patch, ROOT_EDGE_KIND, ROOT_NODE_KIND,
     Retraction, SAME_AS_KIND, Scope, Store, TenantId, Traversal, ValidTime, WriteStatus,
 };
-use jiff::{Timestamp, civil::date, tz::TimeZone};
+use jiff::Timestamp;
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use support::TestDb;
@@ -23,11 +23,7 @@ const SCOPE: &str = "support";
 const RESERVED: [&str; 2] = [SAME_AS_KIND, DIFFERENT_FROM_KIND];
 
 fn day(d: i8) -> Timestamp {
-    date(2024, 1, d)
-        .at(0, 0, 0, 0)
-        .to_zoned(TimeZone::UTC)
-        .unwrap()
-        .timestamp()
+    support::utc(2024, 1, d)
 }
 
 fn values(v: Value) -> Map<String, Value> {

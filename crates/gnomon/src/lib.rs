@@ -11,9 +11,10 @@
 //! Times are [`jiff::Timestamp`]s, version 0.2, stored as `timestamptz` to
 //! the microsecond. The driver truncates a time with finer digits toward
 //! 2000-01-01 UTC, so a time after it moves down to the microsecond and a time
-//! before it moves up. A time the Store returns passes back unchanged. A
-//! `Timestamp` ends at the year 9999, and a read that meets a later stored
-//! time fails with [`Error::Database`].
+//! before it moves up. A time the Store returns passes back unchanged.
+//! `timestamptz` holds times a `Timestamp` cannot, such as `infinity` and
+//! any time after [`jiff::Timestamp::MAX`], 9999-12-30T22:00 UTC. A call that
+//! reads one fails with [`Error::Database`].
 
 mod connect;
 mod edge;
@@ -204,8 +205,9 @@ pub enum Error {
     KindConflict(String),
     /// The Store refused a write: it cites no Episode, its Valid time is
     /// empty, a value does not satisfy the Kind of the Node or Edge, an Edge
-    /// Kind does not allow an endpoint's Kind, or a Node, Edge or Episode is
-    /// not visible to the caller. The message says which.
+    /// Kind does not allow an endpoint's Kind, a Node, Edge or Episode is not
+    /// visible to the caller, or a retry is due after
+    /// [`jiff::Timestamp::MAX`]. The message says which.
     #[error("invalid write: {0}")]
     InvalidWrite(String),
     /// The call named no Tenant, and the deployment is multi-tenant, so it
@@ -268,11 +270,9 @@ pub enum Error {
     )]
     RolledBack,
     /// Postgres refused or failed the call for any other reason, such as a
-    /// check violation or an invalid argument (SQLSTATE 22023). A read that
-    /// meets a stored time after the year 9999, which a
-    /// [`jiff::Timestamp`] cannot hold, fails with this too. Only a write
-    /// made from SQL can store one, and
-    /// [`sqlstate`](Self::sqlstate) then returns `None`.
+    /// check violation or an invalid argument (SQLSTATE 22023). A call that
+    /// reads a time outside the range of a [`jiff::Timestamp`] fails with
+    /// this too, and [`sqlstate`](Self::sqlstate) then returns `None`.
     #[error(transparent)]
     Database(tokio_postgres::Error),
 }
