@@ -7,8 +7,10 @@ mod support;
 
 use gnomon::{AsOf, Caller, FullTextCandidate, KindOf, NewKind, ValidTime, Versioned};
 use gnomon::{NewEdge, NewNode, Patch, Scope};
+use jiff::SignedDuration;
 use serde_json::json;
 use support::erasure::{SCOPE, World, assert_search_counts_match_the_token_rows, at, values};
+use support::timestamptz::Timestamptz;
 use tokio_postgres::Client;
 use tokio_postgres::types::Type;
 
@@ -375,7 +377,7 @@ async fn a_batch_is_indexed_in_its_own_transaction_and_a_replaced_version_leaves
             "select count(*) from gnomon.search_full_text($1, 'vandelay', $2, null, 10)",
             &[
                 (&w.tenant.0, Type::UUID),
-                (&at(2024, 6, 1), Type::TIMESTAMPTZ),
+                (&Timestamptz(at(2024, 6, 1)), Type::TIMESTAMPTZ),
             ],
         )
         .await
@@ -444,7 +446,7 @@ async fn results_honour_the_as_of_instants() {
     );
     let before_all = AsOf::at(
         at(2024, 4, 1),
-        first.recorded_from - chrono::Duration::seconds(1),
+        first.recorded_from - SignedDuration::from_secs(1),
     );
     assert_eq!(found(&caller, &w, "umbrella", before_all).await, vec![]);
 }

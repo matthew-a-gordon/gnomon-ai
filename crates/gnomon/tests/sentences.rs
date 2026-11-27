@@ -12,6 +12,7 @@ use serde_json::json;
 use support::erasure::{
     World, assert_no_unused_full_vector, assert_search_counts_match_the_token_rows, at,
 };
+use support::timestamptz::Timestamptz;
 use support::vectors::{Rng, sentence_hash};
 use tokio_postgres::Client;
 use tokio_postgres::types::Type;
@@ -125,7 +126,7 @@ async fn a_sentences_words_and_counts_are_written_in_its_own_transaction() {
             search,
             &[
                 (&w.tenant.0, Type::UUID),
-                (&at(2024, 6, 1), Type::TIMESTAMPTZ),
+                (&Timestamptz(at(2024, 6, 1)), Type::TIMESTAMPTZ),
             ],
         )
         .await

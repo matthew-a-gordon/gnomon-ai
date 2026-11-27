@@ -5,11 +5,12 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use jiff::{SignedDuration, Timestamp};
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
 use super::erasure::World;
+use super::timestamptz::Timestamptz;
 
 /// The embedding dimension the suites use.
 pub const DIM: usize = super::DEFAULT_DIMENSION as usize;
@@ -114,16 +115,16 @@ pub struct SyntheticVersion {
     pub id: Uuid,
     pub scope: String,
     pub text: usize,
-    pub valid_from: DateTime<Utc>,
-    pub valid_to: Option<DateTime<Utc>>,
-    pub recorded_from: DateTime<Utc>,
-    pub recorded_to: Option<DateTime<Utc>>,
+    pub valid_from: Timestamp,
+    pub valid_to: Option<Timestamp>,
+    pub recorded_from: Timestamp,
+    pub recorded_to: Option<Timestamp>,
 }
 
 impl SyntheticVersion {
     /// Whether an As-of read at `valid_at` and `known_at` (`None`: the
     /// current belief) sees this Version.
-    pub fn visible(&self, valid_at: DateTime<Utc>, known_at: Option<DateTime<Utc>>) -> bool {
+    pub fn visible(&self, valid_at: Timestamp, known_at: Option<Timestamp>) -> bool {
         let valid = self.valid_from <= valid_at && self.valid_to.is_none_or(|t| valid_at < t);
         let known = match known_at {
             None => self.recorded_to.is_none(),
@@ -148,8 +149,8 @@ impl Corpus {
         &self,
         query: &[f32],
         scopes: &[&str],
-        valid_at: DateTime<Utc>,
-        known_at: Option<DateTime<Utc>>,
+        valid_at: Timestamp,
+        known_at: Option<Timestamp>,
         k: usize,
     ) -> Vec<Uuid> {
         let mut d: Vec<(f64, Uuid)> = self
@@ -165,8 +166,8 @@ impl Corpus {
     pub fn visible(
         &self,
         scopes: &[&str],
-        valid_at: DateTime<Utc>,
-        known_at: Option<DateTime<Utc>>,
+        valid_at: Timestamp,
+        known_at: Option<Timestamp>,
     ) -> usize {
         self.versions
             .iter()
@@ -175,9 +176,13 @@ impl Corpus {
     }
 }
 
-fn day(rng: &mut Rng, from: DateTime<Utc>, to: DateTime<Utc>) -> DateTime<Utc> {
-    let days = (to - from).num_days() as usize;
-    from + Duration::days(rng.below(days) as i64)
+fn days(n: i64) -> SignedDuration {
+    SignedDuration::from_hours(24 * n)
+}
+
+fn day(rng: &mut Rng, from: Timestamp, to: Timestamp) -> Timestamp {
+    let between = to.duration_since(from).as_hours() as usize / 24;
+    from + days(rng.below(between) as i64)
 }
 
 /// Loads `n` texts into `scope` of `tenant`, as prototype 5's generator
@@ -200,7 +205,7 @@ pub async fn load(
     centres: &[Vec<f32>],
     rng: &mut Rng,
 ) {
-    let utc = |y, m, d| Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap();
+    let utc = |y, m, d| super::utc(y, m, d);
     let (r_start, r_end) = (utc(2024, 1, 1), utc(2026, 11, 1));
     let (mut node_ids, mut ids, mut node_of, mut props) = (vec![], vec![], vec![], vec![]);
     let (mut vf, mut vt, mut rf, mut rt) = (vec![], vec![], vec![], vec![]);
@@ -218,8 +223,7 @@ pub async fn load(
             (None, None)
         } else {
             let from = day(rng, utc(2020, 1, 1), utc(2025, 6, 1));
-            let to =
-                (rng.uniform() >= 0.7).then(|| from + Duration::days(100 + rng.below(1400) as i64));
+            let to = (rng.uniform() >= 0.7).then(|| from + days(100 + rng.below(1400) as i64));
             (Some(from), to)
         };
         // The Versions of the chain, in Recorded time.
@@ -234,16 +238,16 @@ pub async fn load(
             }
             made += 1;
         }
-        let mut at = day(rng, r_start, r_end - Duration::days(30));
+        let mut at = day(rng, r_start, r_end - days(30));
         for (i, text) in held.iter().enumerate() {
             // Each Version but the last is closed by the next, from one to
             // 200 days later and before the end of the range.
             let next = (i + 1 < held.len()).then(|| {
-                let later = at + Duration::days(1 + rng.below(200) as i64);
+                let later = at + days(1 + rng.below(200) as i64);
                 if later < r_end {
                     later
                 } else {
-                    at + Duration::hours(1)
+                    at + SignedDuration::from_hours(1)
                 }
             });
             let id = Uuid::new_v4();
@@ -251,7 +255,7 @@ pub async fn load(
                 id,
                 scope: scope.to_owned(),
                 text: *text,
-                valid_from: valid_from.unwrap_or(DateTime::<Utc>::MIN_UTC),
+                valid_from: valid_from.unwrap_or(Timestamp::MIN),
                 valid_to,
                 recorded_from: at,
                 recorded_to: next,
@@ -259,10 +263,10 @@ pub async fn load(
             ids.push(id);
             node_of.push(node);
             props.push(serde_json::json!({ "name": format!("{scope} text {text}") }).to_string());
-            vf.push(valid_from);
-            vt.push(valid_to);
-            rf.push(at);
-            rt.push(next);
+            vf.push(valid_from.map(Timestamptz));
+            vt.push(valid_to.map(Timestamptz));
+            rf.push(Timestamptz(at));
+            rt.push(next.map(Timestamptz));
             if let Some(n) = next {
                 at = n;
             }
@@ -412,8 +416,8 @@ pub struct SyntheticName {
     /// Whether its Version is the current belief, or one a later Version
     /// replaced.
     pub current: bool,
-    pub valid_from: DateTime<Utc>,
-    pub valid_to: Option<DateTime<Utc>>,
+    pub valid_from: Timestamp,
+    pub valid_to: Option<Timestamp>,
 }
 
 /// The texts and names of the synthetic name corpus a test loaded.
@@ -432,7 +436,7 @@ impl NameCorpus {
         &self,
         query: &[f32],
         scopes: &[&str],
-        valid_at: Option<DateTime<Utc>>,
+        valid_at: Option<Timestamp>,
         k: usize,
     ) -> Vec<Uuid> {
         let mut best: HashMap<Uuid, f64> = HashMap::new();
@@ -485,7 +489,7 @@ pub async fn load_names(
     centres: &[Vec<f32>],
     rng: &mut Rng,
 ) {
-    let utc = |y, m, d| Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap();
+    let utc = |y, m, d| super::utc(y, m, d);
     let (mut node_ids, mut ids, mut node_of, mut props) = (vec![], vec![], vec![], vec![]);
     let (mut vf, mut vt, mut rf, mut rt) = (vec![], vec![], vec![], vec![]);
     let (mut current, mut replaced) = (vec![], vec![]);
@@ -502,8 +506,7 @@ pub async fn load_names(
             (None, None)
         } else {
             let from = day(rng, utc(2020, 1, 1), utc(2025, 6, 1));
-            let to =
-                (rng.uniform() >= 0.7).then(|| from + Duration::days(100 + rng.below(1400) as i64));
+            let to = (rng.uniform() >= 0.7).then(|| from + days(100 + rng.below(1400) as i64));
             (Some(from), to)
         };
         let replaced_at = day(rng, utc(2024, 1, 1), utc(2026, 1, 1));
@@ -526,7 +529,7 @@ pub async fn load_names(
                     scope: scope.to_owned(),
                     text: *t,
                     current: is_current,
-                    valid_from: valid_from.unwrap_or(DateTime::<Utc>::MIN_UTC),
+                    valid_from: valid_from.unwrap_or(Timestamp::MIN),
                     valid_to,
                 });
                 if is_current {
@@ -544,14 +547,18 @@ pub async fn load_names(
                 })
                 .to_string(),
             );
-            vf.push(valid_from);
-            vt.push(valid_to);
+            vf.push(valid_from.map(Timestamptz));
+            vt.push(valid_to.map(Timestamptz));
             if is_current {
-                rf.push(if only { utc(2024, 1, 1) } else { replaced_at });
+                rf.push(Timestamptz(if only {
+                    utc(2024, 1, 1)
+                } else {
+                    replaced_at
+                }));
                 rt.push(None);
             } else {
-                rf.push(utc(2023, 6, 1));
-                rt.push(Some(replaced_at));
+                rf.push(Timestamptz(utc(2023, 6, 1)));
+                rt.push(Some(Timestamptz(replaced_at)));
             }
         }
     }

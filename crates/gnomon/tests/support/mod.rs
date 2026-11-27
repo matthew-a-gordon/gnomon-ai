@@ -22,6 +22,8 @@ pub mod erasure;
 pub mod install;
 pub mod perf;
 pub mod server;
+#[path = "../../src/timestamptz.rs"]
+pub mod timestamptz;
 pub mod tls;
 pub mod vectors;
 pub mod wire;
@@ -73,6 +75,13 @@ pub fn chain(e: &dyn std::error::Error) -> String {
         source = s.source();
     }
     out
+}
+
+/// The start of a day in UTC.
+pub fn utc(y: i16, m: i8, d: i8) -> jiff::Timestamp {
+    jiff::tz::Offset::UTC
+        .to_timestamp(jiff::civil::date(y, m, d).at(0, 0, 0, 0))
+        .expect("the day is in range")
 }
 
 /// A new Tenant, unknown to every other test.

@@ -7,11 +7,11 @@
 
 mod support;
 
-use chrono::{TimeZone, Utc};
 use gnomon::{EpisodeId, NewEpisode, Scope, Store, TenantId};
 use serde_json::json;
 use support::TestDb;
 use support::erasure::BM25_COUNT_TABLES;
+use support::timestamptz::Timestamptz;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Transaction};
@@ -77,7 +77,7 @@ async fn world() -> World {
                     tenant: Some(TenantId(t)),
                     scope: Scope::new(scope.clone()),
                     content: format!("{t} {scope}"),
-                    reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                    reference_time: "2024-01-01T00:00:00Z".parse().unwrap(),
                     authority: None,
                 })
                 .await
@@ -1386,7 +1386,7 @@ async fn as_the_writer_role_deleting_or_rewriting_committed_history_changes_noth
                 scope: Scope::new("support"),
                 node: gnomon::NodeId(n.n1),
                 content: "a Summary".into(),
-                as_of_valid: Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap(),
+                as_of_valid: "2024-06-01T00:00:00Z".parse().unwrap(),
                 citations: cites.clone(),
             },
         )
@@ -1400,7 +1400,7 @@ async fn as_the_writer_role_deleting_or_rewriting_committed_history_changes_noth
                 replaces: vec![],
                 members: vec![gnomon::NodeId(n.n1)],
                 content: "a Community".into(),
-                as_of_valid: Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap(),
+                as_of_valid: "2024-06-01T00:00:00Z".parse().unwrap(),
                 citations: cites,
             },
         )
@@ -1626,14 +1626,14 @@ async fn the_write_patch_retract_and_erasure_paths_commit_versions_that_episodes
                     tenant: Some(t),
                     scope: Scope::new("support"),
                     content: format!("Episode {i}"),
-                    reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                    reference_time: "2024-01-01T00:00:00Z".parse().unwrap(),
                     authority: None,
                 })
                 .await
                 .unwrap(),
         );
     }
-    let day = |m: u32| Utc.with_ymd_and_hms(2024, m, 1, 0, 0, 0).unwrap();
+    let day = |m: i8| support::utc(2024, m, 1);
     let name = |e: EpisodeId, valid: gnomon::ValidTime, name: &str| {
         gnomon::Patch::new(e, valid, support::erasure::values(json!({ "name": name })))
     };
@@ -2001,7 +2001,7 @@ async fn in_multi_tenant_mode_claims_that_bind_no_tenant_reach_no_row_of_the_for
             tenant: None,
             scope: Scope::new("support"),
             content: "the default Tenant's".into(),
-            reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            reference_time: "2024-01-01T00:00:00Z".parse().unwrap(),
             authority: None,
         })
         .await
@@ -2146,7 +2146,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
             tenant: None,
             scope: Scope::new("support"),
             content: "Ada, 36.".into(),
-            reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            reference_time: "2024-01-01T00:00:00Z".parse().unwrap(),
             authority: None,
         })
         .await
@@ -2176,7 +2176,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
                 version: written.opened[0],
                 side: gnomon::BoundSide::Start,
                 bound: gnomon::Bound::Period {
-                    at: Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap(),
+                    at: "2024-03-01T00:00:00Z".parse().unwrap(),
                     precision: gnomon::Precision::Month,
                 },
             },
@@ -2190,7 +2190,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
             node,
             &gnomon::EndOfValidity {
                 episode,
-                at: gnomon::Bound::At(Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap()),
+                at: gnomon::Bound::At("2024-06-01T00:00:00Z".parse().unwrap()),
             },
         )
         .await
@@ -2202,7 +2202,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
             tenant: None,
             scope: Scope::new("support"),
             content: "retracted".into(),
-            reference_time: Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap(),
+            reference_time: "2024-02-01T00:00:00Z".parse().unwrap(),
             authority: None,
         })
         .await
@@ -2264,7 +2264,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         .read_node(
             None,
             node,
-            gnomon::AsOf::current(Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap()),
+            gnomon::AsOf::current("2024-04-01T00:00:00Z".parse().unwrap()),
         )
         .await
         .unwrap()
@@ -2287,7 +2287,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
                 scope: Scope::new("support"),
                 node,
                 content: "Ada is 36.".into(),
-                as_of_valid: Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap(),
+                as_of_valid: "2024-04-01T00:00:00Z".parse().unwrap(),
                 citations: vec![gnomon::DerivedCitation::of(episode)],
             },
         )
@@ -2301,7 +2301,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
                 replaces: vec![],
                 members: vec![node],
                 content: "Ada, on her own.".into(),
-                as_of_valid: Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap(),
+                as_of_valid: "2024-04-01T00:00:00Z".parse().unwrap(),
                 citations: vec![gnomon::DerivedCitation::of(episode)],
             },
         )
@@ -2826,7 +2826,7 @@ async fn global_default_privileges_give_callers_no_right_the_migrations_do_not()
             tenant: Some(TenantId(t)),
             scope: Scope::new("support"),
             content: "an Episode".into(),
-            reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            reference_time: "2024-01-01T00:00:00Z".parse().unwrap(),
             authority: Some(1),
         })
         .await
@@ -4046,7 +4046,7 @@ async fn erasable(n: &Nodes) -> Uuid {
             tenant: Some(TenantId(n.w.t1)),
             scope: Scope::new("support"),
             content: "another source".into(),
-            reference_time: Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap(),
+            reference_time: "2024-02-01T00:00:00Z".parse().unwrap(),
             authority: None,
         })
         .await
@@ -4934,12 +4934,12 @@ async fn a_caller_reads_only_its_own_tenants_and_scopes_token_rows_and_counts() 
         }
         // Search finds only the caller's own Scope, and nothing when it
         // names the other Tenant.
-        let at = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
+        let at: jiff::Timestamp = "2024-06-01T00:00:00Z".parse().unwrap();
         for (tenant, expected) in [(w.t1, vec!["support".to_owned()]), (w.t2, vec![])] {
             let scopes: Vec<String> = tx
                 .query_typed(
                     "select scope from gnomon.search_full_text($1, 'zebra billing support', $2, null, 10)",
-                    &[(&tenant, Type::UUID), (&at, Type::TIMESTAMPTZ)],
+                    &[(&tenant, Type::UUID), (&Timestamptz(at), Type::TIMESTAMPTZ)],
                 )
                 .await
                 .unwrap()
@@ -5169,7 +5169,7 @@ async fn embedded_world() -> EmbeddedWorld {
             .read_node(
                 TenantId(w.t1),
                 node,
-                gnomon::AsOf::current(Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap()),
+                gnomon::AsOf::current("2024-06-01T00:00:00Z".parse().unwrap()),
             )
             .await
             .unwrap()
@@ -5242,14 +5242,14 @@ async fn a_caller_reads_only_its_own_tenants_and_scopes_embeddings() {
         }
         // Search finds only the caller's own Scope, and nothing when it
         // names the other Tenant.
-        let at = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
+        let at: jiff::Timestamp = "2024-06-01T00:00:00Z".parse().unwrap();
         for (tenant, expected) in [(w.t1, vec!["support".to_owned()]), (w.t2, vec![])] {
             let scopes: Vec<String> = tx
                 .query_typed(
                     &format!(
                         "select distinct scope from gnomon.search_vector($1, {query}, $2, null, 400)"
                     ),
-                    &[(&tenant, Type::UUID), (&at, Type::TIMESTAMPTZ)],
+                    &[(&tenant, Type::UUID), (&Timestamptz(at), Type::TIMESTAMPTZ)],
                 )
                 .await
                 .unwrap()
@@ -5407,7 +5407,7 @@ async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_c
             tenant: Some(t),
             scope: Scope::new("support"),
             content: "an Episode".into(),
-            reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            reference_time: "2024-01-01T00:00:00Z".parse().unwrap(),
             authority: None,
         })
         .await
@@ -5427,7 +5427,7 @@ async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_c
         )
         .await
         .unwrap();
-    let as_of = gnomon::AsOf::current(Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap());
+    let as_of = gnomon::AsOf::current("2024-06-01T00:00:00Z".parse().unwrap());
     let version = caller.read_node(t, node, as_of).await.unwrap().unwrap();
     let embedding = support::vectors::Rng::new(1).unit();
     caller
@@ -5460,7 +5460,7 @@ async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_c
             &[
                 (&t.0, Type::UUID),
                 (&embedding, Type::FLOAT4_ARRAY),
-                (&as_of.valid_at, Type::TIMESTAMPTZ),
+                (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
             ],
         )
         .await
@@ -5547,7 +5547,7 @@ async fn summarized() -> Summarized {
         }))
         .unwrap(),
     );
-    let at = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
+    let at: jiff::Timestamp = "2024-06-01T00:00:00Z".parse().unwrap();
     let summary = |scope: &str, node: Uuid, episode: Uuid, content: &str| gnomon::NewSummary {
         scope: Scope::new(scope),
         node: gnomon::NodeId(node),
@@ -6277,7 +6277,7 @@ async fn derived_world() -> DerivedWorld {
         let (tenant, scope, node, episode): (Uuid, String, Uuid, Uuid) =
             (row.get(0), row.get(1), row.get(2), row.get(3));
         let caller = store.as_worker(TenantId(tenant), Scope::new(scope.clone()), None);
-        let at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let at = "2024-01-01T00:00:00Z".parse().unwrap();
         let summary = caller
             .write_summary(
                 TenantId(tenant),
@@ -6343,7 +6343,7 @@ async fn derived_world() -> DerivedWorld {
                 scope: Scope::new("support"),
                 node: other,
                 content: "plain prose".into(),
-                as_of_valid: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                as_of_valid: "2024-01-01T00:00:00Z".parse().unwrap(),
                 citations: vec![gnomon::DerivedCitation::of(EpisodeId(w.t1_support))],
             },
         )
@@ -6762,7 +6762,7 @@ async fn an_episode_edge_or_summary_of_a_scope_the_caller_cannot_see_changes_no_
                 tenant: Some(t1),
                 scope: Scope::new("billing"),
                 content: format!("hidden {i}"),
-                reference_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                reference_time: "2024-01-01T00:00:00Z".parse().unwrap(),
                 authority: None,
             })
             .await
@@ -6802,7 +6802,7 @@ async fn an_episode_edge_or_summary_of_a_scope_the_caller_cannot_see_changes_no_
             scope: Scope::new("billing"),
             node: gnomon::NodeId(dw.support_node),
             content: "zebra zebra, as billing tells it".into(),
-            as_of_valid: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            as_of_valid: "2024-01-01T00:00:00Z".parse().unwrap(),
             citations: episodes
                 .iter()
                 .map(|e| gnomon::DerivedCitation::of(*e))

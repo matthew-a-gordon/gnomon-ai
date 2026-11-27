@@ -9,8 +9,10 @@ mod support;
 use gnomon::{
     AsOf, Bound, BoundSide, BoundStatement, Precision, ValidTime, VectorCandidate, Versioned,
 };
+use jiff::SignedDuration;
 use serde_json::json;
 use support::erasure::{SCOPE, World, at};
+use support::timestamptz::Timestamptz;
 use support::vectors::{Rng, cosine_distance, embed_every_version, sentence_hash};
 
 fn now() -> AsOf {
@@ -138,10 +140,7 @@ async fn versions_with_the_same_text_share_one_full_vector_and_each_has_its_own_
         .search_vector(
             w.tenant,
             &query,
-            AsOf::at(
-                at(2024, 6, 1),
-                refined_at - chrono::Duration::microseconds(1),
-            ),
+            AsOf::at(at(2024, 6, 1), refined_at - SignedDuration::from_micros(1)),
             10,
         )
         .await
@@ -311,7 +310,7 @@ async fn vector_search_honours_the_valid_at_and_known_at_instants() {
                 .collect::<Vec<_>>()
         }
     };
-    let before = changed_at - chrono::Duration::microseconds(1);
+    let before = changed_at - SignedDuration::from_micros(1);
     // Before the write, the basic Version held at both valid-at instants.
     assert_eq!(
         found(AsOf::at(at(2024, 6, 1), before)).await,
@@ -333,7 +332,7 @@ async fn vector_search_honours_the_valid_at_and_known_at_instants() {
     assert!(
         found(AsOf::at(
             at(2024, 6, 1),
-            basic.recorded_from - chrono::Duration::seconds(1)
+            basic.recorded_from - SignedDuration::from_secs(1)
         ))
         .await
         .is_empty()
@@ -678,8 +677,14 @@ async fn the_re_rank_reads_each_candidates_full_vector_by_one_primary_key_probe(
                 &[
                     (&w.tenant.0, tokio_postgres::types::Type::UUID),
                     (&query, tokio_postgres::types::Type::FLOAT4_ARRAY),
-                    (&as_of.valid_at, tokio_postgres::types::Type::TIMESTAMPTZ),
-                    (&as_of.known_at, tokio_postgres::types::Type::TIMESTAMPTZ),
+                    (
+                        &Timestamptz(as_of.valid_at),
+                        tokio_postgres::types::Type::TIMESTAMPTZ,
+                    ),
+                    (
+                        &as_of.known_at.map(Timestamptz),
+                        tokio_postgres::types::Type::TIMESTAMPTZ,
+                    ),
                 ],
             )
             .await

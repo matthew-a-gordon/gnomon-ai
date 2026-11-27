@@ -6,20 +6,20 @@
 
 mod support;
 
-use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
     AsOf, Bound, EdgeId, EndOfValidity, EpisodeId, Error, KindOf, MergeRule, NewEdge, NewEpisode,
     NewKind, NewNode, NodeId, NodeVersion, Patch, Scope, StatementKind, Store, TenantId, ValidTime,
     WriteOutcome, WriteStatus,
 };
+use jiff::Timestamp;
 use serde_json::{Map, Value, json};
 use support::TestDb;
 use tokio_postgres::types::Type;
 
 const SCOPE: &str = "support";
 
-fn at(y: i32, m: u32, d: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+fn at(y: i16, m: i8, d: i8) -> Timestamp {
+    support::utc(y, m, d)
 }
 
 fn values(v: Value) -> Map<String, Value> {
@@ -91,7 +91,7 @@ impl World {
             .unwrap();
     }
 
-    async fn episode(&self, reference_time: DateTime<Utc>, authority: Option<i32>) -> EpisodeId {
+    async fn episode(&self, reference_time: Timestamp, authority: Option<i32>) -> EpisodeId {
         self.caller()
             .record_episode(&NewEpisode {
                 tenant: Some(self.tenant),
@@ -157,7 +157,7 @@ impl World {
             .0
     }
 
-    async fn read(&self, node: NodeId, valid_at: DateTime<Utc>) -> Option<NodeVersion> {
+    async fn read(&self, node: NodeId, valid_at: Timestamp) -> Option<NodeVersion> {
         self.caller()
             .read_node(self.tenant, node, AsOf::current(valid_at))
             .await
@@ -167,8 +167,8 @@ impl World {
     async fn read_as_of(
         &self,
         node: NodeId,
-        valid_at: DateTime<Utc>,
-        known_at: DateTime<Utc>,
+        valid_at: Timestamp,
+        known_at: Timestamp,
     ) -> Option<NodeVersion> {
         self.caller()
             .read_node(self.tenant, node, AsOf::at(valid_at, known_at))
@@ -176,7 +176,7 @@ impl World {
             .unwrap()
     }
 
-    async fn plan(&self, node: NodeId, valid_at: DateTime<Utc>) -> Option<String> {
+    async fn plan(&self, node: NodeId, valid_at: Timestamp) -> Option<String> {
         self.read(node, valid_at).await.and_then(|v| {
             v.values
                 .get("plan")
@@ -185,7 +185,7 @@ impl World {
         })
     }
 
-    async fn edge_holds(&self, edge: EdgeId, valid_at: DateTime<Utc>) -> bool {
+    async fn edge_holds(&self, edge: EdgeId, valid_at: Timestamp) -> bool {
         self.caller()
             .read_edge(self.tenant, edge, AsOf::current(valid_at))
             .await
@@ -217,7 +217,7 @@ impl World {
             .unwrap()
     }
 
-    async fn end(&self, node: NodeId, episode: EpisodeId, when: DateTime<Utc>) -> WriteOutcome {
+    async fn end(&self, node: NodeId, episode: EpisodeId, when: Timestamp) -> WriteOutcome {
         self.caller()
             .end_node_validity(
                 self.tenant,

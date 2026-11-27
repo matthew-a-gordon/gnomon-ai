@@ -678,7 +678,7 @@ async fn concurrent_claimers_never_get_the_same_record() {
     const RECORDS: usize = 24;
     let w = World::new().await;
     for d in 0..RECORDS / 3 {
-        let e = w.episode(at(2024, 1, 1 + d as u32), None).await;
+        let e = w.episode(at(2024, 1, 1 + d as i8), None).await;
         for stage in ["graph", "sentences", "embeddings"] {
             w.pending(e, stage).await;
         }

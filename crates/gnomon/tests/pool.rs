@@ -12,7 +12,6 @@ mod support;
 use std::future::Future;
 use std::time::Duration;
 
-use chrono::{TimeZone, Utc};
 use gnomon::{Error, NewEpisode, Patch, Scope, Store, TenantId, UnavailableReason, ValidTime};
 use serde_json::json;
 use support::erasure::{World, at, values};
@@ -25,7 +24,7 @@ fn episode(tenant: TenantId, content: &str) -> NewEpisode {
         tenant: Some(tenant),
         scope: Scope::new("support"),
         content: content.to_owned(),
-        reference_time: Utc.with_ymd_and_hms(2024, 3, 14, 9, 30, 0).unwrap(),
+        reference_time: "2024-03-14T09:30:00Z".parse().unwrap(),
         authority: None,
     }
 }

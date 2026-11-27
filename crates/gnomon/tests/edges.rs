@@ -7,19 +7,19 @@
 
 mod support;
 
-use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
     AsOf, Bound, BoundChange, BoundSide, BoundStatement, Direction, EdgeId, EpisodeId, Error,
     KindOf, MergeRule, NewEdge, NewEpisode, NewKind, NewNode, NodeId, Patch, Precision,
     ROOT_EDGE_KIND, ROOT_NODE_KIND, Scope, Store, TenantId, Traversal, ValidTime, WriteStatus,
 };
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Map, Value, json};
 use support::TestDb;
 
 const SCOPE: &str = "support";
 
-fn day(d: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2024, 1, d, 0, 0, 0).unwrap()
+fn day(d: i8) -> Timestamp {
+    support::utc(2024, 1, d)
 }
 
 fn values(v: Value) -> Map<String, Value> {
@@ -101,7 +101,7 @@ impl World {
         }
     }
 
-    async fn episode(&self, reference_time: DateTime<Utc>) -> EpisodeId {
+    async fn episode(&self, reference_time: Timestamp) -> EpisodeId {
         self.caller()
             .record_episode(&NewEpisode {
                 tenant: Some(self.tenant),
@@ -138,7 +138,7 @@ impl World {
         kind: &str,
         source: NodeId,
         target: NodeId,
-        reference_time: DateTime<Utc>,
+        reference_time: Timestamp,
         vt: ValidTime,
         v: Value,
     ) -> EdgeId {
@@ -273,7 +273,7 @@ async fn an_edges_property_values_go_through_contributions_and_versions_as_a_nod
             edge,
             AsOf::at(
                 day(25),
-                outcome.recorded_at - chrono::Duration::microseconds(1),
+                outcome.recorded_at - SignedDuration::from_micros(1),
             ),
         )
         .await
@@ -689,7 +689,7 @@ async fn reads_and_traversal_return_each_edge_versions_sentence_or_none_until_on
             edge,
             AsOf::at(
                 day(15),
-                outcome.recorded_at - chrono::Duration::microseconds(1),
+                outcome.recorded_at - SignedDuration::from_micros(1),
             ),
         )
         .await
@@ -947,7 +947,7 @@ async fn a_batch_as_of_read_returns_each_nodes_version_in_the_order_given() {
     assert_eq!(
         names(AsOf::at(
             day(20),
-            outcome.recorded_at - chrono::Duration::microseconds(1)
+            outcome.recorded_at - SignedDuration::from_micros(1)
         ))
         .await,
         expect("Acme")
@@ -1116,6 +1116,6 @@ async fn ranked_merge_and_bound_statements_apply_to_edges_as_to_nodes() {
     assert!(refined.uncertain);
     assert_eq!(refined.values["role"], "cto");
     assert_eq!(refined.text_hash, v.text_hash);
-    let before = Utc.with_ymd_and_hms(2023, 12, 31, 0, 0, 0).unwrap();
+    let before = "2023-12-31T00:00:00Z".parse().unwrap();
     assert_eq!(w.read_edge(edge, AsOf::current(before)).await, None);
 }

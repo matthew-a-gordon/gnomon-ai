@@ -8,18 +8,18 @@
 
 mod support;
 
-use chrono::{DateTime, Utc};
 use gnomon::{
     AsOf, CommunityId, DerivedCitation, EdgeId, EpisodeId, NewCommunity, NewSummary, NodeId, Scope,
     SearchHit, SearchRequest, SearchResult, SearchWeights, SummaryId, ValidTime, VersionId,
     Versioned,
 };
+use jiff::Timestamp;
 use serde_json::json;
 use support::erasure::{ALL_SCOPES, SCOPE, World, at};
 use support::vectors::Rng;
 
 /// A valid-at instant after every `as_of_valid` the tests write.
-fn now() -> DateTime<Utc> {
+fn now() -> Timestamp {
     at(2025, 1, 1)
 }
 
@@ -914,7 +914,7 @@ async fn mentions_count_the_citations_of_the_versions_valid_at_the_valid_at_inst
         json!({ "plan": "trial" }),
     )
     .await;
-    let mentions = |valid_at: DateTime<Utc>| {
+    let mentions = |valid_at: Timestamp| {
         let w = &w;
         async move {
             let results =

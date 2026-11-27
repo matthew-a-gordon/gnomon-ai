@@ -3,12 +3,12 @@
 //! table from the catalog, so that a table a later migration adds fails them
 //! until Erasure deletes from it.
 
-use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
     AsOf, EdgeId, EpisodeErasure, EpisodeId, GraphErasure, KindOf, NewEdge, NewEpisode, NewKind,
     NewNode, NodeId, NodeVersion, Patch, Scope, StageOutcome, StageRecord, StageUsage, StageWrite,
     Store, TenantId, ValidTime, VersionId,
 };
+use jiff::Timestamp;
 use serde_json::{Map, Value, json};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, GenericClient};
@@ -22,8 +22,8 @@ pub const SCOPE: &str = "support";
 /// Every Scope the Erasure suites write in.
 pub const ALL_SCOPES: &[&str] = &[SCOPE, "billing", "hr"];
 
-pub fn at(y: i32, m: u32, d: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+pub fn at(y: i16, m: i8, d: i8) -> Timestamp {
+    super::utc(y, m, d)
 }
 
 pub fn values(v: Value) -> Map<String, Value> {
@@ -114,18 +114,14 @@ impl World {
         tx
     }
 
-    pub async fn episode(
-        &self,
-        reference_time: DateTime<Utc>,
-        authority: Option<i32>,
-    ) -> EpisodeId {
+    pub async fn episode(&self, reference_time: Timestamp, authority: Option<i32>) -> EpisodeId {
         self.episode_saying(reference_time, authority, "an Episode")
             .await
     }
 
     pub async fn episode_saying(
         &self,
-        reference_time: DateTime<Utc>,
+        reference_time: Timestamp,
         authority: Option<i32>,
         content: &str,
     ) -> EpisodeId {
@@ -186,7 +182,7 @@ impl World {
         episode: EpisodeId,
         vt: ValidTime,
         v: Value,
-    ) -> DateTime<Utc> {
+    ) -> Timestamp {
         self.caller()
             .write_node(self.tenant, node, &Patch::new(episode, vt, values(v)))
             .await
@@ -225,7 +221,7 @@ impl World {
     pub async fn episode_in(
         &self,
         scope: &str,
-        reference_time: DateTime<Utc>,
+        reference_time: Timestamp,
         content: &str,
     ) -> EpisodeId {
         self.worker_in(scope)
@@ -348,7 +344,7 @@ impl World {
             .collect()
     }
 
-    pub async fn read(&self, node: NodeId, valid_at: DateTime<Utc>) -> Option<NodeVersion> {
+    pub async fn read(&self, node: NodeId, valid_at: Timestamp) -> Option<NodeVersion> {
         self.caller()
             .read_node(self.tenant, node, AsOf::current(valid_at))
             .await
@@ -358,8 +354,8 @@ impl World {
     pub async fn read_as_of(
         &self,
         node: NodeId,
-        valid_at: DateTime<Utc>,
-        known_at: DateTime<Utc>,
+        valid_at: Timestamp,
+        known_at: Timestamp,
     ) -> Option<NodeVersion> {
         self.caller()
             .read_node(self.tenant, node, AsOf::at(valid_at, known_at))
@@ -367,7 +363,7 @@ impl World {
             .unwrap()
     }
 
-    pub async fn current_values(&self, node: NodeId, valid_at: DateTime<Utc>) -> Option<Value> {
+    pub async fn current_values(&self, node: NodeId, valid_at: Timestamp) -> Option<Value> {
         self.read(node, valid_at)
             .await
             .map(|v| Value::Object(v.values))
@@ -376,8 +372,8 @@ impl World {
     pub async fn values_as_of(
         &self,
         node: NodeId,
-        valid_at: DateTime<Utc>,
-        known_at: DateTime<Utc>,
+        valid_at: Timestamp,
+        known_at: Timestamp,
     ) -> Option<Value> {
         self.read_as_of(node, valid_at, known_at)
             .await
@@ -482,7 +478,7 @@ impl World {
             .map(|r| r.get(0))
     }
 
-    pub async fn current_edge_version(&self, edge: EdgeId, valid_at: DateTime<Utc>) -> VersionId {
+    pub async fn current_edge_version(&self, edge: EdgeId, valid_at: Timestamp) -> VersionId {
         self.caller()
             .read_edge(self.tenant, edge, AsOf::current(valid_at))
             .await

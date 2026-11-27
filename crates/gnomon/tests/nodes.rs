@@ -6,18 +6,25 @@
 
 mod support;
 
-use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
     AsOf, EpisodeId, NewEpisode, NewNode, Patch, ROOT_NODE_KIND, Scope, Store, TenantId, ValidTime,
     WriteStatus,
 };
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Map, Value, json};
 use support::TestDb;
+use support::timestamptz::Timestamptz;
+use tokio_postgres::Row;
 
 const SCOPE: &str = "support";
 
-fn day(d: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2024, 1, d, 0, 0, 0).unwrap()
+/// A `timestamptz` column that may hold a null.
+fn stored(row: &Row, at: usize) -> Option<Timestamp> {
+    row.get::<_, Option<Timestamptz>>(at).map(|t| t.0)
+}
+
+fn day(d: i8) -> Timestamp {
+    support::utc(2024, 1, d)
 }
 
 fn values(v: Value) -> Map<String, Value> {
@@ -52,7 +59,7 @@ impl World {
     }
 
     /// Records an Episode with a Reference time.
-    async fn episode(&self, reference_time: DateTime<Utc>) -> EpisodeId {
+    async fn episode(&self, reference_time: Timestamp) -> EpisodeId {
         self.caller()
             .record_episode(&NewEpisode {
                 tenant: Some(self.tenant),
@@ -116,7 +123,7 @@ async fn a_node_written_citing_an_episode_reads_back_as_of_now_and_its_version_c
         None
     );
     // Before the write was recorded, gnomon knew nothing.
-    let before = outcome.recorded_at - chrono::Duration::microseconds(1);
+    let before = outcome.recorded_at - SignedDuration::from_micros(1);
     assert_eq!(
         w.caller()
             .read_node(w.tenant, node, AsOf::at(day(5), before))
@@ -177,11 +184,7 @@ impl World {
     }
 
     /// The values that hold at `valid_at` as gnomon believes now.
-    async fn now(
-        &self,
-        node: gnomon::NodeId,
-        valid_at: DateTime<Utc>,
-    ) -> Option<Map<String, Value>> {
+    async fn now(&self, node: gnomon::NodeId, valid_at: Timestamp) -> Option<Map<String, Value>> {
         self.read(node, AsOf::current(valid_at))
             .await
             .map(|v| v.values)
@@ -335,7 +338,7 @@ async fn as_of_reads_at_a_past_known_at_return_what_gnomon_believed_then() {
         "closed by the second write"
     );
 
-    let just_before = second.recorded_at - chrono::Duration::microseconds(1);
+    let just_before = second.recorded_at - SignedDuration::from_micros(1);
     assert_eq!(
         w.read(node, AsOf::at(day(1), just_before))
             .await
@@ -392,7 +395,7 @@ async fn a_new_version_cites_every_episode_behind_its_values_and_not_the_losers(
     let w = World::new().await;
     let a = w.episode(day(1)).await;
     let b = w.episode(day(2)).await;
-    let loser = w.episode(day(1) - chrono::Duration::days(1)).await;
+    let loser = w.episode(day(1) - SignedDuration::from_hours(24)).await;
     let (node, _) = w
         .create(&Patch::new(a, ValidTime::UNKNOWN, name("Ada")))
         .await;
@@ -424,7 +427,7 @@ async fn a_new_version_cites_every_episode_behind_its_values_and_not_the_losers(
 async fn each_value_is_stored_as_a_contribution_with_its_episode_and_valid_time() {
     let w = World::new().await;
     let a = w.episode(day(1)).await;
-    let b = w.episode(day(1) - chrono::Duration::days(1)).await;
+    let b = w.episode(day(1) - SignedDuration::from_hours(24)).await;
     let (node, _) = w
         .create(&Patch::new(
             a,
@@ -445,8 +448,8 @@ async fn each_value_is_stored_as_a_contribution_with_its_episode_and_valid_time(
         uuid::Uuid,
         String,
         Value,
-        Option<DateTime<Utc>>,
-        Option<DateTime<Utc>>,
+        Option<Timestamp>,
+        Option<Timestamp>,
     );
     let got: Vec<Held> = w
         .rows_for(
@@ -457,7 +460,10 @@ async fn each_value_is_stored_as_a_contribution_with_its_episode_and_valid_time(
         )
         .await
         .iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+        .map(|r| {
+            let (from, to) = (stored(r, 3), stored(r, 4));
+            (r.get(0), r.get(1), r.get(2), from, to)
+        })
         .collect();
     assert_eq!(
         got,
@@ -734,7 +740,7 @@ impl World {
     async fn history(
         &self,
         node: gnomon::NodeId,
-    ) -> Vec<(uuid::Uuid, Value, DateTime<Utc>, Option<DateTime<Utc>>)> {
+    ) -> Vec<(uuid::Uuid, Value, Timestamp, Option<Timestamp>)> {
         self.rows_for(
             "select id, props, recorded_from, nullif(recorded_to, 'infinity')
              from gnomon.version where node_id = $1 order by recorded_from, valid_from",
@@ -742,7 +748,10 @@ impl World {
         )
         .await
         .iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .map(|r| {
+            let from = stored(r, 2).expect("a Version has a Recorded start");
+            (r.get(0), r.get(1), from, stored(r, 3))
+        })
         .collect()
     }
 

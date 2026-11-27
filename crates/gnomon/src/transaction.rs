@@ -16,7 +16,7 @@
 //! `query_typed`, which works on every transaction-mode pooler at its
 //! default settings (ADR-0001).
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -24,6 +24,7 @@ use std::time::Duration;
 use tokio_postgres::Row;
 use tokio_postgres::types::{ToSql, Type};
 
+use crate::timestamptz::Timestamptz;
 use crate::{
     AsOf, Bound, BoundChange, BoundOutcome, BoundSide, BoundStatement, BranchRank, Citation,
     Community, CommunityId, DerivedCitation, Direction, EdgeId, EdgeVersion, EndOfValidity,
@@ -289,7 +290,7 @@ impl Transaction {
                     (&self.tenant.0, Type::UUID),
                     (&episode.scope.as_str(), Type::TEXT),
                     (&episode.content, Type::TEXT),
-                    (&episode.reference_time, Type::TIMESTAMPTZ),
+                    (&Timestamptz(episode.reference_time), Type::TIMESTAMPTZ),
                     (&episode.authority, Type::INT4),
                 ],
             )
@@ -309,22 +310,7 @@ impl Transaction {
                 &[(&self.tenant.0, Type::UUID), (&id.0, Type::UUID)],
             )
             .await?;
-        let episode = rows.first().map(|r| Episode {
-            tenant: TenantId(r.get(0)),
-            scope: Scope::new(r.get::<_, String>(1)),
-            id: EpisodeId(r.get(2)),
-            content: r.get(3),
-            reference_time: r.get::<_, DateTime<Utc>>(4),
-            authority: r.get(5),
-            recorded_at: r.get::<_, DateTime<Utc>>(6),
-            recorded_by: r.get(7),
-            retracted: r
-                .get::<_, Option<DateTime<Utc>>>(8)
-                .map(|recorded_at| EpisodeRetracted {
-                    recorded_at,
-                    recorded_by: r.get(9),
-                }),
-        });
+        let episode = rows.first().map(episode_record).transpose()?;
         self.done(call, episode)
     }
 
@@ -615,7 +601,7 @@ impl Transaction {
                     (&statement.episode.0, Type::UUID),
                     (&statement.version.0, Type::UUID),
                     (&side, Type::TEXT),
-                    (&at, Type::TIMESTAMPTZ),
+                    (&at.map(Timestamptz), Type::TIMESTAMPTZ),
                     (&precision, Type::TEXT),
                 ],
             )
@@ -630,7 +616,7 @@ impl Transaction {
         let opened: Vec<uuid::Uuid> = r.get(2);
         let outcome = BoundOutcome {
             change,
-            recorded_at: r.get(1),
+            recorded_at: time(r, 1)?,
             opened: opened.into_iter().map(VersionId).collect(),
         };
         self.done(call, outcome)
@@ -699,7 +685,7 @@ impl Transaction {
                         (&id, Type::UUID),
                         (&is_edge, Type::BOOL),
                         (&end.episode.0, Type::UUID),
-                        (&at, Type::TIMESTAMPTZ),
+                        (&at.map(Timestamptz), Type::TIMESTAMPTZ),
                         (&precision, Type::TEXT),
                     ],
                 )
@@ -720,7 +706,8 @@ impl Transaction {
                 .await?
             }
         };
-        self.done(call, write_outcome(&rows[0]))
+        let outcome = write_outcome(&rows[0])?;
+        self.done(call, outcome)
     }
 
     /// As [`Caller::retract_episode`](crate::Caller::retract_episode), in
@@ -738,7 +725,7 @@ impl Transaction {
             .await?;
         let row = &rows[0];
         let retraction = EpisodeRetraction {
-            recorded_at: row.get(0),
+            recorded_at: time(row, 0)?,
             retracted: row
                 .get::<_, Vec<uuid::Uuid>>(1)
                 .into_iter()
@@ -762,7 +749,7 @@ impl Transaction {
         let row = &rows[0];
         let ids = |i: usize| row.get::<_, Vec<uuid::Uuid>>(i);
         let erasure = EpisodeErasure {
-            erased_at: row.get(0),
+            erased_at: time(row, 0)?,
             recomputed_nodes: ids(1).into_iter().map(NodeId).collect(),
             recomputed_edges: ids(2).into_iter().map(EdgeId).collect(),
             erased_nodes: ids(3).into_iter().map(NodeId).collect(),
@@ -821,7 +808,7 @@ impl Transaction {
         let row = &rows[0];
         let ids = |i: usize| row.get::<_, Vec<uuid::Uuid>>(i);
         let erasure = GraphErasure {
-            erased_at: row.get(0),
+            erased_at: time(row, 0)?,
             erased_episodes: ids(1).into_iter().map(EpisodeId).collect(),
             erased_nodes: ids(2).into_iter().map(NodeId).collect(),
             erased_edges: ids(3).into_iter().map(EdgeId).collect(),
@@ -851,12 +838,13 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&node.0, Type::UUID),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                 ],
             )
             .await?;
-        self.done(call, rows.first().map(|r| node_version(r, 0)))
+        let version = rows.first().map(|r| node_version(r, 0)).transpose()?;
+        self.done(call, version)
     }
 
     /// As [`Caller::read_nodes`](crate::Caller::read_nodes), in this
@@ -879,12 +867,16 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&ids, Type::UUID_ARRAY),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                 ],
             )
             .await?;
-        self.done(call, rows.iter().map(|r| node_version(r, 0)).collect())
+        let versions = rows
+            .iter()
+            .map(|r| node_version(r, 0))
+            .collect::<Result<_, _>>()?;
+        self.done(call, versions)
     }
 
     /// As [`Caller::read_edge`](crate::Caller::read_edge), in this
@@ -906,12 +898,13 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&edge.0, Type::UUID),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                 ],
             )
             .await?;
-        self.done(call, rows.first().map(|r| edge_version(r, 0)))
+        let version = rows.first().map(|r| edge_version(r, 0)).transpose()?;
+        self.done(call, version)
     }
 
     /// As [`Caller::traverse`](crate::Caller::traverse), in this transaction.
@@ -944,8 +937,8 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&node.0, Type::UUID),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                     (&direction, Type::TEXT),
                     (&kinds, Type::TEXT_ARRAY),
                 ],
@@ -953,15 +946,18 @@ impl Transaction {
             .await?;
         let steps = rows
             .iter()
-            .map(|r| Step {
-                direction: Direction::from_sql(r.get(31)),
-                edge: edge_version(r, 0),
-                neighbour: NodeId(r.get(18)),
-                neighbour_version: r
-                    .get::<_, Option<uuid::Uuid>>(17)
-                    .map(|_| node_version(r, 17)),
+            .map(|r| {
+                Ok(Step {
+                    direction: Direction::from_sql(r.get(31)),
+                    edge: edge_version(r, 0)?,
+                    neighbour: NodeId(r.get(18)),
+                    neighbour_version: r
+                        .get::<_, Option<uuid::Uuid>>(17)
+                        .map(|_| node_version(r, 17))
+                        .transpose()?,
+                })
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
         self.done(call, steps)
     }
 
@@ -996,22 +992,24 @@ impl Transaction {
             .await?;
         let statements = rows
             .iter()
-            .map(|r| crate::Statement {
-                kind: match r.get::<_, &str>(0) {
-                    "correction" => StatementKind::Correction,
-                    "end_of_validity" => StatementKind::EndOfValidity,
-                    "retraction" => StatementKind::Retraction,
-                    other => panic!("gnomon.list_statements returned kind {other:?}"),
-                },
-                episode: EpisodeId(r.get(1)),
-                version: r.get::<_, Option<uuid::Uuid>>(2).map(VersionId),
-                valid_time: ValidTime {
-                    from: bound(r.get(3), r.get(4)),
-                    to: bound(r.get(5), r.get(6)),
-                },
-                recorded_at: r.get(7),
+            .map(|r| {
+                Ok(crate::Statement {
+                    kind: match r.get::<_, &str>(0) {
+                        "correction" => StatementKind::Correction,
+                        "end_of_validity" => StatementKind::EndOfValidity,
+                        "retraction" => StatementKind::Retraction,
+                        other => panic!("gnomon.list_statements returned kind {other:?}"),
+                    },
+                    episode: EpisodeId(r.get(1)),
+                    version: r.get::<_, Option<uuid::Uuid>>(2).map(VersionId),
+                    valid_time: ValidTime {
+                        from: bound(optional_time(r, 3)?, r.get(4)),
+                        to: bound(optional_time(r, 5)?, r.get(6)),
+                    },
+                    recorded_at: time(r, 7)?,
+                })
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
         self.done(call, statements)
     }
 
@@ -1048,14 +1046,16 @@ impl Transaction {
             .await?;
         let citations = rows
             .iter()
-            .map(|r| Citation {
-                episode: EpisodeId(r.get(0)),
-                property: r.get(1),
-                place: r.get(2),
-                recorded_at: r.get(3),
-                episode_recorded_at: r.get(4),
+            .map(|r| {
+                Ok(Citation {
+                    episode: EpisodeId(r.get(0)),
+                    property: r.get(1),
+                    place: r.get(2),
+                    recorded_at: time(r, 3)?,
+                    episode_recorded_at: time(r, 4)?,
+                })
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
         self.done(call, citations)
     }
 }
@@ -1078,8 +1078,8 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&query, Type::TEXT),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                     (&limit, Type::INT4),
                 ],
             )
@@ -1160,8 +1160,8 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&query, Type::FLOAT4_ARRAY),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                     (&limit, Type::INT4),
                 ],
             )
@@ -1202,7 +1202,7 @@ impl Transaction {
                     (&self.tenant.0, Type::UUID),
                     (&mention.text, Type::TEXT),
                     (&embedding, Type::FLOAT4_ARRAY),
-                    (&mention.valid_at, Type::TIMESTAMPTZ),
+                    (&mention.valid_at.map(Timestamptz), Type::TIMESTAMPTZ),
                     (&limit, Type::INT4),
                 ],
             )
@@ -1260,8 +1260,8 @@ impl Transaction {
                     (&self.tenant.0, Type::UUID),
                     (&request.text, Type::TEXT),
                     (&embedding, Type::FLOAT4_ARRAY),
-                    (&request.as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&request.as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(request.as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&request.as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                     (&seeds, Type::UUID_ARRAY),
                     (&request.depth, Type::INT4),
                     (&w.vector, Type::FLOAT8),
@@ -1427,7 +1427,7 @@ impl Transaction {
                         .get(&row.get::<_, String>(3))
                         .cloned()
                         .unwrap_or_default(),
-                ))
+                )?)
             }
         };
         self.done(call, claimed)
@@ -1453,7 +1453,7 @@ impl Transaction {
                 let of_stage = usage.remove(&row.get::<_, String>(3)).unwrap_or_default();
                 stage_record(row, of_stage)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         self.done(call, records)
     }
 }
@@ -1468,7 +1468,7 @@ impl Transaction {
             (&summary.scope.as_str(), Type::TEXT),
             (&summary.node.0, Type::UUID),
             (&summary.content, Type::TEXT),
-            (&summary.as_of_valid, Type::TIMESTAMPTZ),
+            (&Timestamptz(summary.as_of_valid), Type::TIMESTAMPTZ),
             (&episodes, Type::UUID_ARRAY),
             (&properties, Type::TEXT_ARRAY),
             (&places, Type::TEXT_ARRAY),
@@ -1496,7 +1496,7 @@ impl Transaction {
             (&replaces, Type::UUID_ARRAY),
             (&members, Type::UUID_ARRAY),
             (&community.content, Type::TEXT),
-            (&community.as_of_valid, Type::TIMESTAMPTZ),
+            (&Timestamptz(community.as_of_valid), Type::TIMESTAMPTZ),
             (&episodes, Type::UUID_ARRAY),
             (&properties, Type::TEXT_ARRAY),
             (&places, Type::TEXT_ARRAY),
@@ -1540,24 +1540,26 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&node.0, Type::UUID),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                 ],
             )
             .await?;
         let summaries = rows
             .iter()
-            .map(|r| Summary {
-                id: SummaryId(r.get(0)),
-                scope: Scope::new(r.get::<_, String>(1)),
-                node: NodeId(r.get(2)),
-                content: r.get(3),
-                as_of_valid: r.get(4),
-                recorded_from: r.get(5),
-                recorded_to: r.get(6),
-                citations: derived_citations(r, 7),
+            .map(|r| {
+                Ok(Summary {
+                    id: SummaryId(r.get(0)),
+                    scope: Scope::new(r.get::<_, String>(1)),
+                    node: NodeId(r.get(2)),
+                    content: r.get(3),
+                    as_of_valid: time(r, 4)?,
+                    recorded_from: time(r, 5)?,
+                    recorded_to: optional_time(r, 6)?,
+                    citations: derived_citations(r, 7),
+                })
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
         self.done(call, summaries)
     }
 
@@ -1577,28 +1579,30 @@ impl Transaction {
                 &[
                     (&self.tenant.0, Type::UUID),
                     (&node.0, Type::UUID),
-                    (&as_of.valid_at, Type::TIMESTAMPTZ),
-                    (&as_of.known_at, Type::TIMESTAMPTZ),
+                    (&Timestamptz(as_of.valid_at), Type::TIMESTAMPTZ),
+                    (&as_of.known_at.map(Timestamptz), Type::TIMESTAMPTZ),
                 ],
             )
             .await?;
         let communities = rows
             .iter()
-            .map(|r| Community {
-                id: CommunityId(r.get(0)),
-                scope: Scope::new(r.get::<_, String>(1)),
-                members: r
-                    .get::<_, Vec<uuid::Uuid>>(2)
-                    .into_iter()
-                    .map(NodeId)
-                    .collect(),
-                content: r.get(3),
-                as_of_valid: r.get(4),
-                recorded_from: r.get(5),
-                recorded_to: r.get(6),
-                citations: derived_citations(r, 7),
+            .map(|r| {
+                Ok(Community {
+                    id: CommunityId(r.get(0)),
+                    scope: Scope::new(r.get::<_, String>(1)),
+                    members: r
+                        .get::<_, Vec<uuid::Uuid>>(2)
+                        .into_iter()
+                        .map(NodeId)
+                        .collect(),
+                    content: r.get(3),
+                    as_of_valid: time(r, 4)?,
+                    recorded_from: time(r, 5)?,
+                    recorded_to: optional_time(r, 6)?,
+                    citations: derived_citations(r, 7),
+                })
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
         self.done(call, communities)
     }
 }
@@ -1695,60 +1699,60 @@ async fn write_patch(
                 (&tx.tenant.0, Type::UUID),
                 (&id, Type::UUID),
                 (&patch.episode.0, Type::UUID),
-                (&from, Type::TIMESTAMPTZ),
+                (&from.map(Timestamptz), Type::TIMESTAMPTZ),
                 (&from_precision, Type::TEXT),
-                (&to, Type::TIMESTAMPTZ),
+                (&to.map(Timestamptz), Type::TIMESTAMPTZ),
                 (&to_precision, Type::TEXT),
                 (&values, Type::JSONB),
                 (&places, Type::JSONB),
             ],
         )
         .await?;
-    Ok(write_outcome(&rows[0]))
+    write_outcome(&rows[0])
 }
 
-fn write_outcome(r: &Row) -> WriteOutcome {
+fn write_outcome(r: &Row) -> Result<WriteOutcome, Error> {
     let status = match r.get::<_, &str>(0) {
         "written" => WriteStatus::Written,
         "unchanged" => WriteStatus::Unchanged,
         other => panic!("the Store's write returned status {other:?}"),
     };
     let opened: Vec<uuid::Uuid> = r.get(2);
-    WriteOutcome {
+    Ok(WriteOutcome {
         status,
-        recorded_at: r.get(1),
+        recorded_at: time(r, 1)?,
         opened: opened.into_iter().map(VersionId).collect(),
-    }
+    })
 }
 
 /// A Node Version from the 14 columns of `row` from `at` on: ID, Node,
 /// Scope, Kind, values, the four bounds with their precisions, the two
 /// Recorded-time bounds, the `uncertain` marker, the text hash and the merge
 /// rule, with open bounds as nulls.
-fn node_version(row: &Row, at: usize) -> NodeVersion {
-    NodeVersion {
+fn node_version(row: &Row, at: usize) -> Result<NodeVersion, Error> {
+    Ok(NodeVersion {
         id: VersionId(row.get(at)),
         node: NodeId(row.get(at + 1)),
         scope: Scope::new(row.get::<_, String>(at + 2)),
         kind: row.get(at + 3),
         values: object(row.get(at + 4)),
         valid_time: ValidTime {
-            from: bound(row.get(at + 5), row.get(at + 6)),
-            to: bound(row.get(at + 7), row.get(at + 8)),
+            from: bound(optional_time(row, at + 5)?, row.get(at + 6)),
+            to: bound(optional_time(row, at + 7)?, row.get(at + 8)),
         },
-        recorded_from: row.get(at + 9),
-        recorded_to: row.get(at + 10),
+        recorded_from: time(row, at + 9)?,
+        recorded_to: optional_time(row, at + 10)?,
         uncertain: row.get(at + 11),
         text_hash: row.get(at + 12),
         merge_rule: MergeRule::from_sql(row.get(at + 13)),
-    }
+    })
 }
 
 /// An Edge Version from the 17 columns of `row` from `at` on: ID, Edge,
 /// Scope, Kind, source, target, then as [`node_version`] from the values on,
 /// and last the Sentence.
-fn edge_version(row: &Row, at: usize) -> EdgeVersion {
-    EdgeVersion {
+fn edge_version(row: &Row, at: usize) -> Result<EdgeVersion, Error> {
+    Ok(EdgeVersion {
         id: VersionId(row.get(at)),
         edge: EdgeId(row.get(at + 1)),
         scope: Scope::new(row.get::<_, String>(at + 2)),
@@ -1757,16 +1761,16 @@ fn edge_version(row: &Row, at: usize) -> EdgeVersion {
         target: NodeId(row.get(at + 5)),
         values: object(row.get(at + 6)),
         valid_time: ValidTime {
-            from: bound(row.get(at + 7), row.get(at + 8)),
-            to: bound(row.get(at + 9), row.get(at + 10)),
+            from: bound(optional_time(row, at + 7)?, row.get(at + 8)),
+            to: bound(optional_time(row, at + 9)?, row.get(at + 10)),
         },
-        recorded_from: row.get(at + 11),
-        recorded_to: row.get(at + 12),
+        recorded_from: time(row, at + 11)?,
+        recorded_to: optional_time(row, at + 12)?,
         uncertain: row.get(at + 13),
         text_hash: row.get(at + 14),
         merge_rule: MergeRule::from_sql(row.get(at + 15)),
         sentence: row.get(at + 16),
-    }
+    })
 }
 
 fn object(values: Value) -> Map<String, Value> {
@@ -1776,8 +1780,22 @@ fn object(values: Value) -> Map<String, Value> {
     }
 }
 
+/// A column that holds a time. `timestamptz` holds times outside the range
+/// of a `Timestamp`, and `Row::get` panics on a value it cannot convert, so
+/// every time is decoded here or in [`optional_time`].
+fn time(row: &Row, at: usize) -> Result<Timestamp, Error> {
+    Ok(row.try_get::<_, Timestamptz>(at)?.0)
+}
+
+/// A column that holds a time or a null, as [`time`] decodes one.
+fn optional_time(row: &Row, at: usize) -> Result<Option<Timestamp>, Error> {
+    Ok(row
+        .try_get::<_, Option<Timestamptz>>(at)?
+        .map(|stored| stored.0))
+}
+
 /// A Valid-time bound as the Store returns it: unknown, or an instant.
-fn bound(at: Option<DateTime<Utc>>, precision: &str) -> Bound {
+fn bound(at: Option<Timestamp>, precision: &str) -> Bound {
     match (Precision::from_sql(precision), at) {
         (None, _) | (_, None) => Bound::Unknown,
         (Some(Precision::Instant), Some(t)) => Bound::At(t),
@@ -1828,13 +1846,32 @@ async fn read_kind(tx: &Transaction, name: &str) -> Result<Option<Kind>, Error> 
     }))
 }
 
+/// An Episode from a row of `gnomon.read_episode`'s columns, in their order.
+fn episode_record(r: &Row) -> Result<Episode, Error> {
+    let retracted_at: Option<Timestamp> = optional_time(r, 8)?;
+    Ok(Episode {
+        tenant: TenantId(r.get(0)),
+        scope: Scope::new(r.get::<_, String>(1)),
+        id: EpisodeId(r.get(2)),
+        content: r.get(3),
+        reference_time: time(r, 4)?,
+        authority: r.get(5),
+        recorded_at: time(r, 6)?,
+        recorded_by: r.get(7),
+        retracted: retracted_at.map(|recorded_at| EpisodeRetracted {
+            recorded_at,
+            recorded_by: r.get(9),
+        }),
+    })
+}
+
 /// A stage record from a row of `tenant_id, scope, episode_id, stage,
 /// status, attempts, last_error_code, last_error_status, retry_at,
 /// lease_until, created_at, updated_at`, as `gnomon.claim_stage` and
 /// `gnomon.read_stage_records` return them.
-fn stage_record(row: &Row, usage: Vec<StageUsage>) -> StageRecord {
+fn stage_record(row: &Row, usage: Vec<StageUsage>) -> Result<StageRecord, Error> {
     let code: Option<String> = row.get(6);
-    StageRecord {
+    Ok(StageRecord {
         tenant: TenantId(row.get(0)),
         scope: Scope::new(row.get::<_, String>(1)),
         episode: EpisodeId(row.get(2)),
@@ -1845,12 +1882,12 @@ fn stage_record(row: &Row, usage: Vec<StageUsage>) -> StageRecord {
             code,
             status: row.get(7),
         }),
-        retry_at: row.get(8),
-        lease_until: row.get(9),
-        created_at: row.get(10),
-        updated_at: row.get(11),
+        retry_at: optional_time(row, 8)?,
+        lease_until: optional_time(row, 9)?,
+        created_at: time(row, 10)?,
+        updated_at: time(row, 11)?,
         usage,
-    }
+    })
 }
 
 /// The usage counts of an Episode's stage records, by stage, each in order
@@ -1901,6 +1938,17 @@ async fn write_stage(tx: &Transaction, write: &StageWrite) -> Result<(), Error> 
             outcome,
             usage,
         } => {
+            // `retry_at` is read back as a `Timestamp`, so a delay that
+            // ends past one would leave the Episode's records unreadable.
+            if let StageOutcome::Retry { after, .. } = outcome
+                && Timestamp::now().checked_add(*after).is_err()
+            {
+                return Err(Error::InvalidWrite(format!(
+                    "a retry delay of {} seconds ends after {}, the latest time gnomon can read",
+                    after.as_secs(),
+                    Timestamp::MAX
+                )));
+            }
             let (status, error, retry_after) = match outcome {
                 StageOutcome::Succeeded => (StageStatus::Succeeded, None, None),
                 StageOutcome::Retry { error, after } => {

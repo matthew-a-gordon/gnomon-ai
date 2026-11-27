@@ -7,6 +7,14 @@
 //! [`Caller::transaction`] starts a [`Transaction`] for several calls that
 //! commit together. [`migrations`] lists the files of the schema the Store
 //! expects, which a consumer copies into its own migration chain.
+//!
+//! Times are [`jiff::Timestamp`]s, version 1, stored as `timestamptz` to
+//! the microsecond. The Store truncates a time with finer digits toward
+//! 2000-01-01 UTC, so a time after it moves down to the microsecond and a time
+//! before it moves up. A time the Store returns passes back unchanged.
+//! `timestamptz` holds times a `Timestamp` cannot, such as `infinity` and
+//! any time after [`jiff::Timestamp::MAX`], 9999-12-30T22:00 UTC. A call that
+//! reads one fails with [`Error::Database`].
 
 mod connect;
 mod edge;
@@ -19,11 +27,12 @@ mod search;
 mod stage;
 mod store;
 mod summary;
+mod timestamptz;
 mod transaction;
 
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use tokio_postgres::error::SqlState;
 use uuid::Uuid;
 
@@ -134,7 +143,7 @@ pub struct NewEpisode {
     pub scope: Scope,
     pub content: String,
     /// When the source was produced, not when gnomon recorded it.
-    pub reference_time: DateTime<Utc>,
+    pub reference_time: Timestamp,
     /// The rank the consumer gives this Episode, if any.
     pub authority: Option<i32>,
 }
@@ -146,10 +155,10 @@ pub struct Episode {
     pub tenant: TenantId,
     pub scope: Scope,
     pub content: String,
-    pub reference_time: DateTime<Utc>,
+    pub reference_time: Timestamp,
     pub authority: Option<i32>,
     /// When gnomon recorded the Episode.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
     /// Who recorded the Episode, as the deployment's `gnomon.user_id()`
     /// named them, or `None`. By default it is the end user's `sub` claim,
     /// or the user a worker was given. A person's edit is an Episode of its
@@ -165,7 +174,7 @@ pub struct Episode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpisodeRetracted {
     /// When Retract Episode ran: when its transaction started.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
     /// As the Episode's own `recorded_by`.
     pub recorded_by: Option<String>,
 }
@@ -197,8 +206,9 @@ pub enum Error {
     KindConflict(String),
     /// The Store refused a write: it cites no Episode, its Valid time is
     /// empty, a value does not satisfy the Kind of the Node or Edge, an Edge
-    /// Kind does not allow an endpoint's Kind, or a Node, Edge or Episode is
-    /// not visible to the caller. The message says which.
+    /// Kind does not allow an endpoint's Kind, a Node, Edge or Episode is not
+    /// visible to the caller, or a retry is due after
+    /// [`jiff::Timestamp::MAX`]. The message says which.
     #[error("invalid write: {0}")]
     InvalidWrite(String),
     /// The call named no Tenant, and the deployment is multi-tenant, so it
@@ -261,7 +271,9 @@ pub enum Error {
     )]
     RolledBack,
     /// Postgres refused or failed the call for any other reason, such as a
-    /// check violation or an invalid argument (SQLSTATE 22023).
+    /// check violation or an invalid argument (SQLSTATE 22023). A call that
+    /// reads a time outside the range of a [`jiff::Timestamp`] fails with
+    /// this too, and [`sqlstate`](Self::sqlstate) then returns `None`.
     #[error(transparent)]
     Database(tokio_postgres::Error),
 }
