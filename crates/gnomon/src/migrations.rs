@@ -27,106 +27,33 @@ pub struct Migration {
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
-        name: "0001_gnomon_schema",
-        template: include_str!("../migrations/0001_gnomon_schema.sql"),
+        name: "0001_schema",
+        template: include_str!("../migrations/0001_schema.sql"),
     },
     Migration {
         version: 2,
-        name: "0002_episodes",
-        template: include_str!("../migrations/0002_episodes.sql"),
+        name: "0002_kinds",
+        template: include_str!("../migrations/0002_kinds.sql"),
     },
     Migration {
         version: 3,
-        name: "0003_kinds",
-        template: include_str!("../migrations/0003_kinds.sql"),
+        name: "0003_reads_and_writes",
+        template: include_str!("../migrations/0003_reads_and_writes.sql"),
     },
     Migration {
         version: 4,
-        name: "0004_nodes_and_versions",
-        template: include_str!("../migrations/0004_nodes_and_versions.sql"),
+        name: "0004_search",
+        template: include_str!("../migrations/0004_search.sql"),
     },
     Migration {
         version: 5,
-        name: "0005_tenancy_modes",
-        template: include_str!("../migrations/0005_tenancy_modes.sql"),
+        name: "0005_erasure",
+        template: include_str!("../migrations/0005_erasure.sql"),
     },
     Migration {
         version: 6,
-        name: "0006_bound_precision",
-        template: include_str!("../migrations/0006_bound_precision.sql"),
-    },
-    Migration {
-        version: 7,
-        name: "0007_ranked_merge",
-        template: include_str!("../migrations/0007_ranked_merge.sql"),
-    },
-    Migration {
-        version: 8,
-        name: "0008_edges",
-        template: include_str!("../migrations/0008_edges.sql"),
-    },
-    Migration {
-        version: 9,
-        name: "0009_statements",
-        template: include_str!("../migrations/0009_statements.sql"),
-    },
-    Migration {
-        version: 10,
-        name: "0010_retract_episode",
-        template: include_str!("../migrations/0010_retract_episode.sql"),
-    },
-    Migration {
-        version: 11,
-        name: "0011_erase_episode",
-        template: include_str!("../migrations/0011_erase_episode.sql"),
-    },
-    Migration {
-        version: 12,
-        name: "0012_erase_node_edge_scope",
-        template: include_str!("../migrations/0012_erase_node_edge_scope.sql"),
-    },
-    // There is no migration 13. It held the vacuum call's role, which was
-    // removed before any migration was released. The exporter chains each
-    // migration to the one before it in this list, so the gap needs nothing.
-    Migration {
-        version: 14,
-        name: "0014_stage_records",
-        template: include_str!("../migrations/0014_stage_records.sql"),
-    },
-    Migration {
-        version: 15,
-        name: "0015_reserved_edge_kinds",
-        template: include_str!("../migrations/0015_reserved_edge_kinds.sql"),
-    },
-    Migration {
-        version: 16,
-        name: "0016_full_text_search",
-        template: include_str!("../migrations/0016_full_text_search.sql"),
-    },
-    Migration {
-        version: 17,
-        name: "0017_vector_search",
-        template: include_str!("../migrations/0017_vector_search.sql"),
-    },
-    Migration {
-        version: 18,
-        name: "0018_summaries_and_communities",
-        template: include_str!("../migrations/0018_summaries_and_communities.sql"),
-    },
-    Migration {
-        version: 19,
-        name: "0019_resolution",
-        template: include_str!("../migrations/0019_resolution.sql"),
-    },
-    Migration {
-        version: 20,
-        name: "0020_neighbourhood_search_and_fusion",
-        template: include_str!("../migrations/0020_neighbourhood_search_and_fusion.sql"),
-    },
-    Migration {
-        version: 21,
-        name: "0021_sentences_and_gaps",
-        template: include_str!("../migrations/0021_sentences_and_gaps.sql"),
+        name: "0006_grants",
+        template: include_str!("../migrations/0006_grants.sql"),
     },
 ];
 

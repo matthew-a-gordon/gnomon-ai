@@ -29,13 +29,16 @@ async fn supabase_migration_up_applies_only_the_new_migration_after_a_release() 
     )
     .unwrap();
     support::supabase_migration_up(workdir.path(), &url).expect("the consumer's migration applies");
-    match gnomon::Store::connect(&db.login_url(), &support::connect_options()).await {
-        Err(gnomon::Error::SchemaVersion { found, .. }) => {
-            assert_eq!(found, Some(gnomon::migrations::SCHEMA_VERSION - 1));
-        }
-        Err(other) => panic!("expected a schema version error, got {other:?}"),
-        Ok(_) => panic!("the Store ran against the earlier release's schema"),
-    }
+    // The grants come last, so the earlier release's ledger is read as the
+    // operator.
+    let found: Option<i32> = db
+        .operator()
+        .await
+        .query_one("select max(version) from gnomon.schema_version", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(found, Some(gnomon::migrations::SCHEMA_VERSION - 1));
 
     // The new release's export, applied by the CLI. It refuses a migration
     // that sorts before one it has applied, so this also checks the order.
