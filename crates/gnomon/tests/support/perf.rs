@@ -11,11 +11,11 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_postgres::types::Type;
 
 use super::vectors::Rng;
-use super::{Server, TestDb, DEFAULT_DIMENSION};
+use super::{DEFAULT_DIMENSION, Server, TestDb};
 
 /// The Scope the data set lives in.
 pub const SCOPE: &str = "perf";

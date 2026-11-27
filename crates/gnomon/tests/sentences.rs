@@ -10,11 +10,11 @@ mod support;
 use gnomon::{AsOf, Error, StageWrite, ValidTime, VersionId, Versioned};
 use serde_json::json;
 use support::erasure::{
-    assert_no_unused_full_vector, assert_search_counts_match_the_token_rows, at, World,
+    World, assert_no_unused_full_vector, assert_search_counts_match_the_token_rows, at,
 };
-use support::vectors::{sentence_hash, Rng};
-use tokio_postgres::types::Type;
+use support::vectors::{Rng, sentence_hash};
 use tokio_postgres::Client;
+use tokio_postgres::types::Type;
 use uuid::Uuid;
 
 fn now() -> AsOf {

@@ -15,7 +15,7 @@ use gnomon::{
     Versioned,
 };
 use serde_json::json;
-use support::erasure::{at, World, ALL_SCOPES, SCOPE};
+use support::erasure::{ALL_SCOPES, SCOPE, World, at};
 use support::vectors::Rng;
 
 /// A valid-at instant after every `as_of_valid` the tests write.
@@ -172,8 +172,8 @@ async fn one_search_returns_versions_summaries_and_communities_fused_with_each_b
 }
 
 #[tokio::test]
-async fn a_summary_or_community_is_found_only_when_its_recorded_time_holds_known_at_and_valid_at_is_on_or_after_as_of_valid(
-) {
+async fn a_summary_or_community_is_found_only_when_its_recorded_time_holds_known_at_and_valid_at_is_on_or_after_as_of_valid()
+ {
     let w = World::new().await;
     let (acme, e) = named(&w, "Acme").await;
     let old = summary(&w, acme, "Acme sells gadgets.", &[e]).await;
@@ -294,8 +294,8 @@ fn sqlstate<T: std::fmt::Debug>(r: Result<T, gnomon::Error>) -> String {
 }
 
 #[tokio::test]
-async fn the_neighbourhood_keeps_the_fifty_most_mentioned_edges_per_node_to_its_depth_and_the_same_ones_each_time(
-) {
+async fn the_neighbourhood_keeps_the_fifty_most_mentioned_edges_per_node_to_its_depth_and_the_same_ones_each_time()
+ {
     let w = World::new().await;
     let (hub, _) = named(&w, "Hub").await;
     let mut edges = vec![];
@@ -391,9 +391,11 @@ async fn the_neighbourhood_keeps_the_fifty_most_mentioned_edges_per_node_to_its_
         .unwrap();
     assert_eq!(back.neighbourhood.unwrap().value, 1);
     // At depth 2 from the hub, the hub is not a result either.
-    assert!(!deeper
-        .iter()
-        .any(|r| matches!(r.hit, SearchHit::Version { of: Versioned::Node(n), .. } if n == hub)));
+    assert!(
+        !deeper.iter().any(
+            |r| matches!(r.hit, SearchHit::Version { of: Versioned::Node(n), .. } if n == hub)
+        )
+    );
 
     // No other depth.
     for depth in [0, 3] {
@@ -440,10 +442,12 @@ async fn with_no_seeds_the_neighbourhood_expands_from_the_top_node_hits_of_the_o
     assert!(plain.full_text.is_none() && plain.vector.is_none());
     assert_eq!(plain.neighbourhood.unwrap().value, 1);
     // The hub itself is a seed, not a neighbour.
-    assert!(find(&results, &node_hit(hub_version, hub))
-        .unwrap()
-        .neighbourhood
-        .is_none());
+    assert!(
+        find(&results, &node_hit(hub_version, hub))
+            .unwrap()
+            .neighbourhood
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -745,9 +749,10 @@ async fn an_episode_edge_or_summary_in_a_scope_the_caller_cannot_see_changes_no_
     let unseen = find(&before, &node_hit(x_version, x)).unwrap();
     assert_eq!(unseen.connectedness.count, 0);
     assert_ne!(both, before);
-    assert!(both
-        .iter()
-        .any(|r| matches!(r.hit, SearchHit::Summary { node, .. } if node == x)));
+    assert!(
+        both.iter()
+            .any(|r| matches!(r.hit, SearchHit::Summary { node, .. } if node == x))
+    );
 }
 
 #[tokio::test]
@@ -847,11 +852,13 @@ async fn erasure_removes_the_search_rows_of_every_summary_and_community_it_remov
         );
     }
     support::erasure::assert_search_counts_match_the_token_rows(&admin).await;
-    assert!(everyone(&w)
-        .search(w.tenant, &SearchRequest::text("anvils", current()), 10)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        everyone(&w)
+            .search(w.tenant, &SearchRequest::text("anvils", current()), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A smoke check, not a performance test: ticket #21 owns those. It loads

@@ -8,10 +8,10 @@ mod support;
 
 use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
-    AsOf, EpisodeId, NewEpisode, NewNode, Patch, Scope, Store, TenantId, ValidTime, WriteStatus,
-    ROOT_NODE_KIND,
+    AsOf, EpisodeId, NewEpisode, NewNode, Patch, ROOT_NODE_KIND, Scope, Store, TenantId, ValidTime,
+    WriteStatus,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use support::TestDb;
 
 const SCOPE: &str = "support";

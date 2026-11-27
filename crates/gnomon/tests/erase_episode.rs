@@ -14,10 +14,10 @@ use gnomon::{
     NewCommunity, NewEdge, NewEpisode, NewNode, NewSummary, Patch, Precision, Retraction, Scope,
     ValidTime,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use support::erasure::{
-    assert_no_residue, at, gnomon_tables, snapshot, tables_derived_from_version_text,
-    tables_with_an_episode_reference, values, Residue, World, SCOPE,
+    Residue, SCOPE, World, assert_no_residue, at, gnomon_tables, snapshot,
+    tables_derived_from_version_text, tables_with_an_episode_reference, values,
 };
 use tokio_postgres::types::Type;
 use uuid::Uuid;
@@ -371,12 +371,13 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
             "{expected} is missing from {referencing:?}"
         );
     }
-    assert!(w
-        .caller()
-        .read_episode(w.tenant, e)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        w.caller()
+            .read_episode(w.tenant, e)
+            .await
+            .unwrap()
+            .is_none()
+    );
     // The Summary and Community that cite E are gone with their members, and
     // those that cite F alone stand.
     for (table, id) in [("summary", e_summary.0), ("community", e_community.0)] {
@@ -557,8 +558,8 @@ async fn surviving_versions_current_and_closed_are_recomputed_from_the_remaining
 }
 
 #[tokio::test]
-async fn each_recomputed_version_keeps_the_merge_rule_it_recorded_when_the_kinds_rule_changed_since(
-) {
+async fn each_recomputed_version_keeps_the_merge_rule_it_recorded_when_the_kinds_rule_changed_since()
+ {
     let w = World::new().await;
     let f = w.episode(at(2024, 1, 1), Some(5)).await;
     let e = w.episode(at(2024, 2, 1), Some(0)).await;
@@ -692,12 +693,13 @@ async fn erasing_the_episode_behind_a_retraction_makes_the_retracted_version_cur
         w.values_as_of(acct, at(2024, 1, 1), retracted).await,
         Some(json!({ "plan": "basic" }))
     );
-    assert!(w
-        .caller()
-        .list_node_statements(w.tenant, acct)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        w.caller()
+            .list_node_statements(w.tenant, acct)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -854,8 +856,8 @@ async fn the_same_erasure_on_the_same_starting_data_always_removes_the_same_rows
 }
 
 #[tokio::test]
-async fn a_write_to_an_affected_node_waits_for_the_erasure_to_commit_and_one_to_an_unaffected_node_does_not(
-) {
+async fn a_write_to_an_affected_node_waits_for_the_erasure_to_commit_and_one_to_an_unaffected_node_does_not()
+ {
     let w = World::new().await;
     let f = w.episode(at(2024, 1, 1), None).await;
     let e = w.episode(at(2024, 2, 1), None).await;
@@ -1031,8 +1033,8 @@ async fn an_erasure_deletes_the_sentence_of_every_edge_version_it_deletes_or_rec
 }
 
 #[tokio::test]
-async fn a_citation_of_a_retracted_episode_does_not_keep_a_version_current_once_its_corroborator_is_erased(
-) {
+async fn a_citation_of_a_retracted_episode_does_not_keep_a_version_current_once_its_corroborator_is_erased()
+ {
     let w = World::new().await;
     let r = w.episode(at(2024, 1, 1), None).await;
     let e = w.episode(at(2024, 2, 1), None).await;
@@ -1075,8 +1077,8 @@ async fn a_citation_of_a_retracted_episode_does_not_keep_a_version_current_once_
 }
 
 #[tokio::test]
-async fn an_erasure_of_many_nodes_holds_one_advisory_lock_for_each_and_runs_on_the_default_lock_table(
-) {
+async fn an_erasure_of_many_nodes_holds_one_advisory_lock_for_each_and_runs_on_the_default_lock_table()
+ {
     const NODES: usize = 500;
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
@@ -1266,17 +1268,18 @@ async fn another_episodes_retraction_of_a_version_only_the_erased_episode_suppli
             "month {month}"
         );
     }
-    assert!(w
-        .caller()
-        .list_node_statements(w.tenant, acct)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        w.caller()
+            .list_node_statements(w.tenant, acct)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
-async fn full_text_search_and_resolution_find_a_node_by_its_name_after_erasing_an_unrelated_episode(
-) {
+async fn full_text_search_and_resolution_find_a_node_by_its_name_after_erasing_an_unrelated_episode()
+ {
     // Acme's current Version comes from F. G, of the same Scope, writes
     // nothing of Acme. H states a value of Acme only before its Version's
     // Valid time starts, so its write leaves that Version open and

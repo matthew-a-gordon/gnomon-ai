@@ -14,9 +14,9 @@ use std::sync::Arc;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::rustls::{self, ServerConfig};
-use tokio_rustls::TlsAcceptor;
 
 const SSL_REQUEST: u32 = 80_877_103;
 

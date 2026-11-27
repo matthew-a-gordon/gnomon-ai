@@ -10,8 +10,8 @@ use gnomon::{
     AsOf, Bound, BoundSide, BoundStatement, Precision, ValidTime, VectorCandidate, Versioned,
 };
 use serde_json::json;
-use support::erasure::{at, World, SCOPE};
-use support::vectors::{cosine_distance, embed_every_version, sentence_hash, Rng};
+use support::erasure::{SCOPE, World, at};
+use support::vectors::{Rng, cosine_distance, embed_every_version, sentence_hash};
 
 fn now() -> AsOf {
     AsOf::current(at(2024, 6, 1))
@@ -330,12 +330,14 @@ async fn vector_search_honours_the_valid_at_and_known_at_instants() {
     );
     // Outside the Valid time, and before anything was recorded, nothing.
     assert!(found(AsOf::current(at(2027, 1, 1))).await.is_empty());
-    assert!(found(AsOf::at(
-        at(2024, 6, 1),
-        basic.recorded_from - chrono::Duration::seconds(1)
-    ))
-    .await
-    .is_empty());
+    assert!(
+        found(AsOf::at(
+            at(2024, 6, 1),
+            basic.recorded_from - chrono::Duration::seconds(1)
+        ))
+        .await
+        .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -469,12 +471,13 @@ async fn an_embedding_or_a_query_of_the_wrong_length_zero_length_or_not_finite_i
         "{refused:?}"
     );
     // None of them stored anything.
-    assert!(w
-        .caller()
-        .search_vector(w.tenant, &good, now(), 10)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        w.caller()
+            .search_vector(w.tenant, &good, now(), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// The As-of instants of prototype 5: "now", and its past read.
@@ -518,8 +521,8 @@ async fn recall_at_10(
 }
 
 #[tokio::test]
-async fn recall_at_10_matches_prototype_5_for_a_small_scope_inside_a_large_tenant_and_a_past_known_at(
-) {
+async fn recall_at_10_matches_prototype_5_for_a_small_scope_inside_a_large_tenant_and_a_past_known_at()
+ {
     // Prototype 5's layout, scaled down: a Scope of 1,000 texts inside a
     // Tenant whose other Scope holds 9,000, on clustered synthetic
     // 1,536-dimension vectors. The small Scope draws on four subtopics and
@@ -712,8 +715,8 @@ async fn full_vectors_of(w: &World, hash: &str) -> i64 {
 }
 
 #[tokio::test]
-async fn erasure_deletes_the_embeddings_of_erased_and_recomputed_text_and_keeps_a_shared_full_vector(
-) {
+async fn erasure_deletes_the_embeddings_of_erased_and_recomputed_text_and_keeps_a_shared_full_vector()
+ {
     let w = World::new().await;
     let f = w.episode(at(2024, 1, 1), None).await;
     let e = w.episode(at(2024, 2, 1), None).await;

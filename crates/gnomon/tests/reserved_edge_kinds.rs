@@ -11,11 +11,11 @@ mod support;
 
 use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
-    AsOf, Direction, EdgeId, EpisodeId, Error, Kind, KindOf, MergeRule, NewEdge, NewEpisode,
-    NewKind, NewNode, NodeId, Patch, Retraction, Scope, Store, TenantId, Traversal, ValidTime,
-    WriteStatus, DIFFERENT_FROM_KIND, ROOT_EDGE_KIND, ROOT_NODE_KIND, SAME_AS_KIND,
+    AsOf, DIFFERENT_FROM_KIND, Direction, EdgeId, EpisodeId, Error, Kind, KindOf, MergeRule,
+    NewEdge, NewEpisode, NewKind, NewNode, NodeId, Patch, ROOT_EDGE_KIND, ROOT_NODE_KIND,
+    Retraction, SAME_AS_KIND, Scope, Store, TenantId, Traversal, ValidTime, WriteStatus,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use support::TestDb;
 
@@ -256,8 +256,8 @@ async fn both_kinds_exist_in_every_ontology_without_registration_and_join_any_no
 }
 
 #[tokio::test]
-async fn writing_the_edge_from_b_to_a_addresses_the_edge_from_a_to_b_and_traversal_finds_it_from_either(
-) {
+async fn writing_the_edge_from_b_to_a_addresses_the_edge_from_a_to_b_and_traversal_finds_it_from_either()
+ {
     let w = World::new().await;
     for name in RESERVED {
         let (a, b) = (

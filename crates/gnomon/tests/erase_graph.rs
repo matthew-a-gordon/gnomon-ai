@@ -12,8 +12,8 @@ use std::time::Duration;
 use gnomon::{Bound, EndOfValidity, NewEdge, Patch, Scope, ValidTime};
 use serde_json::json;
 use support::erasure::{
-    assert_no_residue, assert_only_removed, at, every_row, tables_with_a_scope, values, Residue,
-    World, SCOPE,
+    Residue, SCOPE, World, assert_no_residue, assert_only_removed, at, every_row,
+    tables_with_a_scope, values,
 };
 use tokio_postgres::types::Type;
 use uuid::Uuid;
@@ -90,12 +90,13 @@ async fn erasing_an_edge_removes_its_rows_and_its_bare_endpoint_and_nothing_else
     let mut gone = vec![erased.0, b.0];
     gone.extend(&versions);
     assert_only_removed(&admin, &before, &gone).await;
-    assert!(w
-        .caller()
-        .read_episode(w.tenant, e)
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        w.caller()
+            .read_episode(w.tenant, e)
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(
         w.sentence_of(kept_version).await.as_deref(),
         Some("a owns 40% of Acme")
@@ -107,8 +108,8 @@ async fn erasing_an_edge_removes_its_rows_and_its_bare_endpoint_and_nothing_else
 }
 
 #[tokio::test]
-async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_the_bare_endpoints_the_caller_sees(
-) {
+async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_the_bare_endpoints_the_caller_sees()
+ {
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
     let g = w.episode(at(2024, 1, 2), None).await;
@@ -234,19 +235,20 @@ async fn erasing_a_node_erases_every_edge_that_joins_it_whatever_its_scope_and_t
     assert!(w.exists("node", initech.0).await);
     assert!(w.exists("edge", untouched.0).await);
     for episode in [e, g] {
-        assert!(w
-            .caller()
-            .read_episode(w.tenant, episode)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            w.caller()
+                .read_episode(w.tenant, episode)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
     assert_eq!(w.stage_records_of(SCOPE, e).await, e_stages);
 }
 
 #[tokio::test]
-async fn erasing_a_scope_removes_every_row_in_it_and_every_edge_that_joins_its_nodes_and_nothing_else(
-) {
+async fn erasing_a_scope_removes_every_row_in_it_and_every_edge_that_joins_its_nodes_and_nothing_else()
+ {
     let w = World::new().await;
     // A user of billing and support erases billing.
     w.db.grant_erasure("authenticated").await;

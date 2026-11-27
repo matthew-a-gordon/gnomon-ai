@@ -13,7 +13,7 @@ use gnomon::{
     NodeId, Scope, Summary, SummaryId,
 };
 use serde_json::json;
-use support::erasure::{at, World, ALL_SCOPES, SCOPE};
+use support::erasure::{ALL_SCOPES, SCOPE, World, at};
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
@@ -97,8 +97,8 @@ fn assert_invalid_write<T: std::fmt::Debug>(r: Result<T, Error>, says: &str, wha
 }
 
 #[tokio::test]
-async fn a_summary_of_a_node_is_read_with_its_citations_from_the_valid_at_instant_it_was_written_for(
-) {
+async fn a_summary_of_a_node_is_read_with_its_citations_from_the_valid_at_instant_it_was_written_for()
+ {
     let w = World::new().await;
     let f = w.episode(at(2024, 1, 1), None).await;
     let g = w.episode(at(2024, 2, 1), None).await;
@@ -145,8 +145,8 @@ async fn a_summary_of_a_node_is_read_with_its_citations_from_the_valid_at_instan
 }
 
 #[tokio::test]
-async fn regenerating_a_summary_closes_the_old_row_which_an_earlier_known_at_still_reads_and_deletes_nothing(
-) {
+async fn regenerating_a_summary_closes_the_old_row_which_an_earlier_known_at_still_reads_and_deletes_nothing()
+ {
     let w = World::new().await;
     let f = w.episode(at(2024, 1, 1), None).await;
     let g = w.episode(at(2024, 2, 1), None).await;
@@ -311,28 +311,36 @@ async fn another_tenant_and_another_scope_read_no_summary_or_community() {
 
     let as_of = AsOf::current(at(2025, 1, 1));
     let billing = w.seeing(&[BILLING]);
-    assert!(billing
-        .read_summaries(w.tenant, a, as_of)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(billing
-        .read_communities(w.tenant, a, as_of)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        billing
+            .read_summaries(w.tenant, a, as_of)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        billing
+            .read_communities(w.tenant, a, as_of)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let other = support::tenant();
     let stranger = w.store.as_worker(other, Scope::new(SCOPE));
-    assert!(stranger
-        .read_summaries(other, a, as_of)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(stranger
-        .read_communities(other, a, as_of)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        stranger
+            .read_summaries(other, a, as_of)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        stranger
+            .read_communities(other, a, as_of)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     // Naming the first Tenant from the second's claims is refused.
     assert!(matches!(
         stranger.read_summaries(w.tenant, a, as_of).await,
@@ -515,8 +523,8 @@ async fn retract_episode_leaves_every_summary_and_community_as_it_was() {
 }
 
 #[tokio::test]
-async fn erase_episode_removes_every_summary_and_community_closed_or_open_that_cites_it_and_no_other(
-) {
+async fn erase_episode_removes_every_summary_and_community_closed_or_open_that_cites_it_and_no_other()
+ {
     let w = World::new().await;
     let f = w.episode(at(2024, 1, 1), None).await;
     let e = w.episode(at(2024, 2, 1), None).await;
@@ -597,8 +605,8 @@ async fn erase_episode_removes_every_summary_and_community_closed_or_open_that_c
 }
 
 #[tokio::test]
-async fn erasing_a_node_removes_its_summaries_in_every_scope_even_one_the_caller_cannot_see_and_its_communities(
-) {
+async fn erasing_a_node_removes_its_summaries_in_every_scope_even_one_the_caller_cannot_see_and_its_communities()
+ {
     let w = World::new().await;
     let f = w.episode(at(2024, 1, 1), None).await;
     let b = w.episode_in(BILLING, at(2024, 1, 2), "billing's").await;
@@ -677,8 +685,8 @@ async fn erasing_a_node_removes_its_summaries_in_every_scope_even_one_the_caller
 }
 
 #[tokio::test]
-async fn erasing_a_scope_removes_its_summaries_and_communities_and_the_summaries_of_its_nodes_elsewhere(
-) {
+async fn erasing_a_scope_removes_its_summaries_and_communities_and_the_summaries_of_its_nodes_elsewhere()
+ {
     let w = World::new().await;
     let h = w.episode_in("hr", at(2024, 1, 1), "hr's").await;
     let b = w.episode_in(BILLING, at(2024, 1, 2), "billing's").await;
@@ -754,8 +762,8 @@ async fn erasing_a_scope_removes_its_summaries_and_communities_and_the_summaries
 }
 
 #[tokio::test]
-async fn a_node_an_erasure_would_leave_bare_stays_while_a_summary_that_cites_another_episode_names_it(
-) {
+async fn a_node_an_erasure_would_leave_bare_stays_while_a_summary_that_cites_another_episode_names_it()
+ {
     let w = World::new().await;
     let f = w.episode(at(2024, 1, 1), None).await;
     let e = w.episode(at(2024, 2, 1), None).await;

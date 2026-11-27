@@ -18,11 +18,11 @@ use gnomon::{
     StageWrite, Store, ValidTime,
 };
 use serde_json::json;
-use support::erasure::{at, values, World};
+use support::erasure::{World, at, values};
 use tokio::sync::Barrier;
+use tokio_postgres::Client;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
-use tokio_postgres::Client;
 
 const HOUR: Duration = Duration::from_secs(3600);
 
@@ -71,8 +71,8 @@ impl World {
 }
 
 #[tokio::test]
-async fn a_stage_record_written_with_a_store_call_commits_with_the_stages_output_and_no_read_writes_it(
-) {
+async fn a_stage_record_written_with_a_store_call_commits_with_the_stages_output_and_no_read_writes_it()
+ {
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
     w.pending(e, "graph").await;
@@ -149,8 +149,8 @@ async fn a_stage_record_written_with_a_store_call_commits_with_the_stages_output
 }
 
 #[tokio::test]
-async fn a_store_call_that_fails_writes_no_stage_record_and_a_refused_stage_record_rolls_back_the_output(
-) {
+async fn a_store_call_that_fails_writes_no_stage_record_and_a_refused_stage_record_rolls_back_the_output()
+ {
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
     let node = w
@@ -487,16 +487,20 @@ async fn a_caller_reads_and_writes_only_the_stage_records_of_episodes_it_sees() 
     let billing = w.episode_in("billing", at(2024, 1, 1), "billing").await;
 
     let elsewhere = w.worker_in("billing");
-    assert!(elsewhere
-        .stage_records(w.tenant, e)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(elsewhere
-        .claim_stage(w.tenant, None, HOUR)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        elsewhere
+            .stage_records(w.tenant, e)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        elsewhere
+            .claim_stage(w.tenant, None, HOUR)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let refused = elsewhere
         .write_stages(w.tenant, &[StageWrite::pending(e, "sentences")])
         .await;

@@ -11,7 +11,7 @@ use gnomon::{
     NewEpisode, NewKind, NewNode, NodeId, NodeVersion, Patch, Precision, Scope, Store, TenantId,
     ValidTime, VersionId,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use support::TestDb;
 
 const SCOPE: &str = "support";
@@ -165,8 +165,8 @@ impl World {
 }
 
 #[tokio::test]
-async fn a_higher_authority_contribution_wins_over_a_later_lower_authority_one_where_valid_times_overlap(
-) {
+async fn a_higher_authority_contribution_wins_over_a_later_lower_authority_one_where_valid_times_overlap()
+ {
     let w = World::new().await;
     w.set_rule("account", MergeRule::Ranked).await.unwrap();
     let high = w.episode(at(2024, 1, 1), Some(10)).await;
@@ -401,8 +401,8 @@ async fn a_child_kind_may_turn_ranked_merge_on_and_is_refused_when_it_tries_to_t
 }
 
 #[tokio::test]
-async fn each_version_records_the_rule_that_chose_it_and_a_rule_change_leaves_existing_versions_unchanged(
-) {
+async fn each_version_records_the_rule_that_chose_it_and_a_rule_change_leaves_existing_versions_unchanged()
+ {
     let w = World::new().await;
     let a = w.episode(at(2024, 1, 1), Some(0)).await;
     let b = w.episode(at(2024, 2, 1), Some(0)).await;
@@ -457,8 +457,8 @@ async fn each_version_records_the_rule_that_chose_it_and_a_rule_change_leaves_ex
 }
 
 #[tokio::test]
-async fn a_lower_authority_end_of_validity_loses_to_the_values_a_higher_authority_supplied_and_stays_held(
-) {
+async fn a_lower_authority_end_of_validity_loses_to_the_values_a_higher_authority_supplied_and_stays_held()
+ {
     let w = World::new().await;
     w.set_rule("account", MergeRule::Ranked).await.unwrap();
     let high = w.episode(at(2024, 1, 1), Some(10)).await;
@@ -662,8 +662,8 @@ async fn a_held_bound_statement_takes_effect_when_the_higher_authority_statement
 }
 
 #[tokio::test]
-async fn a_version_starting_where_an_imprecise_end_falls_takes_its_start_precision_from_contributions_that_start_there(
-) {
+async fn a_version_starting_where_an_imprecise_end_falls_takes_its_start_precision_from_contributions_that_start_there()
+ {
     // Ticket 8 left this open for ranked merge. A Contribution's imprecise
     // end gives the Version it closes an imprecise end, and gives the next
     // Version nothing: the next Version's start precision comes only from the

@@ -9,13 +9,12 @@ use std::process::Output;
 use support::alembic::Project;
 
 fn export_alembic(dimension: &str, out: &Path) -> Output {
-    let run = std::process::Command::new(env!("CARGO_BIN_EXE_gnomon"))
+    std::process::Command::new(env!("CARGO_BIN_EXE_gnomon"))
         .args(["migrations", "export", "--target", "alembic"])
         .args(["--embedding-dimension", dimension, "--out"])
         .arg(out)
         .output()
-        .expect("the gnomon binary runs");
-    run
+        .expect("the gnomon binary runs")
 }
 
 fn assert_ok(run: &Output) {

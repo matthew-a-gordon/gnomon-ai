@@ -7,8 +7,8 @@ mod support;
 
 use gnomon::{AsOf, KindOf, Mention, NewKind, ValidTime};
 use serde_json::json;
-use support::erasure::{at, World};
-use support::vectors::{cosine_distance, Rng};
+use support::erasure::{World, at};
+use support::vectors::{Rng, cosine_distance};
 use tokio_postgres::types::Type;
 
 #[tokio::test]
@@ -72,12 +72,13 @@ async fn a_mention_returns_ranked_candidate_nodes_with_the_name_or_alias_that_ma
     assert!(found[0].alias);
 
     // A word no name or Alias holds finds nothing.
-    assert!(w
-        .caller()
-        .resolve(w.tenant, &Mention::text("Babbage"), 10)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        w.caller()
+            .resolve(w.tenant, &Mention::text("Babbage"), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -313,8 +314,8 @@ async fn only_current_names_and_aliases_are_searched() {
 }
 
 #[tokio::test]
-async fn a_node_renamed_in_the_same_session_is_found_under_its_new_name_through_full_text_before_its_embedding_exists(
-) {
+async fn a_node_renamed_in_the_same_session_is_found_under_its_new_name_through_full_text_before_its_embedding_exists()
+ {
     let w = World::new().await;
     let e = w.episode(at(2024, 1, 1), None).await;
     let node = w
@@ -482,19 +483,21 @@ async fn erasure_deletes_the_name_and_alias_rows_of_erased_text_and_keeps_a_shar
     // The erased Alias is gone: its name rows, its full vector, and every
     // match by its text or its embedding.
     assert_eq!(stored(&w, "Analytical Engine").await, (0, 0));
-    assert!(w
-        .caller()
-        .resolve(w.tenant, &Mention::text("analytical"), 10)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(w
-        .caller()
-        .resolve(w.tenant, &Mention::embedding(&v_engine), 10)
-        .await
-        .unwrap()
-        .iter()
-        .all(|c| c.node != ada));
+    assert!(
+        w.caller()
+            .resolve(w.tenant, &Mention::text("analytical"), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        w.caller()
+            .resolve(w.tenant, &Mention::embedding(&v_engine), 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|c| c.node != ada)
+    );
     // The other Node's name with the same text keeps the full vector, and
     // only Ada lost the Alias.
     assert_eq!(stored(&w, "The Countess").await, (1, 1));

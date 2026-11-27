@@ -22,13 +22,13 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
-    AsOf, NewEpisode, NewNode, Patch, Scope, SearchRequest, Store, TenantId, ValidTime,
-    ROOT_NODE_KIND,
+    AsOf, NewEpisode, NewNode, Patch, ROOT_NODE_KIND, Scope, SearchRequest, Store, TenantId,
+    ValidTime,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
+use support::TestDb;
 use support::perf::{self, Dataset, Record, Stats};
 use support::vectors::Rng;
-use support::TestDb;
 
 /// The budgets of ADR-0010: the whole fused Search at p95.
 const SEARCH_BUDGET_50K: f64 = 100.0;
