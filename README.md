@@ -116,6 +116,7 @@ To resolve any of the four your own way, replace it with `create or replace func
 For example, a deployment that keeps each user's Scopes in a membership table of its own:
 
 ```sql
+create schema membership;
 create table membership.member (
   user_id text not null,
   scope text not null,

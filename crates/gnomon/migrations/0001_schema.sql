@@ -166,6 +166,13 @@ begin
         'where pgvector is; grant it as the schema''s owner and apply this migration again', ext;
     end if;
   end if;
+  -- A definer function resolves pgvector's names in its schema, so a caller
+  -- that could create objects there could put its own code in their place.
+  if has_schema_privilege('authenticated', ext, 'CREATE')
+     or has_schema_privilege('gnomon_worker', ext, 'CREATE') then
+    raise exception 'the caller roles authenticated and gnomon_worker must not hold CREATE on '
+      'schema %, where pgvector is; revoke it and apply this migration again', ext;
+  end if;
   foreach r in array array['gnomon_definer', 'gnomon_writer'] loop
     if not has_schema_privilege(r, ext, 'USAGE') then
       execute format('grant usage on schema %I to %I', ext, r);
@@ -1397,8 +1404,11 @@ alter table gnomon.derived_embedding enable row level security;
 --   community   transaction.
 --   the others  any change to the columns its grants allow.
 --
--- The writer reads no search table: only the search index trigger writes
--- them, as `gnomon_definer`.
+-- The writer reads none of the token tables of Search and none of the BM25
+-- count tables (the latter have policies of their own above): only the
+-- search index trigger writes them, as `gnomon_definer`. It reads and writes
+-- the embedding tables, and updates the bits of a name row, as the table
+-- above says.
 do $$
 declare
   t record;

@@ -115,8 +115,9 @@ async fn a_second_migrating_role_needs_admin_on_the_definer_roles_and_nothing_mo
         .await
         .unwrap();
     {
-        // The last file lets the migrator act as `gnomon_definer` for one
-        // step, which the test of the definer role's members must not see.
+        // The last file lets the migrator act as `gnomon_definer` and
+        // `gnomon_writer` for one step, which the test of the definer roles'
+        // members must not see.
         let _lock = Server::get().await.lock();
         apply(&mut client, &last.1)
             .await

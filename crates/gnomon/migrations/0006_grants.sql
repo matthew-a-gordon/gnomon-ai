@@ -192,7 +192,7 @@ grant execute on function gnomon.writable_scopes()
   to gnomon_writer, gnomon_definer;
 grant execute on function gnomon.user_id()
   to gnomon_writer;
-grant execute on function gnomon.check_scope_writable(text)
+grant execute on function gnomon.refuse_read_only_scope(text)
   to gnomon_writer, gnomon_definer;
 grant execute on function gnomon.default_tenant()
   to authenticated, gnomon_worker, gnomon_writer, gnomon_definer;

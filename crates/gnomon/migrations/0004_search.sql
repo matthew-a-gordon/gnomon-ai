@@ -1001,7 +1001,7 @@ create function gnomon.store_embedding(
       raise exception using errcode = 'GNW01',
         message = pg_catalog.format('Version %s is not visible to the caller', p_version_id);
     end if;
-    perform gnomon.check_scope_writable(v_scope);
+    perform gnomon.refuse_read_only_scope(v_scope);
     insert into gnomon.embedding (tenant_id, scope, text_hash, embedding)
       values (p_tenant_id, v_scope, p_text_hash, v_vector)
       on conflict (tenant_id, scope, text_hash) do nothing;
@@ -1312,7 +1312,7 @@ create function gnomon.store_name_embedding(
       raise exception using errcode = 'GNW01',
         message = pg_catalog.format('Node %s is not visible to the caller', p_node_id);
     end if;
-    perform gnomon.check_scope_writable(v_scope);
+    perform gnomon.refuse_read_only_scope(v_scope);
     if not exists (select from gnomon.node_name n
                    where n.tenant_id = p_tenant_id and n.scope = v_scope
                      and n.text_hash = v_hash and n.node_id = p_node_id
@@ -2394,7 +2394,7 @@ create function gnomon.store_sentence(
           'a Sentence states what an Edge Version says, and %s is not an Edge Version the '
           'caller can see', p_version_id);
     end if;
-    perform gnomon.check_scope_writable(v_scope);
+    perform gnomon.refuse_read_only_scope(v_scope);
     insert into gnomon.sentence as s (tenant_id, scope, version_id, sentence)
       values (p_tenant_id, v_scope, p_version_id, p_sentence)
       on conflict (tenant_id, scope, version_id)

@@ -122,10 +122,11 @@
 -- `max_locks_per_transaction` first. Prototype 4 needed 1024 for 500 Nodes
 -- on a server with few connections.
 --
--- The guard triggers (ADR-0009) refuse every caller's delete or rewrite of
--- committed history. Erasure passes them because it runs as `gnomon_definer`.
--- `gnomon.running_as_definer()` is true only when the current user is that
--- role. No caller role can become it, because it has no members and never
+-- No caller writes a table, and the writer role's policies refuse every
+-- delete or rewrite of committed history (#81). Erasure writes it because
+-- it runs as `gnomon_definer`, whose policies have no such condition, and
+-- passes the triggers that check a write. `gnomon.running_as_definer()` is
+-- true only when the current user is that role. No caller role can become it, because it has no members and never
 -- logs in, and no setting a caller can change affects the check. The
 -- Versions, Citations, statements and Contributions the replay writes carry
 -- the Recorded times of the steps they replay. Their transaction mark,
@@ -584,7 +585,7 @@ create function gnomon.erase_episode(p_tenant_id uuid, p_episode_id uuid)
       raise exception using errcode = 'GNW01',
         message = format('Episode %s is not visible to the caller', p_episode_id);
     end if;
-    perform gnomon.check_scope_writable(v_scope);
+    perform gnomon.refuse_read_only_scope(v_scope);
 
     -- The locks of every Node and Edge the Episode touched and of their
     -- Edges' endpoints, in order of ID, then the Episode's row, as a write
@@ -1121,7 +1122,7 @@ create function gnomon.erase_node(p_tenant_id uuid, p_node_id uuid)
       raise exception using errcode = 'GNW01',
         message = format('Node %s is not visible to the caller', p_node_id);
     end if;
-    perform gnomon.check_scope_writable(v_scope);
+    perform gnomon.refuse_read_only_scope(v_scope);
     return query select * from gnomon.erase_graph(p_tenant_id, null, array[p_node_id], '{}');
   end
   $$;
@@ -1150,7 +1151,7 @@ create function gnomon.erase_edge(p_tenant_id uuid, p_edge_id uuid)
       raise exception using errcode = 'GNW01',
         message = format('Edge %s is not visible to the caller', p_edge_id);
     end if;
-    perform gnomon.check_scope_writable(v_scope);
+    perform gnomon.refuse_read_only_scope(v_scope);
     return query select * from gnomon.erase_graph(p_tenant_id, null, '{}', array[p_edge_id]);
   end
   $$;
@@ -1171,7 +1172,7 @@ create function gnomon.erase_scope(p_tenant_id uuid, p_scope text)
       raise exception using errcode = 'GNW01',
         message = format('Scope %s is not visible to the caller', p_scope);
     end if;
-    perform gnomon.check_scope_writable(p_scope);
+    perform gnomon.refuse_read_only_scope(p_scope);
     return query select * from gnomon.erase_graph(p_tenant_id, p_scope, '{}', '{}');
   end
   $$;
