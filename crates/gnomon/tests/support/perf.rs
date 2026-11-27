@@ -1,10 +1,12 @@
 //! The performance suite's harness (ticket #21, ADR-0010, ADR-0020): the run
-//! record, percentiles, and the data set of prototype 5 built with set-based
-//! SQL.
+//! record, percentiles, and the data sets of prototype 5 built with set-based
+//! SQL, one with its texts' words and one with realistic word frequencies
+//! (#85).
 //!
-//! A data set is built once per server: in a database named for its size and
-//! for the migration files, which stays on the server, so a rerun against
-//! the same container skips the build. The cases only read it.
+//! A data set is built once per server: in a database named for its
+//! vocabulary, its size and the migration files, which stays on the server,
+//! so a rerun against the same container skips the build. The cases only
+//! read it.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -261,10 +263,25 @@ impl Record {
     }
 }
 
+/// The words a data set's texts hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vocabulary {
+    /// Prototype 5's: each Version is named `perf text <n>`, so the number
+    /// is in one text and the other two words are in every text.
+    Numbers,
+    /// Realistic word frequencies (#85): a name of two words and a body,
+    /// 41 words in all on average, drawn from a Zipf vocabulary of 50,000
+    /// words whose commonest is in about 82% of texts, and a Summary of every
+    /// tenth Node. Its Nodes, Versions, times, vectors and IDs are the same
+    /// as [`Vocabulary::Numbers`] gives.
+    Words,
+}
+
 /// A loaded data set, ready to search.
 pub struct Dataset {
     pub db: String,
     pub texts: usize,
+    pub vocabulary: Vocabulary,
     /// Node Versions held at `valid_at` at the current belief: the rows a
     /// Search over the Scope can reach.
     pub visible: i64,
@@ -282,6 +299,27 @@ pub fn texts_for_visible(visible: usize) -> usize {
     (visible as f64 / 0.54).round() as usize
 }
 
+/// A word of the Zipf vocabulary of [`Vocabulary::Words`], drawn as
+/// `perf_data.sql` draws one: `w1` is the commonest of 50,000.
+pub fn zipf_word(rng: &mut Rng) -> String {
+    let a = 0.07_f64;
+    let rank = (1.0 + rng.uniform() * (50_001_f64.powf(a) - 1.0)).powf(1.0 / a);
+    format!("w{}", (rank.floor() as u32).min(50_000))
+}
+
+/// A text of `words` distinct words of the Zipf vocabulary.
+pub fn distinct_words(rng: &mut Rng, words: usize) -> String {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut text = vec![];
+    while text.len() < words {
+        let w = zipf_word(rng);
+        if seen.insert(w.clone()) {
+            text.push(w);
+        }
+    }
+    text.join(" ")
+}
+
 /// The one Tenant every data set is built for, so a data set found in the
 /// server by a later run belongs to the Tenant that run names.
 fn data_tenant() -> gnomon::TenantId {
@@ -290,20 +328,24 @@ fn data_tenant() -> gnomon::TenantId {
     ))
 }
 
-fn dataset_name(texts: usize) -> String {
+fn dataset_name(texts: usize, vocabulary: Vocabulary) -> String {
     let mut h = DefaultHasher::new();
     super::migration_files(DEFAULT_DIMENSION).hash(&mut h);
     BUILDER_SQL.hash(&mut h);
-    format!("gnomon_perf_{texts}_{:016x}", h.finish())
+    let words = match vocabulary {
+        Vocabulary::Numbers => "",
+        Vocabulary::Words => "words_",
+    };
+    format!("gnomon_perf_{words}{texts}_{:016x}", h.finish())
 }
 
 impl Dataset {
-    /// The data set of `texts` texts, built into a database that stays on the
-    /// server, or found there when this run or an earlier one on the same
-    /// container built it.
-    pub async fn get(texts: usize) -> Dataset {
+    /// The data set of `texts` texts with `vocabulary`, built into a
+    /// database that stays on the server, or found there when this run or an
+    /// earlier one on the same container built it.
+    pub async fn get(texts: usize, vocabulary: Vocabulary) -> Dataset {
         let server = Server::get().await;
-        let name = dataset_name(texts);
+        let name = dataset_name(texts, vocabulary);
         let admin = server.admin("postgres").await;
         let exists = !admin
             .query_typed(
@@ -314,7 +356,7 @@ impl Dataset {
             .unwrap()
             .is_empty();
         if !exists {
-            build(texts, &name).await;
+            build(texts, vocabulary, &name).await;
         }
         let db = server.admin(&name).await;
         let row = db
@@ -330,6 +372,7 @@ impl Dataset {
         Dataset {
             db: name,
             texts,
+            vocabulary,
             visible: row[0].get(0),
             versions: row[0].get(1),
         }
@@ -370,13 +413,104 @@ impl Dataset {
         // cheaper than a real vocabulary's.
         (rng.below(self.texts).to_string(), q)
     }
+
+    /// The query words of a [`Vocabulary::Words`] data set, by how many
+    /// visible texts and current names hold them.
+    pub async fn query_words(&self) -> QueryWords {
+        assert_eq!(self.vocabulary, Vocabulary::Words);
+        let admin = Server::get().await.admin(&self.db).await;
+        let words = |sql: String| {
+            let admin = &admin;
+            async move {
+                admin
+                    .query_typed(&sql, &[])
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.get::<_, String>(0))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let (mid_from, mid_to) = (self.visible * 6 / 1000, self.visible * 15 / 1000);
+        let q = QueryWords {
+            rare: words(format!(
+                "select token from perf.word_df
+                 where visible_texts between {RARE_FROM} and {RARE_TO} order by token"
+            ))
+            .await,
+            mid: words(format!(
+                "select token from perf.word_df
+                 where visible_texts between {mid_from} and {mid_to} order by token"
+            ))
+            .await,
+            commonest: words(
+                "select token from perf.word_df order by visible_texts desc, token limit 10".into(),
+            )
+            .await,
+            common_names: words(
+                "select token from perf.name_word_df order by current_names desc, token limit 3"
+                    .into(),
+            )
+            .await,
+            rare_names: words(format!(
+                "select n.token from perf.name_word_df n join perf.word_df w using (token)
+                 where w.visible_texts between {RARE_FROM} and {RARE_TO} order by n.token"
+            ))
+            .await,
+            commonest_share: admin
+                .query_typed("select max(visible_texts) from perf.word_df", &[])
+                .await
+                .unwrap()[0]
+                .get::<_, i64>(0) as f64
+                / self.visible as f64,
+            vocabulary: admin
+                .query_typed("select count(*) from perf.word_df", &[])
+                .await
+                .unwrap()[0]
+                .get(0),
+        };
+        for (class, pool) in [
+            ("rare", &q.rare),
+            ("mid", &q.mid),
+            ("rare name", &q.rare_names),
+        ] {
+            assert!(!pool.is_empty(), "the data set has no {class} word");
+        }
+        assert_eq!(q.commonest.len(), 10);
+        assert_eq!(q.common_names.len(), 3);
+        q
+    }
+}
+
+/// How many visible texts a rare word is in (#85).
+const RARE_FROM: i64 = 8;
+const RARE_TO: i64 = 40;
+
+/// The words the cases on a [`Vocabulary::Words`] data set query, counted
+/// over the texts visible at [`valid_at`] at the current belief.
+#[derive(Debug, Clone)]
+pub struct QueryWords {
+    /// In 8 to 40 visible texts.
+    pub rare: Vec<String>,
+    /// In 0.6% to 1.5% of the visible texts.
+    pub mid: Vec<String>,
+    /// The ten words the most visible texts hold, the commonest first.
+    pub commonest: Vec<String>,
+    /// The three words the most current names hold.
+    pub common_names: Vec<String>,
+    /// In a current name, and in 8 to 40 visible texts.
+    pub rare_names: Vec<String>,
+    /// The share of visible texts the commonest word is in.
+    pub commonest_share: f64,
+    /// How many distinct words the visible texts hold.
+    pub vocabulary: i64,
 }
 
 /// Everything the build runs, in order, as one string so a change to it names
 /// a new data set.
 const BUILDER_SQL: &str = include_str!("perf_data.sql");
 
-async fn build(texts: usize, name: &str) {
+async fn build(texts: usize, vocabulary: Vocabulary, name: &str) {
     let started = std::time::Instant::now();
     let db = TestDb::migrated().await;
     db.grant_kind_registration("gnomon_worker").await;
@@ -392,8 +526,15 @@ async fn build(texts: usize, name: &str) {
                 name: "company".into(),
                 of: gnomon::KindOf::Node,
                 parent: None,
-                properties: json!({ "type": "object", "properties": {} }),
-                search: vec![],
+                properties: match vocabulary {
+                    Vocabulary::Numbers => json!({ "type": "object", "properties": {} }),
+                    Vocabulary::Words => json!({ "type": "object",
+                        "properties": { "text": { "type": "string" } } }),
+                },
+                search: match vocabulary {
+                    Vocabulary::Numbers => vec![],
+                    Vocabulary::Words => vec!["text".into()],
+                },
             })
             .await
             .unwrap();
@@ -420,10 +561,25 @@ async fn build(texts: usize, name: &str) {
         .await
         .unwrap()[0]
         .get(0);
-    let sections: Vec<&str> = BUILDER_SQL.split("-- @@\n").collect();
+    let (props, words_join) = match vocabulary {
+        Vocabulary::Numbers => (
+            "jsonb_build_object('name', '{{scope}} text ' || v.text_id)",
+            "",
+        ),
+        Vocabulary::Words => (
+            "jsonb_build_object('name', w.name, 'text', w.body)",
+            " join perf.words w on w.id = v.text_id",
+        ),
+    };
+    let sections: Vec<&str> = BUILDER_SQL
+        .split("-- @@\n")
+        .filter(|s| vocabulary == Vocabulary::Words || !s.starts_with("-- words only\n"))
+        .collect();
     let mut step = 0;
     for section in &sections {
         let sql = section
+            .replace("{{props}}", props)
+            .replace("{{words_join}}", words_join)
             .replace("{{ext}}", &super::quote_ident(&ext))
             .replace("{{texts}}", &texts.to_string())
             .replace("{{tenant}}", &tenant.0.to_string())
@@ -451,14 +607,15 @@ async fn build(texts: usize, name: &str) {
     drop(admin);
     db.keep_as(name).await;
     eprintln!(
-        "data set of {texts} texts built in {:.0}s",
+        "data set of {texts} texts ({vocabulary:?}) built in {:.0}s",
         started.elapsed().as_secs_f64()
     );
 }
 
 /// The token rows, which the inserts with triggers off did not write,
 /// through the function the search index trigger calls, in chunks of
-/// versions.
+/// Versions, then the token rows of the Summaries, as that trigger writes
+/// them.
 async fn index_search_text(db: &TestDb, tenant: gnomon::TenantId) {
     let claims = json!({ "role": "gnomon_worker",
         "app_metadata": { "tenant_id": tenant.0.to_string(), "scopes": [SCOPE] } })
@@ -487,6 +644,23 @@ async fn index_search_text(db: &TestDb, tenant: gnomon::TenantId) {
         .unwrap();
         tx.commit().await.unwrap();
     }
+    let tx = admin.transaction().await.unwrap();
+    tx.query_typed(
+        "select set_config('request.jwt.claims', $1, true)",
+        &[(&claims, Type::TEXT)],
+    )
+    .await
+    .unwrap();
+    tx.execute_typed(
+        "insert into gnomon.derived_search_token
+           (tenant_id, scope, token, summary_id, community_id, tf, dl)
+         select * from gnomon.derived_text_tokens(
+           $1, 'summary', array(select id from gnomon.summary where tenant_id = $1))",
+        &[(&tenant.0, Type::UUID)],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
 }
 
 /// Stores every Version's embedding on one connection, in batches of
