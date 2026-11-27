@@ -157,7 +157,7 @@ async fn a_second_migrating_role_needs_admin_on_the_definer_roles_and_nothing_mo
     };
     assert_eq!(owner, "gnomon_writer");
     assert!(!acting, "the migrator kept SET on gnomon_writer");
-    gnomon::Store::connect(&second.login_url(), &support::connect_options())
+    support::connect_and_check(&second.login_url(), &support::connect_options())
         .await
         .expect("the Store accepts the second database");
 

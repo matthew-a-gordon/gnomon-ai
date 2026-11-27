@@ -1,7 +1,8 @@
 //! Seam 1 under concurrency: no caller's context reaches another caller's
 //! call.
 //!
-//! Many Stores, each one connection, run users and workers on different
+//! Many Stores, each running its calls in turn on a connection of its pool,
+//! run users and workers on different
 //! Tenants and Scopes at once. Raw connections as the login role run beside
 //! them and check that nothing the Store set is left on the session. Lane 4
 //! runs this through PgBouncer and Supavisor in transaction mode, where the

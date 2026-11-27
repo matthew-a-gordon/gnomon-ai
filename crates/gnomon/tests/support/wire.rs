@@ -4,7 +4,10 @@
 //! log each simple Query and each Parse with its statement name. That lets a
 //! test check, from outside the Store, which statements reach the server and
 //! whether any of them is named, as a transaction-mode pooler would see them.
-//! Every byte is forwarded unchanged.
+//! Every byte is forwarded unchanged. It keeps each connection's messages
+//! apart, and [`WireLog::cut_open_connections`] makes every connection open
+//! at that moment close, unseen by the client, when the client next sends
+//! on it, as a server or a network that dropped an idle connection would.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -24,15 +27,86 @@ pub enum Sent {
 }
 
 #[derive(Clone, Default)]
-pub struct WireLog(Arc<Mutex<Vec<Sent>>>);
+pub struct WireLog(Arc<Mutex<Log>>, Arc<tokio::sync::Notify>);
+
+#[derive(Default)]
+struct Log {
+    /// Every message in the order the proxy saw it, with the number of the
+    /// connection it came on.
+    sent: Vec<(usize, Sent)>,
+    /// How many connections the proxy has accepted.
+    connections: usize,
+    /// Connections numbered below this close on their next message.
+    cut_below: usize,
+}
 
 impl WireLog {
+    /// Every message, on every connection, in the order the proxy saw them.
     pub fn sent(&self) -> Vec<Sent> {
-        self.0.lock().unwrap().clone()
+        self.0
+            .lock()
+            .unwrap()
+            .sent
+            .iter()
+            .map(|(_, m)| m.clone())
+            .collect()
     }
 
-    fn push(&self, m: Sent) {
-        self.0.lock().unwrap().push(m);
+    /// Each connection's messages, in the order the connections were
+    /// accepted.
+    pub fn by_connection(&self) -> Vec<Vec<Sent>> {
+        let log = self.0.lock().unwrap();
+        let mut out = vec![Vec::new(); log.connections];
+        for (c, m) in &log.sent {
+            out[*c].push(m.clone());
+        }
+        out
+    }
+
+    /// How many messages the proxy has seen, on every connection.
+    pub fn len(&self) -> usize {
+        self.0.lock().unwrap().sent.len()
+    }
+
+    /// Returns once the proxy has seen `n` messages, on every connection.
+    pub async fn until_seen(&self, n: usize) {
+        loop {
+            let seen = self.1.notified();
+            if self.len() >= n {
+                return;
+            }
+            seen.await;
+        }
+    }
+
+    /// How many connections the proxy has accepted.
+    pub fn connections(&self) -> usize {
+        self.0.lock().unwrap().connections
+    }
+
+    /// Makes every connection open now close when the client next sends on
+    /// it. That message is logged and never reaches the server. Connections
+    /// accepted later are not cut.
+    pub fn cut_open_connections(&self) {
+        let mut log = self.0.lock().unwrap();
+        log.cut_below = log.connections;
+    }
+
+    fn accept(&self) -> usize {
+        let mut log = self.0.lock().unwrap();
+        log.connections += 1;
+        log.connections - 1
+    }
+
+    /// Logs a message, and says whether its connection is cut.
+    fn push(&self, connection: usize, m: Sent) -> bool {
+        let cut = {
+            let mut log = self.0.lock().unwrap();
+            log.sent.push((connection, m));
+            connection < log.cut_below
+        };
+        self.1.notify_waiters();
+        cut
     }
 }
 
@@ -45,16 +119,22 @@ pub async fn record(upstream: SocketAddr) -> (SocketAddr, WireLog) {
     tokio::spawn(async move {
         while let Ok((client, _)) = listener.accept().await {
             let log = accept_log.clone();
+            let connection = log.accept();
             tokio::spawn(async move {
                 let server = TcpStream::connect(upstream).await.unwrap();
-                let _ = relay(client, server, log).await;
+                let _ = relay(client, server, log, connection).await;
             });
         }
     });
     (addr, log)
 }
 
-async fn relay(client: TcpStream, server: TcpStream, log: WireLog) -> std::io::Result<()> {
+async fn relay(
+    client: TcpStream,
+    server: TcpStream,
+    log: WireLog,
+    connection: usize,
+) -> std::io::Result<()> {
     let (mut from_client, mut to_server) = (client, server);
     let (mut client_read, mut client_write) = from_client.split();
     let (mut server_read, mut server_write) = to_server.split();
@@ -67,7 +147,10 @@ async fn relay(client: TcpStream, server: TcpStream, log: WireLog) -> std::io::R
             let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
             let mut body = vec![0u8; len - 4];
             client_read.read_exact(&mut body).await?;
-            log.push(parse(header[0], &body));
+            if log.push(connection, parse(header[0], &body)) {
+                // Cut: both sockets close when the relay returns.
+                return Ok(());
+            }
             // One write per message, as a client makes: Supavisor refuses
             // an authentication message that arrives in two reads.
             let mut message = header.to_vec();

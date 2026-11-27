@@ -450,26 +450,33 @@ async fn a_sentence_of_a_closed_version_is_stored_and_found_as_of_then() {
 }
 
 #[tokio::test]
-async fn storing_a_sentence_commits_the_stage_records_its_caller_is_recording() {
+async fn a_sentence_commits_with_the_stage_records_of_its_transaction() {
     let w = World::new().await;
     let (_, version) = owned(&w).await;
     let e = w.episode(at(2024, 3, 1), None).await;
-    w.caller()
-        .recording(vec![StageWrite::pending(e, "embeddings")])
-        .store_sentence(w.tenant, version, "Ada holds seven percent of Acme")
+    let caller = w.caller();
+    let mut tx = caller.transaction(w.tenant).await.unwrap();
+    tx.store_sentence(version, "Ada holds seven percent of Acme")
         .await
         .unwrap();
+    tx.write_stages(&[StageWrite::pending(e, "embeddings")])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let records = w.caller().stage_records(w.tenant, e).await.unwrap();
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].stage, "embeddings");
 
-    // A refused store writes none.
+    // A refused store fails its transaction, which then commits nothing.
     let f = w.episode(at(2024, 3, 2), None).await;
-    let refused = w
-        .caller()
-        .recording(vec![StageWrite::pending(f, "embeddings")])
-        .store_sentence(w.tenant, VersionId(Uuid::new_v4()), "A Sentence.")
+    let mut tx = caller.transaction(w.tenant).await.unwrap();
+    let refused = tx
+        .store_sentence(VersionId(Uuid::new_v4()), "A Sentence.")
         .await;
     assert!(refused.is_err());
+    let _ = tx
+        .write_stages(&[StageWrite::pending(f, "embeddings")])
+        .await;
+    assert!(matches!(tx.commit().await, Err(gnomon::Error::RolledBack)));
     assert_eq!(w.caller().stage_records(w.tenant, f).await.unwrap(), vec![]);
 }

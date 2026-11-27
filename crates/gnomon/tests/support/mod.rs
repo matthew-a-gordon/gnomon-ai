@@ -44,21 +44,22 @@ const LOGIN_PASSWORD: &str = "gnomon-test-login";
 /// The settings the suites connect the Store with.
 ///
 /// The test servers run without TLS, so TLS is off, which a deployment
-/// must ask for explicitly. Named statements are on only when
-/// `GNOMON_TEST_NAMED_STATEMENTS` is `1`, for a pooler that supports them.
+/// must ask for explicitly. Every statement is sent unnamed, as the Store
+/// always sends them.
 pub fn connect_options() -> gnomon::ConnectOptions {
-    gnomon::ConnectOptions::default()
-        .tls(gnomon::Tls::plaintext())
-        .named_statements(named_statements_from_env())
+    gnomon::ConnectOptions::default().tls(gnomon::Tls::plaintext())
 }
 
-/// Whether `GNOMON_TEST_NAMED_STATEMENTS` turns named statements on.
-pub fn named_statements_from_env() -> bool {
-    match server::env("GNOMON_TEST_NAMED_STATEMENTS").as_deref() {
-        None | Some("0") => false,
-        Some("1") => true,
-        Some(other) => panic!("GNOMON_TEST_NAMED_STATEMENTS={other:?}: use 0 or 1"),
-    }
+/// A Store for `url` that has run the schema check, as a server does at
+/// startup. `Store::connect` itself opens no connection, so a test that
+/// needs the check or a refused connection to fail calls this.
+pub async fn connect_and_check(
+    url: &str,
+    options: &gnomon::ConnectOptions,
+) -> Result<gnomon::Store, gnomon::Error> {
+    let store = gnomon::Store::connect(url, options).await?;
+    store.check().await?;
+    Ok(store)
 }
 
 /// An error with every error under it, where the reason is: Postgres's
