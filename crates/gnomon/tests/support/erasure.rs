@@ -704,7 +704,7 @@ pub async fn assert_no_residue(admin: &Client, residue: &Residue<'_>) {
     }
 }
 
-/// The full vectors of vector Search (migration 0017), each the embedding of
+/// The full vectors of vector Search (`0004_search.sql`), each the embedding of
 /// one text of a Scope. A row names no Version, so an Erasure that deletes
 /// one leaves no ID behind in the row's text; [`assert_no_unused_full_vector`]
 /// checks it instead.
@@ -745,11 +745,11 @@ pub async fn assert_no_unused_full_vector(admin: &Client) {
     );
 }
 
-/// The token table of full-text Search (migration 0016), whose rows the
+/// The token table of full-text Search (`0004_search.sql`), whose rows the
 /// Store derives from each Version's text.
 pub const SEARCH_TOKEN: &str = "search_token";
 
-/// The name table of Resolution (migration 0019), whose rows the Store
+/// The name table of Resolution (`0004_search.sql`), whose rows the Store
 /// derives from each Node Version's name and Aliases.
 pub const NAME_ROWS: &str = "node_name";
 
@@ -848,7 +848,7 @@ async fn assert_tokens_derived_anew(admin: &Client, residue: &Residue<'_>) {
 
 /// Checks that the BM25 counts, read past RLS, are those the token rows give
 /// when counted again: each Scope's texts per word, and its texts and words.
-/// The texts are Versions' and, since migration 0020, Summaries' and
+/// The texts are Versions' and, Summaries' and
 /// Communities'. No committed transaction leaves a change to them behind.
 pub async fn assert_search_counts_match_the_token_rows(admin: &Client) {
     let left: i64 = admin

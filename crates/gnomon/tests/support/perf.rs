@@ -3,7 +3,7 @@
 //! SQL.
 //!
 //! A data set is built once per server: in a database named for its size and
-//! for the exported migrations, which stays on the server, so a rerun against
+//! for the migration files, which stays on the server, so a rerun against
 //! the same container skips the build. The cases only read it.
 
 use std::collections::hash_map::DefaultHasher;
@@ -292,7 +292,7 @@ fn data_tenant() -> gnomon::TenantId {
 
 fn dataset_name(texts: usize) -> String {
     let mut h = DefaultHasher::new();
-    super::exported(DEFAULT_DIMENSION).hash(&mut h);
+    super::migration_files(DEFAULT_DIMENSION).hash(&mut h);
     BUILDER_SQL.hash(&mut h);
     format!("gnomon_perf_{texts}_{:016x}", h.finish())
 }

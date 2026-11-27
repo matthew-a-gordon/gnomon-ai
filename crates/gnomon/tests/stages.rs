@@ -1,4 +1,4 @@
-//! Seam 1, stage records (ADR-0011, migration 0014): a stage record written
+//! Seam 1, stage records (ADR-0011, `0003_reads_and_writes.sql`): a stage record written
 //! in the transaction of the Store call that holds the stage's output, the
 //! claim of a due record with a lease, two concurrent claimers never getting
 //! the same record, an expired lease making a record claimable again, the

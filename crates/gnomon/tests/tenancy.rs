@@ -318,7 +318,7 @@ async fn switching_to_multi_tenant_mode_keeps_every_row_readable_under_the_forme
     let version = written.opened[0];
     let citations = single.list_citations(None, version).await.unwrap();
     assert_eq!(citations.len(), 2);
-    // The Node's name, embedded for Resolution (migration 0019).
+    // The Node's name, embedded for Resolution (`0004_search.sql`).
     let name_vector = support::vectors::Rng::new(7).unit();
     single
         .store_name_embedding(None, node, "Ada", &name_vector)

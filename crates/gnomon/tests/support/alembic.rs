@@ -1,5 +1,5 @@
-//! Runs Alembic against a consumer's Alembic project, for the alembic
-//! target (ADR-0006).
+//! Runs Alembic against a consumer's Alembic project that applies gnomon's
+//! migration files (ADR-0006).
 //!
 //! Alembic runs through `uvx` with pinned versions, so nothing is installed
 //! globally and every run resolves the same packages.
@@ -28,9 +28,15 @@ impl Project {
         Project { dir }
     }
 
-    /// Where the revisions go: what a consumer passes as `--out`.
+    /// Where the revisions go.
     pub fn versions(&self) -> PathBuf {
         self.dir.path().join("versions")
+    }
+
+    /// Where the consumer copies gnomon's migration files, beside
+    /// `versions/`.
+    pub fn gnomon_files(&self) -> PathBuf {
+        self.dir.path().join("gnomon")
     }
 
     /// Runs `alembic <args>` in the project and returns its stdout. `url`
@@ -54,60 +60,5 @@ impl Project {
         } else {
             Err(String::from_utf8_lossy(&run.stderr).into_owned())
         }
-    }
-
-    /// The `(down_revision, revision)` links `alembic history` reports, with
-    /// `<base>` for a revision with no parent.
-    pub fn links(&self) -> Vec<(String, String)> {
-        let history = self.alembic(&["history"], None).expect("alembic history");
-        let mut links: Vec<(String, String)> = history
-            .lines()
-            .filter_map(|line| {
-                let (from, rest) = line.split_once(" -> ")?;
-                let to = rest.split([' ', ',']).next()?;
-                Some((from.trim().to_owned(), to.to_owned()))
-            })
-            .flat_map(|(from, to)| {
-                // A merge revision reports `a, b -> c`.
-                from.split(", ")
-                    .map(|f| (f.to_owned(), to.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        links.sort();
-        links
-    }
-
-    /// The chain's heads, as `alembic heads` reports them.
-    pub fn heads(&self) -> Vec<String> {
-        let out = self.alembic(&["heads"], None).expect("alembic heads");
-        let mut heads: Vec<String> = out
-            .lines()
-            .filter_map(|l| l.split_whitespace().next().map(str::to_owned))
-            .collect();
-        heads.sort();
-        heads
-    }
-
-    /// Writes a consumer's own revision into `versions/`.
-    pub fn add_consumer_revision(&self, revision: &str, down_revision: Option<&str>) {
-        let down = down_revision.map_or("None".to_owned(), |d| format!("{d:?}"));
-        std::fs::write(
-            self.versions().join(format!("{revision}_consumer.py")),
-            format!(
-                "\"\"\"A consumer's own revision.\"\"\"\n\
-                 from typing import Sequence, Union\n\n\
-                 from alembic import op\n\n\
-                 revision: str = {revision:?}\n\
-                 down_revision: Union[str, Sequence[str], None] = {down}\n\
-                 branch_labels = None\n\
-                 depends_on = None\n\n\n\
-                 def upgrade() -> None:\n    \
-                     op.execute(\"create table public.consumer_{revision} (id bigint primary key)\")\n\n\n\
-                 def downgrade() -> None:\n    \
-                     op.execute(\"drop table public.consumer_{revision}\")\n"
-            ),
-        )
-        .unwrap();
     }
 }

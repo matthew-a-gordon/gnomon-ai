@@ -179,7 +179,7 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
     }
     // A Sentence the Pipeline embedded and then replaced, on the Edge E never
     // touches, and the replacement's embedding. The replaced text's
-    // embedding goes when it is replaced (migration 0021), so no full vector
+    // embedding goes when it is replaced (`0004_search.sql`), so no full vector
     // is left that no row uses, which no Erasure could find.
     for sentence in [
         format!("{MARKER}: d held 1% of Acme"),
@@ -238,7 +238,7 @@ async fn after_an_erasure_no_row_of_any_table_names_the_episode_or_holds_a_value
         .write_community(w.tenant, &community(vec![c], "Acme".into(), vec![f]))
         .await
         .unwrap();
-    // Each is embedded for Search (migration 0020), and each has token rows
+    // Each is embedded for Search (`0004_search.sql`), and each has token rows
     // of its text, E's marker among them for the two that cite E.
     for (i, id) in [e_summary, f_summary].into_iter().enumerate() {
         let v = support::vectors::Rng::new(40 + i as u64).unit();

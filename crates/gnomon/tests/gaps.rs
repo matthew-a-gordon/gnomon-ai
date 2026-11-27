@@ -1,4 +1,4 @@
-//! Seam 1 for the gap listing (migration 0021): for one Scope, what
+//! Seam 1 for the gap listing (`0004_search.sql`): for one Scope, what
 //! `maintain` repairs. That is the Edge Versions without a Sentence, the
 //! search texts without an embedding, and the Nodes and Communities without
 //! a current Summary, through the Rust core's Store API against real

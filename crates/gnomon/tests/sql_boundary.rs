@@ -349,7 +349,7 @@ const ONTOLOGY_TABLES: &[&str] = &["kind", "kind_rule", "kind_merge"];
 const ERASURE_REACH: &str = "erasure_reach";
 
 /// The BM25 counts of each Scope, which only the token table's triggers
-/// write (migration 0016).
+/// write (`0004_search.sql`).
 
 #[tokio::test]
 async fn every_gnomon_table_has_rls_and_every_graph_table_has_a_tenant_and_the_tenant_scope_policy()
@@ -578,6 +578,9 @@ async fn every_gnomon_function_runs_as_the_invoker_with_a_search_path_ending_in_
 async fn the_definer_role_cannot_log_in_or_bypass_rls_and_no_role_belongs_to_it_or_it_to_one() {
     let w = world().await;
     let client = w.db.login().await;
+    // A migrating role acts as the definer role for one step, under the
+    // server's lock when a test applies the files (tests/install.rs).
+    let _lock = support::Server::get().await.lock();
     let row = client
         .query_typed(
             "select rolcanlogin, rolsuper or rolbypassrls,
@@ -2468,7 +2471,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         .await
         .unwrap();
     // A Summary of the Node and a Community holding it, each citing the
-    // Episode (ADR-0014, migration 0018).
+    // Episode (ADR-0014, `0003_reads_and_writes.sql`).
     single
         .write_summary(
             None,
@@ -2496,7 +2499,7 @@ async fn after_the_switch_a_caller_of_the_former_default_tenant_sees_every_row_o
         )
         .await
         .unwrap();
-    // Its embedding, for Search (migration 0020). Its token rows and the
+    // Its embedding, for Search (`0004_search.sql`). Its token rows and the
     // Summary's are written with them.
     single
         .store_community_embedding(None, community, &support::vectors::Rng::new(8).unit())
@@ -3373,7 +3376,7 @@ async fn global_default_privileges_give_callers_no_right_the_migrations_do_not()
             .await
             .unwrap();
     }
-    for (file, sql) in support::exported(support::DEFAULT_DIMENSION) {
+    for (file, sql) in support::migration_files(support::DEFAULT_DIMENSION) {
         operator
             .batch_execute(&sql)
             .await
@@ -5865,7 +5868,7 @@ async fn no_role_holds_maintain_and_no_caller_can_vacuum_reindex_or_cluster_a_gn
     );
 }
 
-/// The stage tables (ADR-0011, migration 0014).
+/// The stage tables (ADR-0011, `0003_reads_and_writes.sql`).
 const STAGE_TABLES: &[&str] = &["stage_record", "stage_usage"];
 
 /// `world()` with stage records for its Episodes: each Episode's graph stage
@@ -6145,7 +6148,7 @@ async fn a_caller_cannot_delete_a_stage_record_or_change_what_it_names() {
 }
 
 /// The token table of full-text Search, the BM25 counts of each Scope and
-/// each transaction's changes to them (ADR-0010, migration 0016).
+/// each transaction's changes to them (ADR-0010, `0004_search.sql`).
 const SEARCH_TABLES: &[&str] = &[
     "search_token",
     "search_token_frequency",
@@ -6388,7 +6391,7 @@ async fn the_search_index_function_is_a_definer_no_role_may_execute_and_callers_
 }
 
 /// The full vectors and quantized rows of vector Search (ADR-0010,
-/// migration 0017).
+/// `0004_search.sql`).
 const EMBEDDING_TABLES: &[&str] = &["embedding", "embedding_bit"];
 
 /// `searchable_world()` with an embedding stored for every Version, as each
@@ -6492,7 +6495,7 @@ async fn embedding_rows(db: &TestDb) -> Vec<String> {
     support::erasure::rows_of(&db.admin().await, &tables).await
 }
 
-/// A unit vector of the exported dimension, as SQL text.
+/// A unit vector of the embedding dimension, as SQL text.
 fn sql_vector() -> String {
     let v = support::vectors::Rng::new(5).unit();
     format!(
@@ -6778,7 +6781,7 @@ async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_c
         ))
         .await
         .unwrap();
-    for (file, sql) in support::exported(support::DEFAULT_DIMENSION) {
+    for (file, sql) in support::migration_files(support::DEFAULT_DIMENSION) {
         operator
             .batch_execute(&sql)
             .await
@@ -6903,7 +6906,7 @@ async fn vector_search_works_with_pgvector_in_a_schema_of_its_own_whatever_the_c
     assert!(found.iter().any(|c| c.node == twin));
 }
 
-// Summaries and Communities (ADR-0009, ADR-0014, ADR-0015, migration 0018).
+// Summaries and Communities (ADR-0009, ADR-0014, ADR-0015, `0003_reads_and_writes.sql`).
 // Callers write them through invoker functions or directly, and every check
 // is the tables' own: RLS, column grants, foreign keys that carry the Scope,
 // and guard triggers. Only Erasure deletes committed rows, and its reach
@@ -7504,7 +7507,7 @@ async fn the_definers_summary_reach_covers_only_the_summaries_of_a_node_its_own_
     tx.rollback().await.unwrap();
 }
 
-// Resolution (ADR-0009, ADR-0010, migration 0019). The search index trigger
+// Resolution (ADR-0009, ADR-0010, `0004_search.sql`). The search index trigger
 // writes the name rows, and callers update only a name row's bits in their
 // own Scopes, which a trigger derives from the stored full vector whatever
 // the caller supplies.
@@ -7837,7 +7840,7 @@ async fn callers_hold_only_select_and_a_bits_update_on_the_name_table_and_the_de
     );
 }
 
-// Search (ADR-0010, migration 0020). The fused call, its token rows and
+// Search (ADR-0010, `0004_search.sql`). The fused call, its token rows and
 // embeddings of Summaries and Communities, and its graph signals run as the
 // caller under RLS. No caller writes a token row, and an embedding row a
 // caller inserts is derived from the stored row whatever it supplied.
@@ -8409,7 +8412,7 @@ async fn an_episode_edge_or_summary_of_a_scope_the_caller_cannot_see_changes_no_
     assert_ne!(ranked(&["support", "billing"]).await, both_before);
 }
 
-// Sentences and the gap listing (ADR-0009, ADR-0013, migration 0021).
+// Sentences and the gap listing (ADR-0009, ADR-0013, `0004_search.sql`).
 
 /// The Edges of `edges()`, each Edge Version's ID, and an Edge of Tenant
 /// one's `billing` Scope from its Node to itself. Tenant two's Edge and the
