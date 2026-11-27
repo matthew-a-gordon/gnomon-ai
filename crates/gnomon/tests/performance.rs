@@ -234,10 +234,11 @@ impl QueryClass {
 }
 
 /// The query classes whose Search budget is asserted at each size: those
-/// that met it before Search counted word frequency at query time (#85). None
-/// did. On pgvector before #85, a rare word took 150 ms at p95 at 50,000
-/// visible rows and 665 ms at 200,000, so every class is recorded only, and
-/// #87 tracks the cost of the full-text branch with these frequencies.
+/// that met it when the cases were added, while Search read a stored count of
+/// each word (#85). None did. A rare word then took 150 ms at p95 at 50,000
+/// visible rows on pgvector and 487 ms at 200,000 on supabase, so every class
+/// is recorded only, and #87 tracks the cost of the full-text branch with
+/// these frequencies.
 const WORD_BUDGETED_50K: &[QueryClass] = &[];
 const WORD_BUDGETED_200K: &[QueryClass] = &[];
 

@@ -144,7 +144,7 @@ GNOMON_TEST_CONTAINER_PREFIX=gnomon-t21 GNOMON_TEST_DATA_DIR=disk \
 It asserts:
 
 - the whole fused Search, `Caller::search` by text and vector, under 100 ms at p95 up to 50,000 visible rows and under 250 ms up to 200,000 (ADR-0010), on the data shape of prototype 5 (`origin/prototype/exact-search`);
-- the same budgets for the query classes of the data set with realistic word frequencies that met them before #85 counted word frequency at query time. No class did, so each is recorded with no budget: before #85, a rare word took 150 ms at p95 at 50,000 visible rows and 665 ms at 200,000 on pgvector. #87 tracks the cost of the full-text branch with these frequencies;
+- the same budgets for the query classes of the data set with realistic word frequencies that met them when the cases were added, while Search read a stored count of each word (#85). No class did, so each is recorded with no budget: a rare word then took 150 ms at p95 at 50,000 visible rows on pgvector and 487 ms at 200,000 on supabase. #87 tracks the cost of the full-text branch with these frequencies;
 - the p50 limit of each patch case on a small Store and on a large one, and that each case takes at most 1.5 times as long on the large Store as on the small one at p50 (ADR-0007, #84). The cases are bounded patches on Nodes of 10, 100 and 500 Contributions, an open-ended patch on 500, and one open-ended patch that rewrites every Version of a Node of 200 Versions. Each limit is 1.5 times the p50 the suite measured after #84 on the slower image, and ADR-0007 records them.
 
 How a case measures:
