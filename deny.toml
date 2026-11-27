@@ -54,4 +54,12 @@ allow-git = []
 # differs between cargo-deny versions and kinds of advisory, so both are stated.
 unmaintained = "all"
 unsound = "all"
-ignore = []
+# Each entry names one advisory, so a later advisory against the same crate
+# still fails the check. cargo deny warns about an entry that matches no crate.
+ignore = [
+  # Remove when a testcontainers release no longer depends on the crate
+  # (testcontainers/testcontainers-rs#1006).
+  { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar is unmaintained. Only testcontainers, a dev-dependency, brings it in, so gnomon does not ship it" },
+  # Remove when #105 moves the public API's times off chrono.
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, and its types are in the public API. ADR-0001 records why gnomon keeps it for now" },
+]
