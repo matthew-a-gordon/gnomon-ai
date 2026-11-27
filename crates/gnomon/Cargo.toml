@@ -20,19 +20,18 @@ path = "tests/performance.rs"
 required-features = ["performance"]
 
 [dependencies]
-chrono = "0.4"
 deadpool-postgres = { version = "0.14", default-features = false, features = ["rt_tokio_1"] }
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
-tokio-postgres = { version = "0.7.18", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
+tokio-postgres = { version = "0.7.18", features = ["with-uuid-1", "with-jiff-0_2", "with-serde_json-1"] }
 tokio-postgres-rustls = { version = "0.14", features = ["aws-lc-rs"] }
 uuid = "1"
 
 [dev-dependencies]
-chrono = "0.4"
 serde_json = "1"
 proptest = "1"
 tempfile = "3"

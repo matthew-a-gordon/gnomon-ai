@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -65,9 +65,9 @@ pub struct EdgeVersion {
     pub values: Map<String, Value>,
     pub valid_time: ValidTime,
     /// When gnomon began to hold this Version as its belief.
-    pub recorded_from: DateTime<Utc>,
+    pub recorded_from: Timestamp,
     /// When it stopped, or `None` while it is current.
-    pub recorded_to: Option<DateTime<Utc>>,
+    pub recorded_to: Option<Timestamp>,
     /// Whether the read's valid-at instant falls inside the period of this
     /// Version's imprecise start bound (ADR-0008).
     pub uncertain: bool,
@@ -157,7 +157,7 @@ pub struct Step {
 pub struct EpisodeErasure {
     /// When the Erasure ran: when the call's transaction started. History is
     /// rewritten up to this instant as if the Episode had never existed.
-    pub erased_at: DateTime<Utc>,
+    pub erased_at: Timestamp,
     /// The Nodes the Episode touched whose Versions were recomputed from the
     /// Contributions that remain, in order of ID.
     pub recomputed_nodes: Vec<NodeId>,
@@ -177,7 +177,7 @@ pub struct EpisodeErasure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphErasure {
     /// When the Erasure ran: when the call's transaction started.
-    pub erased_at: DateTime<Utc>,
+    pub erased_at: Timestamp,
     /// The Episodes erased, in order of ID. Only a Scope's Erasure erases
     /// Episodes: those of the Scope.
     pub erased_episodes: Vec<EpisodeId>,

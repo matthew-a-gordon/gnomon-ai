@@ -420,10 +420,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -885,8 +883,8 @@ dependencies = [
 name = "gnomon"
 version = "0.0.0"
 dependencies = [
- "chrono",
  "deadpool-postgres",
+ "jiff 0.2.46",
  "proptest",
  "rcgen",
  "rustls",
@@ -1792,8 +1790,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "851ca9db4932932d69f3ea811b1abe63087a0f740a47692619dd40d4899b68be"
 dependencies = [
  "bytes",
- "chrono",
  "fallible-iterator",
+ "jiff 0.2.46",
  "postgres-protocol",
  "serde_core",
  "serde_json",

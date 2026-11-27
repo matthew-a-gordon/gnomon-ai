@@ -182,8 +182,8 @@ async fn the_store_refuses_a_schema_whose_embedding_dimension_pgvector_cannot_st
 
 // Recording and reading an Episode, and isolation through the Store API.
 
-use chrono::{TimeZone, Utc};
 use gnomon::{EpisodeId, NewEpisode, Scope, TenantId};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::Map;
 use tokio_postgres::error::SqlState;
 
@@ -194,7 +194,7 @@ fn episode(tenant: TenantId, scope: &str, content: &str) -> NewEpisode {
         tenant: Some(tenant),
         scope: Scope::new(scope),
         content: content.to_owned(),
-        reference_time: Utc.with_ymd_and_hms(2024, 3, 14, 9, 30, 0).unwrap(),
+        reference_time: "2024-03-14T09:30:00Z".parse().unwrap(),
         authority: Some(3),
     }
 }
@@ -240,7 +240,7 @@ async fn an_end_user_records_an_episode_and_reads_it_back() {
         "support",
         "The customer asked to move the renewal to April.",
     );
-    let before = Utc::now();
+    let before = Timestamp::now();
     let id = alice.record_episode(&new).await.unwrap();
     let read = alice
         .read_episode(t, id)
@@ -255,14 +255,11 @@ async fn an_end_user_records_an_episode_and_reads_it_back() {
         read.content,
         "The customer asked to move the renewal to April."
     );
-    assert_eq!(
-        read.reference_time,
-        Utc.with_ymd_and_hms(2024, 3, 14, 9, 30, 0).unwrap()
-    );
+    assert_eq!(read.reference_time, "2024-03-14T09:30:00Z".parse().unwrap());
     assert_eq!(read.authority, Some(3));
-    let skew = chrono::Duration::seconds(5);
+    let skew = SignedDuration::from_secs(5);
     assert!(
-        read.recorded_at > before - skew && read.recorded_at < Utc::now() + skew,
+        read.recorded_at > before - skew && read.recorded_at < Timestamp::now() + skew,
         "recorded_at {} is not the time of the write",
         read.recorded_at
     );
@@ -340,7 +337,7 @@ async fn episode_ids_are_uuid_v7_in_recording_order() {
             .get_timestamp()
             .expect("a v7 UUID carries a timestamp")
             .to_unix();
-        let age = Utc::now().timestamp() - secs as i64;
+        let age = Timestamp::now().as_second() - secs as i64;
         assert!(
             (0..=60).contains(&age),
             "{id} carries a timestamp {age} s from now"
@@ -703,7 +700,7 @@ async fn a_batch_as_of_read_of_many_nodes_and_a_traversal_are_each_one_call_what
         .await
         .unwrap();
     let r = reader.as_worker(t, Scope::new(scope), None);
-    let now = gnomon::AsOf::current(Utc::now());
+    let now = gnomon::AsOf::current(Timestamp::now());
     let one = r.read_nodes(t, &nodes[..1], now).await.unwrap();
     let all = r.read_nodes(t, &nodes, now).await.unwrap();
     let steps = r

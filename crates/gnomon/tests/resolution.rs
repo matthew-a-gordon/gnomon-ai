@@ -6,6 +6,7 @@
 mod support;
 
 use gnomon::{AsOf, KindOf, Mention, NewKind, ValidTime};
+use jiff::SignedDuration;
 use serde_json::json;
 use support::erasure::{World, at};
 use support::vectors::{Rng, cosine_distance};
@@ -218,10 +219,7 @@ async fn only_current_names_and_aliases_are_searched() {
         .read_node(
             w.tenant,
             ada,
-            AsOf::at(
-                at(2024, 6, 1),
-                renamed_at - chrono::Duration::microseconds(1),
-            ),
+            AsOf::at(at(2024, 6, 1), renamed_at - SignedDuration::from_micros(1)),
         )
         .await
         .unwrap()
@@ -724,7 +722,7 @@ async fn recall_at_10(
     corpus: &support::vectors::NameCorpus,
     scopes: &[&str],
     queries: &[Vec<f32>],
-    valid_at: Option<chrono::DateTime<chrono::Utc>>,
+    valid_at: Option<jiff::Timestamp>,
 ) -> f64 {
     let caller = w.seeing(scopes);
     let mut total = 0.0;

@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::{EpisodeId, Scope, TenantId};
 
@@ -100,12 +100,12 @@ pub struct StageRecord {
     pub attempts: i32,
     pub last_error: Option<StageError>,
     /// When a [`StageStatus::Retry`] record is due, by the database's clock.
-    pub retry_at: Option<DateTime<Utc>>,
+    pub retry_at: Option<Timestamp>,
     /// When a [`StageStatus::Running`] record's lease ends, by the
     /// database's clock. After it the record may be claimed again.
-    pub lease_until: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub lease_until: Option<Timestamp>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
     /// By model, in order of name.
     pub usage: Vec<StageUsage>,
 }

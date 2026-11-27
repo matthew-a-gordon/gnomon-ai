@@ -5,19 +5,23 @@
 
 mod support;
 
-use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
     AsOf, Bound, BoundChange, BoundSide, BoundStatement, EpisodeId, Error, KindOf, MergeRule,
     NewEpisode, NewKind, NewNode, NodeId, NodeVersion, Patch, Precision, Scope, Store, TenantId,
     ValidTime, VersionId,
 };
+use jiff::{Timestamp, civil::date, tz::TimeZone};
 use serde_json::{Map, Value, json};
 use support::TestDb;
 
 const SCOPE: &str = "support";
 
-fn at(y: i32, m: u32, d: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+fn at(y: i16, m: i8, d: i8) -> Timestamp {
+    date(y, m, d)
+        .at(0, 0, 0, 0)
+        .to_zoned(TimeZone::UTC)
+        .unwrap()
+        .timestamp()
 }
 
 fn values(v: Value) -> Map<String, Value> {
@@ -80,7 +84,7 @@ impl World {
         self.caller().set_merge_rule(self.tenant, kind, rule).await
     }
 
-    async fn episode(&self, reference_time: DateTime<Utc>, authority: Option<i32>) -> EpisodeId {
+    async fn episode(&self, reference_time: Timestamp, authority: Option<i32>) -> EpisodeId {
         self.caller()
             .record_episode(&NewEpisode {
                 tenant: Some(self.tenant),
@@ -115,14 +119,14 @@ impl World {
             .unwrap();
     }
 
-    async fn read(&self, node: NodeId, valid_at: DateTime<Utc>) -> Option<NodeVersion> {
+    async fn read(&self, node: NodeId, valid_at: Timestamp) -> Option<NodeVersion> {
         self.caller()
             .read_node(self.tenant, node, AsOf::current(valid_at))
             .await
             .unwrap()
     }
 
-    async fn plan(&self, node: NodeId, valid_at: DateTime<Utc>) -> Option<String> {
+    async fn plan(&self, node: NodeId, valid_at: Timestamp) -> Option<String> {
         self.read(node, valid_at).await.and_then(|v| {
             v.values
                 .get("plan")
@@ -564,7 +568,7 @@ async fn state_end(
     node: NodeId,
     version: VersionId,
     episode: EpisodeId,
-    to: DateTime<Utc>,
+    to: Timestamp,
 ) -> gnomon::BoundOutcome {
     w.caller()
         .state_bound(

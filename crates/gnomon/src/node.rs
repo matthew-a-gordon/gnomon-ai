@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -73,20 +73,17 @@ pub enum Bound {
     /// does an unknown end.
     Unknown,
     /// An instant, the bound's start in UTC.
-    At(DateTime<Utc>),
+    At(Timestamp),
     /// A period the source names, such as "March 2024". A write may give any
     /// instant inside the period. The Store keeps the start of the period in
     /// UTC, and a read returns that start.
-    Period {
-        at: DateTime<Utc>,
-        precision: Precision,
-    },
+    Period { at: Timestamp, precision: Precision },
 }
 
 impl Bound {
     /// The bound's instant and precision as the Store's SQL takes them: an
     /// unknown bound is `(None, None)`.
-    pub(crate) fn parts(self) -> (Option<DateTime<Utc>>, Option<&'static str>) {
+    pub(crate) fn parts(self) -> (Option<Timestamp>, Option<&'static str>) {
         match self {
             Bound::Unknown => (None, None),
             Bound::At(t) => (Some(t), Some(Precision::Instant.as_sql())),
@@ -112,7 +109,7 @@ impl ValidTime {
     };
 
     /// `[from, to)`.
-    pub fn between(from: DateTime<Utc>, to: DateTime<Utc>) -> ValidTime {
+    pub fn between(from: Timestamp, to: Timestamp) -> ValidTime {
         ValidTime {
             from: Bound::At(from),
             to: Bound::At(to),
@@ -128,7 +125,7 @@ impl ValidTime {
     }
 
     /// From `from` on, with an open end.
-    pub fn since(from: DateTime<Utc>) -> ValidTime {
+    pub fn since(from: Timestamp) -> ValidTime {
         ValidTime {
             from: Bound::At(from),
             to: Bound::Unknown,
@@ -202,7 +199,7 @@ pub struct WriteOutcome {
     pub status: WriteStatus,
     /// The write's Recorded time: when its transaction started. Every write
     /// in one transaction shares it.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
     /// The Versions the write opened.
     pub opened: Vec<VersionId>,
 }
@@ -211,15 +208,15 @@ pub struct WriteOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AsOf {
     /// When in the world.
-    pub valid_at: DateTime<Utc>,
+    pub valid_at: Timestamp,
     /// According to what gnomon believed when. `None` reads the current
     /// belief.
-    pub known_at: Option<DateTime<Utc>>,
+    pub known_at: Option<Timestamp>,
 }
 
 impl AsOf {
     /// What gnomon believes now about `valid_at`.
-    pub fn current(valid_at: DateTime<Utc>) -> AsOf {
+    pub fn current(valid_at: Timestamp) -> AsOf {
         AsOf {
             valid_at,
             known_at: None,
@@ -227,7 +224,7 @@ impl AsOf {
     }
 
     /// What gnomon believed at `known_at` about `valid_at`.
-    pub fn at(valid_at: DateTime<Utc>, known_at: DateTime<Utc>) -> AsOf {
+    pub fn at(valid_at: Timestamp, known_at: Timestamp) -> AsOf {
         AsOf {
             valid_at,
             known_at: Some(known_at),
@@ -246,9 +243,9 @@ pub struct NodeVersion {
     pub values: Map<String, Value>,
     pub valid_time: ValidTime,
     /// When gnomon began to hold this Version as its belief.
-    pub recorded_from: DateTime<Utc>,
+    pub recorded_from: Timestamp,
     /// When it stopped, or `None` while it is current.
-    pub recorded_to: Option<DateTime<Utc>>,
+    pub recorded_to: Option<Timestamp>,
     /// Whether the read's valid-at instant falls inside the period of one of
     /// this Version's imprecise bounds, so that the Version may not yet have
     /// held (ADR-0008).
@@ -300,7 +297,7 @@ pub enum BoundChange {
 pub struct BoundOutcome {
     pub change: BoundChange,
     /// The statement's Recorded time: when its transaction started.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
     /// The Versions the statement opened.
     pub opened: Vec<VersionId>,
 }
@@ -324,9 +321,9 @@ pub struct Citation {
     /// Where in the Episode, if the write said.
     pub place: Option<String>,
     /// When gnomon recorded the Citation.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
     /// When gnomon recorded the Episode.
-    pub episode_recorded_at: DateTime<Utc>,
+    pub episode_recorded_at: Timestamp,
 }
 
 /// What an Episode states when what a Version stated stopped being true:
@@ -378,7 +375,7 @@ pub struct Statement {
     /// validity, and the whole Valid time of the Version for a Retraction.
     pub valid_time: ValidTime,
     /// When gnomon recorded the statement: when its transaction started.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
 }
 
 /// What Retract Episode recorded.
@@ -386,7 +383,7 @@ pub struct Statement {
 pub struct EpisodeRetraction {
     /// When the Retractions were recorded: when the call's transaction
     /// started.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
     /// The Versions retracted, each cited only by the Episode.
     pub retracted: Vec<VersionId>,
 }

@@ -14,7 +14,7 @@
 //! two are one thing, or are not, is a `same_as` or `different_from` Edge the
 //! Pipeline writes (ADR-0012).
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::{NodeId, Scope, VersionId};
 
@@ -29,7 +29,7 @@ pub struct Mention<'a> {
     pub embedding: Option<&'a [f32]>,
     /// When set, only the names and Aliases of Versions valid at this
     /// instant match. When `None`, those of every Valid time do.
-    pub valid_at: Option<DateTime<Utc>>,
+    pub valid_at: Option<Timestamp>,
 }
 
 impl<'a> Mention<'a> {
@@ -60,7 +60,7 @@ impl<'a> Mention<'a> {
     }
 
     /// The same mention, matching only names valid at `at`.
-    pub fn valid_at(self, at: DateTime<Utc>) -> Mention<'a> {
+    pub fn valid_at(self, at: Timestamp) -> Mention<'a> {
         Mention {
             valid_at: Some(at),
             ..self

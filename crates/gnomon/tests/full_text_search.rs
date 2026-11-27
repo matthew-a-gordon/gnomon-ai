@@ -7,6 +7,7 @@ mod support;
 
 use gnomon::{AsOf, Caller, FullTextCandidate, KindOf, NewKind, ValidTime, Versioned};
 use gnomon::{NewEdge, NewNode, Patch, Scope};
+use jiff::SignedDuration;
 use serde_json::json;
 use support::erasure::{SCOPE, World, assert_search_counts_match_the_token_rows, at, values};
 use tokio_postgres::Client;
@@ -444,7 +445,7 @@ async fn results_honour_the_as_of_instants() {
     );
     let before_all = AsOf::at(
         at(2024, 4, 1),
-        first.recorded_from - chrono::Duration::seconds(1),
+        first.recorded_from - SignedDuration::from_secs(1),
     );
     assert_eq!(found(&caller, &w, "umbrella", before_all).await, vec![]);
 }

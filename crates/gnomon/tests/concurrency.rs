@@ -15,7 +15,6 @@ mod support;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chrono::{TimeZone, Utc};
 use gnomon::{Caller, EpisodeId, Error, NewEpisode, Scope, Store, TenantId};
 use support::{LOGIN_ROLE, TestDb};
 use tokio::sync::Barrier;
@@ -75,7 +74,7 @@ async fn run_caller(
                 tenant: Some(me.tenant),
                 scope: Scope::new(&me.scope),
                 content: content.clone(),
-                reference_time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                reference_time: "2026-01-01T00:00:00Z".parse().unwrap(),
                 authority: None,
             })
             .await

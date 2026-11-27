@@ -828,7 +828,7 @@ async fn episodes_behind(
 async fn the_episodes_behind_a_node_are_each_one_its_node_edges_and_summaries_cite_and_none_the_caller_cannot_read()
  {
     let w = World::new().await;
-    let support = |day: u32, what: &'static str| w.episode_saying(at(2024, 1, day), None, what);
+    let support = |day: i8, what: &'static str| w.episode_saying(at(2024, 1, day), None, what);
     // Each Episode reaches x one way.
     let value = support(1, "x's plan").await;
     let replacing = support(2, "x's new plan").await;

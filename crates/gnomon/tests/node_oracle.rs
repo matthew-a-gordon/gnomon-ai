@@ -9,11 +9,11 @@
 
 mod support;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
 use gnomon::{
     AsOf, Bound, EpisodeId, NewEpisode, NewNode, NodeId, Patch, ROOT_NODE_KIND, Scope, Store,
     TenantId, ValidTime,
 };
+use jiff::{SignedDuration, Timestamp};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 use serde_json::{Map, Value, json};
@@ -22,8 +22,9 @@ use support::TestDb;
 const SCOPE: &str = "support";
 
 /// Day `d` of the Valid-time axis, which may be fractional.
-fn at(d: f64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap() + Duration::minutes((d * 1440.0) as i64)
+fn at(d: f64) -> Timestamp {
+    "2024-01-01T00:00:00Z".parse::<Timestamp>().unwrap()
+        + SignedDuration::from_mins((d * 1440.0) as i64)
 }
 
 /// One write: an Episode's Reference time, a Valid time in whole days

@@ -9,12 +9,12 @@
 
 mod support;
 
-use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
     AsOf, DIFFERENT_FROM_KIND, Direction, EdgeId, EpisodeId, Error, Kind, KindOf, MergeRule,
     NewEdge, NewEpisode, NewKind, NewNode, NodeId, Patch, ROOT_EDGE_KIND, ROOT_NODE_KIND,
     Retraction, SAME_AS_KIND, Scope, Store, TenantId, Traversal, ValidTime, WriteStatus,
 };
+use jiff::{Timestamp, civil::date, tz::TimeZone};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use support::TestDb;
@@ -22,8 +22,12 @@ use support::TestDb;
 const SCOPE: &str = "support";
 const RESERVED: [&str; 2] = [SAME_AS_KIND, DIFFERENT_FROM_KIND];
 
-fn day(d: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2024, 1, d, 0, 0, 0).unwrap()
+fn day(d: i8) -> Timestamp {
+    date(2024, 1, d)
+        .at(0, 0, 0, 0)
+        .to_zoned(TimeZone::UTC)
+        .unwrap()
+        .timestamp()
 }
 
 fn values(v: Value) -> Map<String, Value> {
@@ -69,7 +73,7 @@ impl World {
         self.store.as_worker(self.tenant, Scope::new(SCOPE), None)
     }
 
-    async fn episode(&self, reference_time: DateTime<Utc>) -> EpisodeId {
+    async fn episode(&self, reference_time: Timestamp) -> EpisodeId {
         self.caller()
             .record_episode(&NewEpisode {
                 tenant: Some(self.tenant),

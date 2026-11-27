@@ -22,10 +22,12 @@ gnomon has two parts. The Store holds the graph and its guarantees as SQL functi
   - Every call runs in an explicit transaction. `as_user` and `as_worker` set their context with `set_config(..., true)` and `SET LOCAL ROLE`, never at session level. The Store sends `begin` and `set local role` in one simple query, one round trip. An unnamed statement also needs the transaction on a transaction-mode pooler, because `sqlx` sends Parse and Bind as two round trips and the pooler can reassign the server connection between them.
   - The prototype found no leaked claims or roles in 364,491 checks across 41 runs.
   - The conformance suite runs against both pooler types. The unnamed path still has to be measured on the Store's real queries.
-- Times in the public Rust API are `chrono` types, which tokio-postgres (`with-chrono-0_4`), PyO3 and napi-rs all convert. `chrono` is unmaintained (RUSTSEC-2026-0543). The advisory recommends `jiff` or `time` instead, and the maintainer recommends moving off (chronotope/chrono#1768). gnomon keeps `chrono` for now, and `deny.toml` ignores the advisory. #105 tracks the move. On 2026-11-27:
-  - napi 3.16.3 converted neither `jiff` nor `time`, so a move to either one means writing the Node conversions in gnomon.
-  - tokio-postgres 0.7.18 converted `jiff` 0.1 and 0.2, and support for 1.0 was in an open pull request (rust-postgres/rust-postgres#1405). PyO3 0.30.1 converted `jiff` 0.2, and a maintainer expected 1.0 in 0.31 (PyO3/pyo3#6609). A move to `jiff` 0.2 means changing again for 1.0.
-  - tokio-postgres 0.7.18 and PyO3 0.30.1 converted `time` 0.3.
-  - Valid time is UTC only, so `jiff`'s time-zone handling brings nothing to gnomon.
-- Waiting has two costs. A defect found in `chrono` may get no fix. A later change touches every public type that has a timestamp, and the Python and Node bindings will raise that cost.
+- Times in the public Rust API are `jiff` 0.2 types, and every instant is a `jiff::Timestamp`. gnomon used `chrono` first and moved off it (#105) when it became unmaintained (RUSTSEC-2026-0543), before the shared types and the bindings could raise the cost of the change. On 2026-11-27:
+  - tokio-postgres 0.7.18, PyO3 0.30.1 and `schemars` 1.2.3 all converted `jiff` 0.2. None of them converted `jiff` 1.0. rust-postgres/rust-postgres#1405 was open, and a PyO3 maintainer expected 1.0 in 0.31 (PyO3/pyo3#6609).
+  - `time` 0.3 was the other crate the advisory recommended. `schemars` did not convert it.
+  - napi 3.16.3 converted no `jiff` version, so gnomon writes the Node conversion. Its `chrono` conversion made a JS `Date` in whole milliseconds, which loses part of a `timestamptz`, so gnomon could not have relied on that either.
+  - `rmcp` 3.12.0 enabled `chrono` in its default features, so gnomon takes it without them. It also depends on `jiff` 1, so the dependency tree will hold two `jiff` versions.
+- The move to `jiff` 1.0 is a second breaking change to the public API. #109 tracks it.
+- Valid time is UTC only, so gnomon enables no time zone database feature of `jiff`.
+- A `jiff::Timestamp` ends at the year 9999 and `timestamptz` goes much further. The Store functions can be called from SQL, so a later time can be stored. A read that meets one returns an error.
 - The bindings, the HTTP API, JWT verification and MCP are settled in ADR-0016 to ADR-0019. The bindings expose both APIs and start no background tasks. The server verifies worker tokens against an issuer of their own, and an MCP caller runs under RLS as any other caller does.

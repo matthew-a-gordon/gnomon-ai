@@ -7,6 +7,13 @@
 //! [`Caller::transaction`] starts a [`Transaction`] for several calls that
 //! commit together. [`migrations`] lists the files of the schema the Store
 //! expects, which a consumer copies into its own migration chain.
+//!
+//! Times are [`jiff::Timestamp`]s, version 0.2, stored as `timestamptz` to
+//! the microsecond. The driver truncates a time with finer digits toward
+//! 2000-01-01 UTC, so a time after it moves down to the microsecond and a time
+//! before it moves up. A time the Store returns passes back unchanged. A
+//! `Timestamp` ends at the year 9999, and a read that meets a later stored
+//! time fails with [`Error::Database`].
 
 mod connect;
 mod edge;
@@ -23,7 +30,7 @@ mod transaction;
 
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use tokio_postgres::error::SqlState;
 use uuid::Uuid;
 
@@ -134,7 +141,7 @@ pub struct NewEpisode {
     pub scope: Scope,
     pub content: String,
     /// When the source was produced, not when gnomon recorded it.
-    pub reference_time: DateTime<Utc>,
+    pub reference_time: Timestamp,
     /// The rank the consumer gives this Episode, if any.
     pub authority: Option<i32>,
 }
@@ -146,10 +153,10 @@ pub struct Episode {
     pub tenant: TenantId,
     pub scope: Scope,
     pub content: String,
-    pub reference_time: DateTime<Utc>,
+    pub reference_time: Timestamp,
     pub authority: Option<i32>,
     /// When gnomon recorded the Episode.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
     /// Who recorded the Episode, as the deployment's `gnomon.user_id()`
     /// named them, or `None`. By default it is the end user's `sub` claim,
     /// or the user a worker was given. A person's edit is an Episode of its
@@ -165,7 +172,7 @@ pub struct Episode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpisodeRetracted {
     /// When Retract Episode ran: when its transaction started.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
     /// As the Episode's own `recorded_by`.
     pub recorded_by: Option<String>,
 }
@@ -261,7 +268,11 @@ pub enum Error {
     )]
     RolledBack,
     /// Postgres refused or failed the call for any other reason, such as a
-    /// check violation or an invalid argument (SQLSTATE 22023).
+    /// check violation or an invalid argument (SQLSTATE 22023). A read that
+    /// meets a stored time after the year 9999, which a
+    /// [`jiff::Timestamp`] cannot hold, fails with this too. Only a write
+    /// made from SQL can store one, and
+    /// [`sqlstate`](Self::sqlstate) then returns `None`.
     #[error(transparent)]
     Database(tokio_postgres::Error),
 }

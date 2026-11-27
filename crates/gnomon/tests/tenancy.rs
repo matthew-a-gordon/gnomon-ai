@@ -8,11 +8,11 @@
 
 mod support;
 
-use chrono::{TimeZone, Utc};
 use gnomon::{
     AsOf, EpisodeId, Error, KindOf, NewEpisode, NewKind, NewNode, NodeId, Patch, Scope, Store,
     TenantId, ValidTime, VersionId,
 };
+use jiff::{Timestamp, civil::date, tz::TimeZone};
 use serde_json::{Map, Value, json};
 use support::TestDb;
 
@@ -40,7 +40,7 @@ fn episode(tenant: Option<TenantId>, scope: &str, content: &str) -> NewEpisode {
         tenant,
         scope: Scope::new(scope),
         content: content.to_owned(),
-        reference_time: Utc.with_ymd_and_hms(2024, 3, 14, 9, 30, 0).unwrap(),
+        reference_time: "2024-03-14T09:30:00Z".parse().unwrap(),
         authority: None,
     }
 }
@@ -149,7 +149,7 @@ async fn in_multi_tenant_mode_every_call_that_names_no_tenant_fails_and_never_us
         properties: json!({}),
         search: vec![],
     };
-    let now = AsOf::current(Utc::now());
+    let now = AsOf::current(Timestamp::now());
     for caller in [&bound, &unbound, &worker] {
         let new = episode(None, "support", "No Tenant named.");
         assert_eq!(
@@ -265,8 +265,12 @@ fn values(v: Value) -> Map<String, Value> {
     }
 }
 
-fn day(d: u32) -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2024, 1, d, 0, 0, 0).unwrap()
+fn day(d: i8) -> jiff::Timestamp {
+    date(2024, 1, d)
+        .at(0, 0, 0, 0)
+        .to_zoned(TimeZone::UTC)
+        .unwrap()
+        .timestamp()
 }
 
 #[tokio::test]

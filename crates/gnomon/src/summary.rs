@@ -14,7 +14,7 @@
 //! Episode, and every Summary of an erased Node and Community that holds one
 //! (ADR-0003).
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::{EpisodeId, NodeId, Scope};
 
@@ -54,7 +54,7 @@ pub struct NewSummary {
     pub node: NodeId,
     pub content: String,
     /// The valid-at instant the Pipeline wrote it for.
-    pub as_of_valid: DateTime<Utc>,
+    pub as_of_valid: Timestamp,
     pub citations: Vec<DerivedCitation>,
 }
 
@@ -65,11 +65,11 @@ pub struct Summary {
     pub scope: Scope,
     pub node: NodeId,
     pub content: String,
-    pub as_of_valid: DateTime<Utc>,
+    pub as_of_valid: Timestamp,
     /// When gnomon began to hold it.
-    pub recorded_from: DateTime<Utc>,
+    pub recorded_from: Timestamp,
     /// When a regeneration closed it, or `None` while it is current.
-    pub recorded_to: Option<DateTime<Utc>>,
+    pub recorded_to: Option<Timestamp>,
     /// In order of Episode ID, then property and place.
     pub citations: Vec<DerivedCitation>,
 }
@@ -86,7 +86,7 @@ pub struct NewCommunity {
     pub members: Vec<NodeId>,
     /// The generated Summary of the group.
     pub content: String,
-    pub as_of_valid: DateTime<Utc>,
+    pub as_of_valid: Timestamp,
     pub citations: Vec<DerivedCitation>,
 }
 
@@ -98,9 +98,9 @@ pub struct Community {
     /// In order of Node ID.
     pub members: Vec<NodeId>,
     pub content: String,
-    pub as_of_valid: DateTime<Utc>,
-    pub recorded_from: DateTime<Utc>,
-    pub recorded_to: Option<DateTime<Utc>>,
+    pub as_of_valid: Timestamp,
+    pub recorded_from: Timestamp,
+    pub recorded_to: Option<Timestamp>,
     /// In order of Episode ID, then property and place.
     pub citations: Vec<DerivedCitation>,
 }

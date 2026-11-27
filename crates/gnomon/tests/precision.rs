@@ -6,18 +6,22 @@
 
 mod support;
 
-use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
     AsOf, Bound, BoundChange, BoundSide, BoundStatement, EpisodeId, NewEpisode, NewNode, NodeId,
     NodeVersion, Patch, Precision, ROOT_NODE_KIND, Scope, Store, TenantId, ValidTime,
 };
+use jiff::{SignedDuration, Timestamp, civil::date, tz::TimeZone};
 use serde_json::{Map, Value, json};
 use support::TestDb;
 
 const SCOPE: &str = "support";
 
-fn at(y: i32, m: u32, d: u32, h: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap()
+fn at(y: i16, m: i8, d: i8, h: i8) -> Timestamp {
+    date(y, m, d)
+        .at(h, 0, 0, 0)
+        .to_zoned(TimeZone::UTC)
+        .unwrap()
+        .timestamp()
 }
 
 fn values(v: Value) -> Map<String, Value> {
@@ -50,7 +54,7 @@ impl World {
         self.store.as_worker(self.tenant, Scope::new(SCOPE), None)
     }
 
-    async fn episode(&self, reference_time: DateTime<Utc>) -> EpisodeId {
+    async fn episode(&self, reference_time: Timestamp) -> EpisodeId {
         self.caller()
             .record_episode(&NewEpisode {
                 tenant: Some(self.tenant),
@@ -111,7 +115,7 @@ impl World {
     }
 }
 
-fn period(precision: Precision, when: DateTime<Utc>) -> Bound {
+fn period(precision: Precision, when: Timestamp) -> Bound {
     Bound::Period {
         at: when,
         precision,
@@ -259,7 +263,7 @@ async fn stating_an_unknown_start_is_a_refinement_that_keeps_the_text_hash_and_t
 
     // Before the Refinement the earlier Version is still what gnomon knew:
     // it was incomplete, not wrong, and it is not rewritten.
-    let known = outcome.recorded_at - chrono::Duration::microseconds(1);
+    let known = outcome.recorded_at - SignedDuration::from_micros(1);
     let then = w
         .read(node, AsOf::at(at(2024, 3, 15, 0), known))
         .await
@@ -366,7 +370,7 @@ async fn a_bound_outside_the_earlier_period_is_recorded_as_a_correction_not_a_re
     assert_eq!(outcome.opened.len(), 1);
 
     // The wrong Version stays readable as-of before the Correction.
-    let known = outcome.recorded_at - chrono::Duration::microseconds(1);
+    let known = outcome.recorded_at - SignedDuration::from_micros(1);
     let wrong = w
         .read(node, AsOf::at(at(2024, 3, 15, 0), known))
         .await

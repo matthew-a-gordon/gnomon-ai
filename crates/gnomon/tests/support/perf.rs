@@ -178,7 +178,7 @@ impl Record {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
         let environment = json!({
-            "date": chrono::Utc::now().to_rfc3339(),
+            "date": jiff::Timestamp::now().to_string(),
             "image": server.image,
             "postgres": version,
             "pgvector": pgvector,
@@ -216,7 +216,7 @@ impl Record {
         });
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("performance");
         std::fs::create_dir_all(&dir).unwrap();
-        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ");
         let cap = self.environment["container_memory_cap"].as_str().unwrap();
         let image = self.environment["image"]
             .as_str()
@@ -272,7 +272,7 @@ pub struct Dataset {
 }
 
 /// Visible rows are counted at this instant.
-pub fn valid_at() -> chrono::DateTime<chrono::Utc> {
+pub fn valid_at() -> jiff::Timestamp {
     super::erasure::at(2025, 1, 1)
 }
 
@@ -428,7 +428,7 @@ async fn build(texts: usize, name: &str) {
             .replace("{{texts}}", &texts.to_string())
             .replace("{{tenant}}", &tenant.0.to_string())
             .replace("{{scope}}", SCOPE)
-            .replace("{{valid_at}}", &valid_at().to_rfc3339())
+            .replace("{{valid_at}}", &valid_at().to_string())
             .replace("{{dim}}", &DEFAULT_DIMENSION.to_string());
         step += 1;
         let t = std::time::Instant::now();

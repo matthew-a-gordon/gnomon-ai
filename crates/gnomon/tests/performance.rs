@@ -19,11 +19,11 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, TimeZone, Utc};
 use gnomon::{
     AsOf, NewEpisode, NewNode, Patch, ROOT_NODE_KIND, Scope, SearchRequest, Store, TenantId,
     ValidTime,
 };
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Map, Value, json};
 use support::TestDb;
 use support::perf::{self, Dataset, Record, Stats};
@@ -180,8 +180,8 @@ async fn fused_search_stays_under_250_ms_at_p95_up_to_200000_visible_rows() {
 
 // ---- patch writes ----
 
-fn day(d: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::days(d)
+fn day(d: i64) -> Timestamp {
+    "2023-01-01T00:00:00Z".parse::<Timestamp>().unwrap() + SignedDuration::from_hours(24 * d)
 }
 
 fn values(v: Value) -> Map<String, Value> {
@@ -274,7 +274,7 @@ impl Writes {
             .as_worker(self.tenant, Scope::new(perf::SCOPE), None)
     }
 
-    async fn episode(&self, reference_time: DateTime<Utc>) -> gnomon::EpisodeId {
+    async fn episode(&self, reference_time: Timestamp) -> gnomon::EpisodeId {
         self.caller()
             .record_episode(&NewEpisode {
                 tenant: Some(self.tenant),
