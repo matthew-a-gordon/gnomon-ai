@@ -744,6 +744,13 @@ create index version_as_of on gnomon.version
 create index version_open on gnomon.version (tenant_id, scope, versioned_id, valid_from)
   where recorded_to = 'infinity';
 
+-- The merge also finds the Versions of one Node or Edge by `versioned_id`
+-- when they are closed: those recorded at the step, and those the step
+-- closed. Without this index each such statement read every Version of the
+-- Scope.
+create index version_versioned on gnomon.version
+  (tenant_id, scope, versioned_id, recorded_from);
+
 -- A Citation: the link from a Version to an Episode it was derived from,
 -- naming the property and, if the write gave one, the place.
 create table gnomon.citation (
