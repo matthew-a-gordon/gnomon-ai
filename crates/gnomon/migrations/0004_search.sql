@@ -904,7 +904,7 @@ create function gnomon.sentence_text_hash(p_sentence text) returns text
     select pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(p_sentence, 'UTF8')), 'hex')
   $$;
 
--- A query or stored embedding as a vector of the exported dimension. It
+-- A query or stored embedding as a vector of the embedding dimension. It
 -- refuses one of another length, one with a null, NaN or infinite element,
 -- and one of length zero, which has no cosine distance.
 create function gnomon.embedding_vector(p_embedding real[])

@@ -1,4 +1,4 @@
-//! Seam 1, Search (ADR-0010, ADR-0014, ADR-0015, migration 0020), through
+//! Seam 1, Search (ADR-0010, ADR-0014, ADR-0015, `0004_search.sql`), through
 //! the Rust core's Store API against real Postgres: one call fusing the
 //! vector, full-text and neighbourhood branches over Versions, Summaries and
 //! Communities, each result with its rank in each branch, the two graph

@@ -8,10 +8,6 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-[[bin]]
-name = "gnomon"
-path = "src/main.rs"
-
 [features]
 # Builds the on-demand performance suite, tests/performance.rs. Off by
 # default, so a plain `cargo test` or `cargo nextest run` never builds or runs
@@ -25,7 +21,6 @@ required-features = ["performance"]
 
 [dependencies]
 chrono = "0.4"
-clap = { version = "4", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1"

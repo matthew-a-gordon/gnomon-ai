@@ -1,6 +1,6 @@
 //! Seam 1: the Rust core's Store API against real Postgres.
 //!
-//! Every test applies the exported migrations to a fresh database and drives
+//! Every test applies the migration files to a fresh database and drives
 //! gnomon only through the crate's public methods. The suite runs on
 //! `pgvector/pgvector:pg17` and `supabase/postgres` 17.x; see docs/testing.md.
 
@@ -18,7 +18,7 @@ async fn the_store_accepts_a_freshly_migrated_database() {
 }
 
 #[tokio::test]
-async fn the_store_reports_the_embedding_dimension_the_migrations_were_exported_with() {
+async fn the_store_reports_the_embedding_dimension_the_files_state() {
     let db = TestDb::migrated_with_dimension(768).await;
     let store = Store::connect(&db.login_url(), &support::connect_options())
         .await

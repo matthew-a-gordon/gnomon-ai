@@ -1,17 +1,65 @@
-//! Lane 3: the Supabase CLI local stack (ADR-0020), after `supabase start`
-//! applied the migrations `gnomon migrations export --target supabase` wrote
-//! into the stack's `postgres` database.
+//! A consumer's Supabase CLI chain applies gnomon's migration files
+//! (ADR-0006).
 //!
-//! These tests need the stack, so they are ignored by default.
-//! `crates/gnomon/tests/support/supabase/run-lane-3.sh` starts it, runs them with
-//! `--run-ignored only`, and runs the rest of the suite against it. They
-//! never touch a hosted project.
+//! The consumer copies the files into `supabase/migrations` under
+//! timestamped names, `<version>_gnomon_<name>.sql`, after its own
+//! migrations, and the CLI applies them. The first two tests run the pinned
+//! CLI's own runner, `supabase migration up`, against a database of the
+//! suite's server, with pgvector in the default schema and in `extensions`.
+//! They need `npx`, or an installed CLI that `GNOMON_TEST_SUPABASE_CLI`
+//! names.
+//!
+//! The rest is lane 3 (ADR-0020): the Supabase CLI local stack, after
+//! `supabase start` applied the files copied the same way into the stack's
+//! `postgres` database. Those tests need the stack, so they are ignored by
+//! default. `crates/gnomon/tests/support/supabase/run-lane-3.sh` starts it
+//! and runs them with `--run-ignored only`. They never touch a hosted
+//! project.
 
 mod support;
 
 use serde_json::Value;
+use support::install::{Extensions, assert_installed, prepare};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_postgres::{Client, NoTls};
+
+/// The Supabase CLI version of the `n`th file: one second apart, after a
+/// consumer's own migration of 2024.
+fn supabase_version(n: usize) -> String {
+    format!("2025010100000{n}_gnomon_")
+}
+
+async fn the_cli_applies_the_files(placement: Extensions) {
+    let db = support::TestDb::empty_with_login().await;
+    let schema = prepare(&db, placement).await;
+    let workdir = tempfile::tempdir().unwrap();
+    let migrations = workdir.path().join("supabase/migrations");
+    std::fs::create_dir_all(&migrations).unwrap();
+    std::fs::write(
+        migrations.join("20240101000000_consumer_table.sql"),
+        "create table public.consumer_table (id bigint primary key);\n",
+    )
+    .unwrap();
+    support::copy_migration_files(&migrations, supabase_version);
+    let applied = support::supabase_migration_up(workdir.path(), &db.migration_url("postgresql"))
+        .unwrap_or_else(|e| panic!("supabase migration up failed: {e}"));
+    assert_eq!(
+        applied.matches("Applying migration").count(),
+        1 + gnomon::migrations::MIGRATIONS.len(),
+        "{applied}"
+    );
+    assert_installed(&db, &schema).await;
+}
+
+#[tokio::test]
+async fn the_cli_applies_the_files_with_pgvector_in_the_default_schema() {
+    the_cli_applies_the_files(Extensions::Default).await;
+}
+
+#[tokio::test]
+async fn the_cli_applies_the_files_with_pgvector_in_extensions() {
+    the_cli_applies_the_files(Extensions::InExtensions).await;
+}
 
 /// The stack's `postgres` database, where the CLI applied the migrations,
 /// as the superuser `GNOMON_TEST_DATABASE_URL` names.
@@ -219,6 +267,6 @@ async fn the_stack_exposes_no_schema_that_holds_what_the_migrations_created() {
     assert!(!exposed.contains(&"gnomon"), "exposed: {exposed:?}");
     assert!(
         !exposed.contains(&vector_schema.as_str()),
-        "pgvector, which migration 0001 creates, is in {vector_schema}, an exposed schema: {exposed:?}"
+        "pgvector, which 0001 creates, is in {vector_schema}, an exposed schema: {exposed:?}"
     );
 }

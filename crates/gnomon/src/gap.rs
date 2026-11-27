@@ -1,4 +1,4 @@
-//! The gaps `maintain` repairs (migration 0021).
+//! The gaps `maintain` repairs (`0004_search.sql`).
 //!
 //! For one Scope, the Store lists what the Pipeline has still to write: the
 //! Edge Versions without a Sentence, the search texts without an embedding

@@ -133,7 +133,7 @@ impl Store {
         })
     }
 
-    /// The embedding dimension the migrations were exported with.
+    /// The embedding dimension `gnomon.embedding_dimension()` states.
     pub fn embedding_dimension(&self) -> EmbeddingDimension {
         self.embedding_dimension
     }
@@ -974,7 +974,7 @@ impl Caller<'_> {
     /// Version gets its own quantized row. Storing a Version's embedding again
     /// with another of its texts moves it to that text.
     ///
-    /// An `embedding` of another length than the exported dimension, of
+    /// An `embedding` of another length than the embedding dimension, of
     /// length zero, or holding a number that is not finite fails with
     /// [`Error::Database`] and SQLSTATE 22023. A Version the caller cannot
     /// see, or a hash of neither of its texts, fails with
@@ -1007,7 +1007,7 @@ impl Caller<'_> {
     }
 
     /// Stores the embedding of `name`, a current name or Alias of `node`,
-    /// for Resolution (migration 0019). The full vector is stored once per
+    /// for Resolution (`0004_search.sql`). The full vector is stored once per
     /// text in the Node's Scope, the same row a Sentence or another name with
     /// that text uses: when one is stored already it stays, and `embedding`
     /// is not used. Every current name and Alias of the Scope with that text
@@ -1098,7 +1098,7 @@ impl Caller<'_> {
             .collect())
     }
 
-    /// Resolution (migration 0019): the Nodes whose current names and
+    /// Resolution (`0004_search.sql`): the Nodes whose current names and
     /// Aliases match `mention`, best first, at most `limit` of them, each with
     /// the name or Alias it matched. The full-text half scores each name and
     /// Alias by BM25 from the word counts of the caller's allowed Scopes, and
@@ -2218,7 +2218,7 @@ async fn write_stage(
     Ok(())
 }
 
-/// Summaries and Communities (ADR-0014, ADR-0015, migration 0018).
+/// Summaries and Communities (ADR-0014, ADR-0015, `0003_reads_and_writes.sql`).
 impl Caller<'_> {
     /// Writes a Summary of a Node and returns its ID. The Node's current
     /// Summary in the same Scope, if it has one, is closed at the start of
@@ -2444,7 +2444,7 @@ fn derived_citations(row: &Row, at: usize) -> Vec<DerivedCitation> {
         .collect()
 }
 
-/// Search (ADR-0010, migration 0020).
+/// Search (ADR-0010, `0004_search.sql`).
 impl Caller<'_> {
     /// Search: one fused, ranked list of the Versions, Summaries and
     /// Communities that match `request` As-of its instants, best first, at most
@@ -2626,7 +2626,7 @@ fn search_result(r: &Row) -> SearchResult {
     }
 }
 
-/// Sentences and the gaps `maintain` repairs (ADR-0013, migration 0021).
+/// Sentences and the gaps `maintain` repairs (ADR-0013, `0004_search.sql`).
 impl Caller<'_> {
     /// Stores the Sentence of an Edge Version, after the write that made the
     /// Version committed, replacing any stored before (ADR-0013). It writes

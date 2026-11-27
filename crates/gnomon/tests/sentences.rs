@@ -1,4 +1,4 @@
-//! Seam 1 for storing a Sentence (ADR-0013, migration 0021): the Pipeline
+//! Seam 1 for storing a Sentence (ADR-0013, `0004_search.sql`): the Pipeline
 //! stores the Sentence of one Edge Version after the Version commits, through
 //! the Rust core's Store API against real Postgres. Its token rows and BM25
 //! counts are written in the same transaction, so full-text Search finds the

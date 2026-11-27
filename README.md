@@ -15,25 +15,77 @@ The name fits on both counts. A gnomon tells the time by the shadow it casts, an
 
 ## Status
 
-Early design. The data model, packaging and client languages are still being decided, and there is nothing to install yet.
+Early design. The data model, packaging and client languages are still being decided, and nothing is released yet.
 
-## Exporting the migrations
+## Installing the schema
 
-gnomon never changes your schema itself. You export its numbered migrations into your own migration chain, and your tooling applies them like any other migration.
+gnomon never changes your schema itself. Its schema is six plain SQL files in `crates/gnomon/migrations`, `0001_schema.sql` to `0006_grants.sql`. Copy them into your own migration chain, and your tooling applies them like any other migration, in order, each in one transaction. Every gnomon object lives in the `gnomon` schema. Keep that schema out of PostgREST's exposed schemas, so clients reach the Store only through gnomon.
+
+The files state the embedding dimension once, in `gnomon.embedding_dimension()` in `0001_schema.sql`: `as $$ select 1536 $$`. If your embedding model has another width, edit that number before you apply the files. Change nothing else.
+
+### With psql
 
 ```sh
-gnomon migrations export --target supabase --embedding-dimension 1536 --out supabase/migrations
-gnomon migrations export --target alembic  --embedding-dimension 1536 --out alembic/versions
-gnomon migrations export --target plain    --embedding-dimension 1536 --out migrations/gnomon
+for f in migrations/gnomon/*.sql; do
+  psql -v ON_ERROR_STOP=1 --single-transaction -f "$f" "$DATABASE_URL"
+done
 ```
 
-- `supabase` writes `<timestamp>_gnomon_<name>.sql` files for the Supabase CLI. It creates pgvector in the `extensions` schema, which PostgREST does not expose.
-- `alembic` writes `gnomon_<name>.py` revisions. The first follows your chain's head, and each later one follows the one before. A chain with several heads is refused: merge them first.
-- `plain` writes `<number>_<name>.sql` files to apply in name order, each in one transaction.
+### With Alembic
 
-Run the same command again after you upgrade gnomon. It adds only the new migrations, after everything already in your chain, and never rewrites one it exported before. It refuses to run if a released migration in your chain differs from what this release would write, for example because it was exported with another embedding dimension.
+Copy the files into a `gnomon/` directory beside your `versions/` directory, and add one revision that runs them. `no_parameters` sends the SQL to the driver as written, so neither Alembic nor the driver reads a `%` or a `:` in it as a placeholder.
 
-Every gnomon object lives in the `gnomon` schema. Keep that schema out of PostgREST's exposed schemas, so clients reach the Store only through gnomon.
+```python
+"""gnomon's migration files."""
+
+from pathlib import Path
+
+from alembic import op
+
+revision = "gnomon_0006"
+down_revision = None  # your chain's head
+branch_labels = None
+depends_on = None
+
+GNOMON = Path(__file__).resolve().parent.parent / "gnomon"
+FILES = [
+    "0001_schema.sql",
+    "0002_kinds.sql",
+    "0003_reads_and_writes.sql",
+    "0004_search.sql",
+    "0005_erasure.sql",
+    "0006_grants.sql",
+]
+
+
+def upgrade() -> None:
+    for name in FILES:
+        sql = (GNOMON / name).read_text(encoding="utf-8")
+        op.get_bind().exec_driver_sql(sql, execution_options={"no_parameters": True})
+
+
+def downgrade() -> None:
+    raise NotImplementedError("gnomon's migrations have no downgrade")
+```
+
+### With the Supabase CLI
+
+Copy each file into `supabase/migrations` as `<timestamp>_gnomon_<name>.sql`, with timestamps after your own latest migration and in the files' order, such as `20250101000001_gnomon_0001_schema.sql`. Supabase has an `extensions` schema, which PostgREST does not expose, and the first file creates pgvector and btree_gist there.
+
+### Upgrading
+
+A file never changes once it is released. A later release adds files with higher numbers. Copy only the new ones: with psql, apply them in order; with Alembic, add a revision that runs them after your head; with the Supabase CLI, give them timestamps after your latest migration. The Store refuses to run against a schema whose `gnomon.schema_version` is not the one it expects.
+
+### What the database needs
+
+- The floor is PostgreSQL 17, pgvector 0.7.0 or later, and btree_gist (ADR-0023). The first file creates each extension when it is missing, in the `extensions` schema when that schema exists and in the migrating role's default schema otherwise. btree_gist is a trusted extension, so a role with CREATE on the database may create it. On Azure Flexible Server, add `vector` and `btree_gist` to `azure.extensions` first.
+- The functions that use pgvector keep a search path of `pg_catalog`, pgvector's schema and `pg_temp`, set when the files run. So no untrusted role may have CREATE on pgvector's schema, and moving the extension to another schema later breaks those functions.
+- The role that applies the files needs CREATE on the database, the right to create pgvector, and CREATEROLE when the gnomon roles `authenticated`, `gnomon_worker` and `gnomon_definer` do not exist yet. When the callers lack USAGE on pgvector's schema, the first file grants it, so the role must be able to. The last file hands the definer functions to `gnomon_definer`, which needs the role to act as `gnomon_definer` for that step. A role that created `gnomon_definer` holds ADMIN on it and grants itself that for the step. When another role created the gnomon roles, for example for another database on the same cluster, the last file fails with `permission denied to grant role "gnomon_definer"` until a role with ADMIN on `gnomon_definer` runs `grant gnomon_definer to <migrating role> with admin option, inherit false, set false`. `tests/install.rs` shows both.
+- Grant `authenticated` and `gnomon_worker` to the role the Store logs in as. The files grant Kind registration (`gnomon.register_kind`, `gnomon.set_merge_rule`) and Erasure (`gnomon.erase_episode`, `gnomon.erase_node`, `gnomon.erase_edge`, `gnomon.erase_scope`) to no role. Grant EXECUTE on them to the roles you choose.
+- An Erasure holds one advisory lock for each Node and Edge it touches, in the server's shared lock table of `max_locks_per_transaction * (max_connections + max_prepared_transactions)` entries. In a test on PostgreSQL 17 with `max_connections` 100 and the default `max_locks_per_transaction`, one transaction held 5,000 advisory locks and failed at 20,000. Raise the setting before you erase Episodes cited across many thousands of Nodes.
+- A large Erasure can outlast a statement time limit on the login role: a prototype measured 24 to 35 seconds for an Episode across 500 Nodes. Set the limit to allow for it.
+- The reference `gnomon.tenant_id()` trusts `request.jwt.claims`, which the Store sets for each call. So the login role, and raw SQL, must never reach end users.
+- A replacement `gnomon.tenant_id()` or `gnomon.allowed_scopes()` also runs inside the definer functions, so any `search_path` it sets, or one a function it calls sets, must end in `pg_temp` (ADR-0009).
 
 ## Connecting
 

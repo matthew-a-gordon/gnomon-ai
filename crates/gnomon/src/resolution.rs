@@ -1,4 +1,4 @@
-//! Resolution (ADR-0010, ADR-0012, migration 0019): matching a mention to the
+//! Resolution (ADR-0010, ADR-0012, `0004_search.sql`): matching a mention to the
 //! Nodes the graph already has.
 //!
 //! [`Caller::resolve`](crate::Caller::resolve) searches the current names and
