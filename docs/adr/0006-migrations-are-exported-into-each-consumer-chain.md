@@ -14,4 +14,4 @@ gnomon publishes numbered SQL migration files that never change once released. `
 ## Consequences
 
 - All objects live in a `gnomon` Postgres schema that PostgREST does not expose. Clients reach the Store through gnomon, not through a REST layer.
-- The floor is PostgreSQL 17, so the migrations avoid PG 18-only features and ship their own UUID v7 function.
+- The floor is PostgreSQL 17 with pgvector and btree_gist, set by the hosts gnomon must run on (ADR-0023). The migrations avoid PG 18-only features and ship their own UUID v7 function.

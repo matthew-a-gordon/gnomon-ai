@@ -93,7 +93,7 @@ Generated prose describing one Node, derived from the Episodes it cites. It belo
 _Avoid_: description, profile, digest
 
 **Community**:
-A group of closely connected Nodes within one Scope, with a generated Summary of the group.
+A group of closely connected Nodes within one Scope, with a generated Summary of the group. A Community keeps its identity while most of its members stay, so its members can change over its life.
 _Avoid_: cluster, group, neighborhood
 
 ### Search
@@ -103,7 +103,7 @@ Finding the Versions, Summaries and Communities that match a query, as they stoo
 _Avoid_: retrieval, lookup, query
 
 **Context**:
-The text the Pipeline assembles for a model from Search results and As-of reads, in a chosen format and within a token budget.
+The Search results and As-of reads the Pipeline selects for a model within a token budget, returned as typed rows and as text in a chosen format.
 _Avoid_: prompt, payload, retrieval result
 
 **Sentence**:
