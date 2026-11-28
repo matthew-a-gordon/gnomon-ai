@@ -919,13 +919,11 @@ async fn two_first_writes_to_a_scope_both_commit_and_its_totals_are_exact() {
     assert_search_counts_match_the_token_rows(&admin).await;
 }
 
-#[tokio::test]
-async fn erasing_a_scopes_only_text_keeps_the_totals_of_a_concurrent_write() {
-    // The Erasure removes the one Episode behind the Scope's only text,
-    // "xenon", while another transaction, which names a new Node, has applied
-    // its counts and not committed. The two share no word, so no word's row
-    // makes the Erasure wait before it reaches the totals. It waits there and
-    // leaves the other text counted.
+/// Erases the one Episode behind the Scope's only text, "xenon", while
+/// another transaction, which names a new Node `name`, has applied its counts
+/// and not committed. Expects the Erasure to wait for that transaction and to
+/// leave its text alone counted, a text of two words.
+async fn erase_the_only_text_during_a_write(name: &str) {
     let w = World::new().await;
     let erased = w.episode(at(2024, 1, 1), None).await;
     let kept = w.episode(at(2024, 2, 1), None).await;
@@ -950,9 +948,7 @@ async fn erasing_a_scopes_only_text_keeps_the_totals_of_a_concurrent_write() {
         .await
         .unwrap();
     let node = w.create_node_in_tx(&writer, SCOPE, "company").await;
-    write_name(&writer, &w, kept, node, "yttrium argon")
-        .await
-        .unwrap();
+    write_name(&writer, &w, kept, node, name).await.unwrap();
     writer
         .batch_execute("set constraints gnomon.search_count_delta_apply immediate")
         .await
@@ -961,7 +957,7 @@ async fn erasing_a_scopes_only_text_keeps_the_totals_of_a_concurrent_write() {
     let commit = erasure.commit();
     tokio::pin!(commit);
     tokio::select! {
-        _ = &mut commit => panic!("the Erasure did not wait for the writer's totals row"),
+        _ = &mut commit => panic!("the Erasure did not wait for the writer's counts"),
         () = a_backend_waits_on_a_lock(&admin) => {}
     }
     writer.commit().await.unwrap();
@@ -969,4 +965,17 @@ async fn erasing_a_scopes_only_text_keeps_the_totals_of_a_concurrent_write() {
 
     assert_eq!(counts(&admin).await.1, vec![format!("{SCOPE} 1 2")]);
     assert_search_counts_match_the_token_rows(&admin).await;
+}
+
+#[tokio::test]
+async fn erasing_a_scopes_only_text_keeps_the_totals_of_a_concurrent_write() {
+    // The two texts share no word, so no word's row makes the Erasure wait
+    // before it reaches the totals.
+    erase_the_only_text_during_a_write("yttrium argon").await;
+}
+
+#[tokio::test]
+async fn erasing_a_words_only_text_keeps_the_count_of_a_concurrent_write() {
+    // Both texts say "xenon", so the Erasure waits at that word's row.
+    erase_the_only_text_during_a_write("xenon argon").await;
 }
