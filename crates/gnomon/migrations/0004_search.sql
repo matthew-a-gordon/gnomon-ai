@@ -643,18 +643,34 @@ create function gnomon.maintain_search_index() returns trigger
             delete from gnomon.search_token_frequency f
               where f.tenant_id = d.tenant_id and f.scope = d.scope and f.token = d.token;
           end if;
-        elsif d.token is null and d.versions > 0 then
-          insert into gnomon.search_scope_length as l (tenant_id, scope, versions, words)
-            values (d.tenant_id, d.scope, d.versions, d.words)
-            on conflict (tenant_id, scope)
-              do update set versions = l.versions + excluded.versions,
-                            words = l.words + excluded.words;
-        elsif d.token is null and (d.versions < 0 or d.words <> 0) then
+        elsif d.token is null and (d.versions <> 0 or d.words <> 0) then
+          -- A Scope's net change can add texts while it adds no word or
+          -- removes words. The row's check refuses such a change as a
+          -- proposed row, even where the insert would only update. So the
+          -- row is updated first, and inserted only where there is none,
+          -- when the change is all the Scope holds. If another transaction
+          -- inserts it meanwhile, the insert adds to that row.
+          --
+          -- A change that removes texts locks the row first. Otherwise,
+          -- where it takes every text this transaction can see, the update
+          -- would skip the row without waiting for a transaction that is
+          -- adding one, and the delete would then take that text's counts.
+          if d.versions < 0 then
+            perform from gnomon.search_scope_length l
+              where l.tenant_id = d.tenant_id and l.scope = d.scope
+              for update;
+          end if;
           update gnomon.search_scope_length l
             set versions = l.versions + d.versions, words = l.words + d.words
             where l.tenant_id = d.tenant_id and l.scope = d.scope
               and l.versions + d.versions > 0;
-          if not found then
+          if not found and d.versions > 0 then
+            insert into gnomon.search_scope_length as l (tenant_id, scope, versions, words)
+              values (d.tenant_id, d.scope, d.versions, d.words)
+              on conflict (tenant_id, scope)
+                do update set versions = l.versions + excluded.versions,
+                              words = l.words + excluded.words;
+          elsif not found then
             delete from gnomon.search_scope_length l
               where l.tenant_id = d.tenant_id and l.scope = d.scope;
           end if;

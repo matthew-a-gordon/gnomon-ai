@@ -295,8 +295,21 @@ impl World {
         )
         .await
         .unwrap();
-        let id: Uuid = tx
-            .query_typed(
+        let node = self.create_node_in_tx(&tx, scope, kind).await;
+        tx.commit().await.unwrap();
+        node
+    }
+
+    /// Creates a Node that no Episode describes, so with no Version, in a
+    /// transaction whose claims allow `scope`.
+    pub async fn create_node_in_tx(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        scope: &str,
+        kind: &str,
+    ) -> NodeId {
+        NodeId(
+            tx.query_typed(
                 "select gnomon.create_node($1, $2, $3)",
                 &[
                     (&self.tenant.0, Type::UUID),
@@ -306,9 +319,8 @@ impl World {
             )
             .await
             .unwrap()[0]
-            .get(0);
-        tx.commit().await.unwrap();
-        NodeId(id)
+                .get(0),
+        )
     }
 
     pub async fn erase_node(&self, node: NodeId) -> GraphErasure {
@@ -843,9 +855,9 @@ async fn assert_tokens_derived_anew(admin: &Client, residue: &Residue<'_>) {
 }
 
 /// Checks that the BM25 counts, read past RLS, are those the token rows give
-/// when counted again: each Scope's texts per word, and its texts and words.
-/// The texts are Versions' and, Summaries' and
-/// Communities'. No committed transaction leaves a change to them behind.
+/// when counted again: each Scope's texts per word, and its texts and words,
+/// counted separately for each Tenant's Scope. The texts are Versions',
+/// Summaries' and Communities'. No committed transaction leaves a change to them behind.
 pub async fn assert_search_counts_match_the_token_rows(admin: &Client) {
     let left: i64 = admin
         .query_typed("select count(*) from gnomon.search_count_delta", &[])
@@ -855,21 +867,24 @@ pub async fn assert_search_counts_match_the_token_rows(admin: &Client) {
     assert_eq!(left, 0, "committed changes to the counts are left");
     for (stored, recounted, what) in [
         (
-            "select scope, token, versions from gnomon.search_token_frequency",
-            "select scope, token, count(*)
-             from (select scope, token from gnomon.search_token
+            "select format('%s %s', tenant_id, scope), token, versions
+             from gnomon.search_token_frequency",
+            "select format('%s %s', tenant_id, scope), token, count(*)
+             from (select tenant_id, scope, token from gnomon.search_token
                    union all
-                   select scope, token from gnomon.derived_search_token) t
-             group by 1, 2",
+                   select tenant_id, scope, token from gnomon.derived_search_token) t
+             group by tenant_id, scope, token",
             "the document frequencies",
         ),
         (
-            "select scope, versions::text, words from gnomon.search_scope_length",
-            "select scope, count(*)::text, sum(dl)::bigint
-             from (select distinct scope, version_id, dl from gnomon.search_token
+            "select format('%s %s', tenant_id, scope), versions::text, words
+             from gnomon.search_scope_length",
+            "select format('%s %s', tenant_id, scope), count(*)::text, sum(dl)::bigint
+             from (select distinct tenant_id, scope, version_id, dl from gnomon.search_token
                    union all
-                   select distinct scope, derived_id, dl from gnomon.derived_search_token) d
-             group by 1",
+                   select distinct tenant_id, scope, derived_id, dl
+                   from gnomon.derived_search_token) d
+             group by tenant_id, scope",
             "the Scope totals",
         ),
     ] {
