@@ -1,9 +1,11 @@
 //! A pass-through TCP proxy that records what a client sends Postgres.
 //!
-//! It parses only the frontend side of the wire protocol, and only enough to
-//! log each simple Query and each Parse with its statement name. That lets a
-//! test check, from outside the Store, which statements reach the server and
-//! whether any of them is named, as a transaction-mode pooler would see them.
+//! It parses only the frontend side of the wire protocol. It logs each simple
+//! Query and each Parse with its statement name. That lets a test check, from
+//! outside the Store, which statements reach the server and whether any of
+//! them is named, as a transaction-mode pooler would see them. It also keeps
+//! each message's bytes, so [`WireLog::replayable_since`] can read the
+//! parameters too and give back what the client sent, to send again.
 //! Every byte is forwarded unchanged. It keeps each connection's messages
 //! apart, and [`WireLog::cut_open_connections`] makes every connection open
 //! at that moment close, unseen by the client, when the client next sends
@@ -26,6 +28,21 @@ pub enum Sent {
     Other(u8),
 }
 
+/// A statement the client sent, with what it takes to send it again.
+#[derive(Debug, Clone)]
+pub enum Replayable {
+    /// A simple-protocol Query.
+    Simple(String),
+    /// An extended-protocol statement: its Parse and the Bind after it.
+    Extended {
+        sql: String,
+        /// The parameters' type OIDs.
+        types: Vec<u32>,
+        /// Each parameter in the binary format, `None` for null.
+        params: Vec<Option<Vec<u8>>>,
+    },
+}
+
 #[derive(Clone, Default)]
 pub struct WireLog(Arc<Mutex<Log>>, Arc<tokio::sync::Notify>);
 
@@ -34,6 +51,8 @@ struct Log {
     /// Every message in the order the proxy saw it, with the number of the
     /// connection it came on.
     sent: Vec<(usize, Sent)>,
+    /// Each message's body, in the same order.
+    bodies: Vec<Vec<u8>>,
     /// How many connections the proxy has accepted.
     connections: usize,
     /// Connections numbered below this close on their next message.
@@ -50,6 +69,50 @@ impl WireLog {
             .iter()
             .map(|(_, m)| m.clone())
             .collect()
+    }
+
+    /// The statements among the messages after the first `from`, in order.
+    /// It suits a client that used one connection meanwhile, and sends its
+    /// parameters in the binary format, as `tokio-postgres` does.
+    pub fn replayable_since(&self, from: usize) -> Vec<Replayable> {
+        let log = self.0.lock().unwrap();
+        let mut out = vec![];
+        // The SQL and parameter types of the last Parse, until its Bind.
+        let mut parsed = None;
+        for ((_, message), body) in log.sent.iter().zip(&log.bodies).skip(from) {
+            match message {
+                Sent::Query(sql) => out.push(Replayable::Simple(sql.clone())),
+                Sent::Parse { sql, .. } => {
+                    // The name and the SQL, then the parameter types.
+                    let mut rest = Body(body);
+                    rest.cstring();
+                    rest.cstring();
+                    let types = (0..rest.u16()).map(|_| rest.u32()).collect();
+                    parsed = Some((sql.clone(), types));
+                }
+                Sent::Other(b'B') => {
+                    let (sql, types) = parsed.take().expect("a Parse before its Bind");
+                    // The portal and statement names, then the parameters'
+                    // formats.
+                    let mut rest = Body(body);
+                    rest.cstring();
+                    rest.cstring();
+                    for _ in 0..rest.u16() {
+                        assert_eq!(rest.u16(), 1, "a parameter in the text format");
+                    }
+                    let params = (0..rest.u16())
+                        .map(|_| {
+                            // A length of -1 is a null.
+                            let len = rest.u32() as i32;
+                            usize::try_from(len).ok().map(|n| rest.take(n).to_vec())
+                        })
+                        .collect();
+                    out.push(Replayable::Extended { sql, types, params });
+                }
+                Sent::Other(_) => {}
+            }
+        }
+        out
     }
 
     /// Each connection's messages, in the order the connections were
@@ -99,10 +162,11 @@ impl WireLog {
     }
 
     /// Logs a message, and says whether its connection is cut.
-    fn push(&self, connection: usize, m: Sent) -> bool {
+    fn push(&self, connection: usize, m: Sent, body: &[u8]) -> bool {
         let cut = {
             let mut log = self.0.lock().unwrap();
             log.sent.push((connection, m));
+            log.bodies.push(body.to_vec());
             connection < log.cut_below
         };
         self.1.notify_waiters();
@@ -147,7 +211,7 @@ async fn relay(
             let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
             let mut body = vec![0u8; len - 4];
             client_read.read_exact(&mut body).await?;
-            if log.push(connection, parse(header[0], &body)) {
+            if log.push(connection, parse(header[0], &body), &body) {
                 // Cut: both sockets close when the relay returns.
                 return Ok(());
             }
@@ -187,6 +251,31 @@ async fn startup(
         if code != SSL_REQUEST && code != GSSENC_REQUEST {
             return Ok(());
         }
+    }
+}
+
+/// The part of a message's body not yet read.
+struct Body<'a>(&'a [u8]);
+
+impl<'a> Body<'a> {
+    fn take(&mut self, n: usize) -> &'a [u8] {
+        let (taken, rest) = self.0.split_at(n);
+        self.0 = rest;
+        taken
+    }
+
+    fn u16(&mut self) -> u16 {
+        u16::from_be_bytes(self.take(2).try_into().unwrap())
+    }
+
+    fn u32(&mut self) -> u32 {
+        u32::from_be_bytes(self.take(4).try_into().unwrap())
+    }
+
+    /// Skips a string and its terminating zero.
+    fn cstring(&mut self) {
+        let end = self.0.iter().position(|&c| c == 0).expect("a terminator");
+        self.take(end + 1);
     }
 }
 

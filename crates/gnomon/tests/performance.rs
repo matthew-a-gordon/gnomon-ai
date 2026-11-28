@@ -12,9 +12,10 @@
 //! container capped at 4 GiB.
 //!
 //! Each case writes its environment, the machine load around it and its
-//! numbers to `target/tmp/performance/` and prints a summary. A run on a busy
-//! machine says so. The cases take a lock, so they never overlap even when
-//! the test runner runs tests in parallel.
+//! numbers to `target/tmp/performance/` and prints a summary. A Search case
+//! also saves the query plans of one call of each class, taken after the last
+//! timed call (#124). A run on a busy machine says so. The cases take a lock,
+//! so they never overlap even when the test runner runs tests in parallel.
 
 mod support;
 
@@ -51,6 +52,23 @@ const COMMON_WORD_SAMPLES: usize = 50;
 /// panics releases it, and the next one still runs.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::const_new(());
 
+/// Saves the plans of one fused Search of `class` in the record.
+async fn take_search_plans(
+    written: &mut perf::Written,
+    data: &Dataset,
+    class: &str,
+    request: &SearchRequest<'_>,
+) {
+    written
+        .take_plans(class, request.text, async |store| {
+            data.worker(store)
+                .search(data.tenant(), request, 10)
+                .await
+                .unwrap();
+        })
+        .await;
+}
+
 async fn fused_search_case(case: &str, visible_target: usize, budget_ms: f64) {
     let _one = ONE_AT_A_TIME.lock().await;
     let data = Dataset::get(perf::texts_for_visible(visible_target), Vocabulary::Numbers).await;
@@ -66,7 +84,7 @@ async fn fused_search_case(case: &str, visible_target: usize, budget_ms: f64) {
         data.visible
     );
     let store = data.store().await;
-    let caller = store.as_worker(data.tenant(), Scope::new(perf::SCOPE), None);
+    let caller = data.worker(&store);
     let centres = data.centres().await;
     let mut rng = Rng::new(21);
     let record = Record::start(case, &data.db).await;
@@ -128,7 +146,7 @@ async fn fused_search_case(case: &str, visible_target: usize, budget_ms: f64) {
     }
     let stats = Stats::of(&times);
     let common = Stats::of(&common_times);
-    let loaded = record.finish(json!({
+    let mut written = record.finish(json!({
         "visible_rows": data.visible,
         "versions": data.versions,
         "texts": data.texts,
@@ -142,6 +160,13 @@ async fn fused_search_case(case: &str, visible_target: usize, budget_ms: f64) {
         "common_word_fused_search": common.to_json(),
         "common_word_full_text_branch_alone": Stats::of(&common_text_times).to_json(),
     }));
+    // The plans of one call of each class, after the last timed call.
+    let (word, q) = data.query_for(&mut rng, &centres);
+    for (class, text) in [("number word", word.as_str()), ("common word", COMMON_WORD)] {
+        let request = SearchRequest::text(text, current).with_embedding(&q);
+        take_search_plans(&mut written, &data, class, &request).await;
+    }
+    let loaded = written.loaded;
     println!(
         "{case}: fused Search over {} visible rows: p50 {:.1} ms, p95 {:.1} ms, p99 {:.1} ms \
          (budget {budget_ms} ms at p95){}",
@@ -303,12 +328,15 @@ async fn word_frequency_case(
         words.commonest_share * 100.0
     );
     let store = data.store().await;
-    let caller = store.as_worker(data.tenant(), Scope::new(perf::SCOPE), None);
+    let caller = data.worker(&store);
     let centres = data.centres().await;
     let record = Record::start(case, &data.db).await;
     let current = AsOf::current(perf::valid_at());
     let tenant = data.tenant();
 
+    // The first query and mention of each class, to take their plans.
+    let mut searched = vec![];
+    let mut mentioned = vec![];
     let mut classes = vec![];
     let mut failures = vec![];
     for class in QueryClass::ALL {
@@ -375,6 +403,7 @@ async fn word_frequency_case(
             "budget_p95_ms": budget_ms,
             "budget_asserted": asserted,
         }));
+        searched.push((class.name(), queries[0].clone()));
     }
 
     // Resolution's full-text half: a mention of one word, with no embedding.
@@ -410,9 +439,10 @@ async fn word_frequency_case(
         );
         resolution.push(json!({ "class": class, "example_mention": mentions[0],
                                 "resolve": stats.to_json() }));
+        mentioned.push((class, mentions[0].clone()));
     }
 
-    let loaded = record.finish(json!({
+    let mut written = record.finish(json!({
         "visible_rows": data.visible,
         "versions": data.versions,
         "texts": data.texts,
@@ -423,6 +453,22 @@ async fn word_frequency_case(
         "search": classes,
         "resolution_full_text": resolution,
     }));
+    // The plans of one call of each class, after the last timed call.
+    for (class, (text, q)) in &searched {
+        let request = SearchRequest::text(text, current).with_embedding(q);
+        take_search_plans(&mut written, &data, class, &request).await;
+    }
+    for (class, mention) in &mentioned {
+        written
+            .take_plans(&format!("Resolution, {class}"), mention, async |store| {
+                data.worker(store)
+                    .resolve(tenant, &Mention::text(mention), 10)
+                    .await
+                    .unwrap();
+            })
+            .await;
+    }
+    let loaded = written.loaded;
     assert!(
         failures.is_empty(),
         "{}{}",
@@ -989,7 +1035,7 @@ async fn each_patch_write_meets_its_limit_and_costs_at_most_half_as_much_again_o
             "p50_ratio": l.p50 / s.p50,
         }));
     }
-    let loaded = record.finish(json!({
+    let written = record.finish(json!({
         "cells": cells,
         "unrelated_rows": unrelated.iter().map(|(t, n)| json!({ "table": t, "rows": n }))
             .collect::<Vec<_>>(),
@@ -997,7 +1043,7 @@ async fn each_patch_write_meets_its_limit_and_costs_at_most_half_as_much_again_o
         "warm_up_nodes_discarded": WARM_UP_NODES,
         "rewrites_discarded": REWRITE_WARM_UP,
     }));
-    let rerun = if loaded {
+    let rerun = if written.loaded {
         " (the machine was loaded: rerun when it is quieter)"
     } else {
         ""
