@@ -16,6 +16,7 @@
 //! `support/erasure.rs` then reads every table past RLS: no row names an
 //! Episode, Node, Edge or Version the Erasure removed, and the token and name
 //! rows of each Version it recomputed are those its text as it stands gives.
+//! The BM25 counts of every Scope must be those its token rows give.
 //! The expected number of disagreements is zero, and proptest shrinks a
 //! failing sequence to a short one.
 
@@ -30,7 +31,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 use serde_json::{Map, Value, json};
 use support::TestDb;
-use support::erasure::{Residue, assert_no_residue};
+use support::erasure::{Residue, assert_no_residue, assert_search_counts_match_the_token_rows};
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
@@ -82,6 +83,14 @@ struct EpisodeTraits {
     scope: usize,
     reference_day: u32,
     authority: i32,
+}
+
+fn traits(scope: usize, reference_day: u32, authority: i32) -> EpisodeTraits {
+    EpisodeTraits {
+        scope,
+        reference_day,
+        authority,
+    }
 }
 
 /// One write: the Node it writes and the Episode it cites, both by index, a
@@ -372,11 +381,6 @@ fn as_of_reads_after_every_erasure_agree_with_an_oracle_over_the_remaining_contr
 #[tokio::test]
 async fn erasing_an_episode_keeps_the_search_text_of_a_current_version_it_never_closed() {
     let (db, store, tenant) = setup().await;
-    let traits = |scope, reference_day, authority| EpisodeTraits {
-        scope,
-        reference_day,
-        authority,
-    };
     let case = Case {
         ranked: false,
         episodes: vec![
@@ -408,6 +412,48 @@ async fn erasing_an_episode_keeps_the_search_text_of_a_current_version_it_never_
             Erasure::Episode(2),
             Erasure::Episode(1),
             Erasure::Episode(0),
+        ],
+    };
+    let (wrong, _, ran) = check(&db, &store, tenant, &case).await;
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(ran, [4, 0, 0, 0]);
+}
+
+/// The case of issue #99, which the random sequences shrank to. One of its
+/// Erasures adds texts to the net count of the Scope `support` and removes
+/// words from it. The commit once proposed that net change as a new row of
+/// the Scope's totals, which the row's check refused although the row exists.
+#[tokio::test]
+async fn an_erasure_that_adds_texts_and_removes_words_commits() {
+    let (db, store, tenant) = setup().await;
+    let write = |episode, from, to, name, aliases| Write {
+        node: 1,
+        episode,
+        from,
+        to,
+        name,
+        aliases: Some(Some(aliases)),
+    };
+    let case = Case {
+        ranked: false,
+        episodes: vec![
+            traits(0, 3, 1),
+            traits(0, 3, 0),
+            traits(1, 3, 0),
+            traits(1, 2, 0),
+        ],
+        sequence: vec![
+            vec![write(0, None, None, None, "y")],
+            vec![
+                write(0, Some(6), Some(7), None, "x"),
+                write(1, Some(1), None, Some(Some("a")), "x"),
+            ],
+        ],
+        erasures: vec![
+            Erasure::Episode(1),
+            Erasure::Episode(0),
+            Erasure::Episode(3),
+            Erasure::Episode(2),
         ],
     };
     let (wrong, _, ran) = check(&db, &store, tenant, &case).await;
@@ -687,6 +733,7 @@ async fn check(
             }
         }
         assert_erasure_left_no_residue(db, tenant, &before, &recomputed_of).await;
+        assert_search_counts_match_the_token_rows(&db.admin().await).await;
         for (k, edge) in edges.iter().enumerate() {
             let expected = !erased.is_edge_erased(case, k);
             if exists(db, "edge", edge.0).await != expected {

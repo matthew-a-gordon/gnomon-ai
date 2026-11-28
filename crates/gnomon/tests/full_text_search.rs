@@ -771,32 +771,34 @@ async fn write_name(
     .await
 }
 
+/// Returns once any backend of the test's database waits on a lock.
+async fn a_backend_waits_on_a_lock(admin: &Client) {
+    loop {
+        let waiting: i64 = admin
+            .query_typed(
+                "select count(*) from pg_stat_activity
+                 where datname = current_database() and wait_event_type = 'Lock'",
+                &[],
+            )
+            .await
+            .unwrap()[0]
+            .get(0);
+        if waiting > 0 {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Runs `statement` and fails as soon as any backend of the test's database
 /// waits on a lock, as the stage tests watch a claim. It asserts no timing.
 async fn without_waiting<T>(
     admin: &Client,
     statement: impl std::future::Future<Output = Result<T, tokio_postgres::Error>>,
 ) -> T {
-    let watch = async {
-        loop {
-            let waiting: i64 = admin
-                .query_typed(
-                    "select count(*) from pg_stat_activity
-                     where datname = current_database() and wait_event_type = 'Lock'",
-                    &[],
-                )
-                .await
-                .unwrap()[0]
-                .get(0);
-            if waiting > 0 {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    };
     tokio::select! {
         done = statement => done.expect("the write succeeds"),
-        _ = watch => panic!("a writer waited on another writer's lock"),
+        _ = a_backend_waits_on_a_lock(admin) => panic!("a writer waited on another writer's lock"),
     }
 }
 
@@ -834,4 +836,146 @@ async fn two_writers_of_several_statements_in_one_scope_never_wait_on_each_other
     assert_eq!(found(&caller, &w, "krypton", now()).await.len(), 2);
     assert_eq!(found(&caller, &w, "xenon", now()).await.len(), 2);
     assert_eq!(found(&caller, &w, "seed", now()).await, vec![]);
+}
+
+/// Stores `old` as the Sentence of an Edge Version between "Ada" and "Acme".
+/// Then, in one transaction, replaces it with the one word "partner" and
+/// names a new Node "Globex", and expects the commit to leave the Scope four
+/// texts of one word each.
+async fn replace_a_sentence_and_name_a_new_node(old: &str) {
+    let w = World::new().await;
+    let e = w.episode(at(2024, 1, 1), None).await;
+    let ada = w
+        .node("account", e, ValidTime::UNKNOWN, json!({ "name": "Ada" }))
+        .await;
+    let acme = w
+        .node("company", e, ValidTime::UNKNOWN, json!({ "name": "Acme" }))
+        .await;
+    let owns = w.edge_in(SCOPE, ada, acme, e, json!({ "share": 7 })).await;
+    let version = w.versions_of(&[owns.0]).await[0];
+    w.store_sentence_in(SCOPE, version, old).await;
+
+    let mut client = w.db.login().await;
+    let tx = w.raw(&mut client).await;
+    tx.execute_typed(
+        "select gnomon.store_sentence($1, $2, 'partner')",
+        &[(&w.tenant.0, Type::UUID), (&version, Type::UUID)],
+    )
+    .await
+    .unwrap();
+    let globex = w.create_node_in_tx(&tx, SCOPE, "company").await;
+    write_name(&tx, &w, e, globex, "Globex").await.unwrap();
+    tx.commit().await.unwrap();
+
+    let admin = w.db.admin().await;
+    assert_eq!(counts(&admin).await.1, vec![format!("{SCOPE} 4 4")]);
+    assert_search_counts_match_the_token_rows(&admin).await;
+}
+
+#[tokio::test]
+async fn a_transaction_that_adds_a_text_and_removes_words_commits() {
+    replace_a_sentence_and_name_a_new_node("Ada holds seven percent of Acme").await;
+}
+
+#[tokio::test]
+async fn a_transaction_that_adds_a_text_and_no_words_commits() {
+    replace_a_sentence_and_name_a_new_node("Ada owns").await;
+}
+
+#[tokio::test]
+async fn two_first_writes_to_a_scope_both_commit_and_its_totals_are_exact() {
+    // Neither transaction sees a totals row of the Scope, so each inserts
+    // one. The first applies its counts early and stays open. The second then
+    // commits: its insert meets the first's uncommitted row, waits for it and
+    // adds to it. The two share no word, so no word's row makes the second
+    // wait before it reaches the totals.
+    let w = World::new().await;
+    let e = w.episode(at(2024, 1, 1), None).await;
+    let admin = w.db.admin().await;
+    assert_eq!(counts(&admin).await.1, Vec::<String>::new());
+
+    let mut c1 = w.db.login().await;
+    let mut c2 = w.db.login().await;
+    let t1 = w.raw(&mut c1).await;
+    let t2 = w.raw(&mut c2).await;
+    let n1 = w.create_node_in_tx(&t1, SCOPE, "company").await;
+    let n2 = w.create_node_in_tx(&t2, SCOPE, "company").await;
+    write_name(&t1, &w, e, n1, "xenon").await.unwrap();
+    write_name(&t2, &w, e, n2, "yttrium argon").await.unwrap();
+    t1.batch_execute("set constraints gnomon.search_count_delta_apply immediate")
+        .await
+        .unwrap();
+
+    let second = t2.commit();
+    tokio::pin!(second);
+    tokio::select! {
+        _ = &mut second => panic!("the second writer did not wait for the first's totals row"),
+        () = a_backend_waits_on_a_lock(&admin) => {}
+    }
+    t1.commit().await.unwrap();
+    second.await.unwrap();
+
+    assert_eq!(counts(&admin).await.1, vec![format!("{SCOPE} 2 3")]);
+    assert_search_counts_match_the_token_rows(&admin).await;
+}
+
+/// Erases the one Episode behind the Scope's only text, "xenon", while
+/// another transaction, which names a new Node `name`, has applied its counts
+/// and not committed. Expects the Erasure to wait for that transaction and to
+/// leave its text alone counted, a text of two words.
+async fn erase_the_only_text_during_a_write(name: &str) {
+    let w = World::new().await;
+    let erased = w.episode(at(2024, 1, 1), None).await;
+    let kept = w.episode(at(2024, 2, 1), None).await;
+    w.node(
+        "company",
+        erased,
+        ValidTime::UNKNOWN,
+        json!({ "name": "xenon" }),
+    )
+    .await;
+    let admin = w.db.admin().await;
+
+    let mut c1 = w.db.login().await;
+    let mut c2 = w.db.login().await;
+    let erasure = w.raw(&mut c1).await;
+    let writer = w.raw(&mut c2).await;
+    erasure
+        .query_typed(
+            "select gnomon.erase_episode($1, $2)",
+            &[(&w.tenant.0, Type::UUID), (&erased.0, Type::UUID)],
+        )
+        .await
+        .unwrap();
+    let node = w.create_node_in_tx(&writer, SCOPE, "company").await;
+    write_name(&writer, &w, kept, node, name).await.unwrap();
+    writer
+        .batch_execute("set constraints gnomon.search_count_delta_apply immediate")
+        .await
+        .unwrap();
+
+    let commit = erasure.commit();
+    tokio::pin!(commit);
+    tokio::select! {
+        _ = &mut commit => panic!("the Erasure did not wait for the writer's counts"),
+        () = a_backend_waits_on_a_lock(&admin) => {}
+    }
+    writer.commit().await.unwrap();
+    commit.await.unwrap();
+
+    assert_eq!(counts(&admin).await.1, vec![format!("{SCOPE} 1 2")]);
+    assert_search_counts_match_the_token_rows(&admin).await;
+}
+
+#[tokio::test]
+async fn erasing_a_scopes_only_text_keeps_the_totals_of_a_concurrent_write() {
+    // The two texts share no word, so no word's row makes the Erasure wait
+    // before it reaches the totals.
+    erase_the_only_text_during_a_write("yttrium argon").await;
+}
+
+#[tokio::test]
+async fn erasing_a_words_only_text_keeps_the_count_of_a_concurrent_write() {
+    // Both texts say "xenon", so the Erasure waits at that word's row.
+    erase_the_only_text_during_a_write("xenon argon").await;
 }
