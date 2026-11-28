@@ -21,6 +21,7 @@ pub mod alembic;
 pub mod erasure;
 pub mod install;
 pub mod perf;
+pub mod plans;
 pub mod server;
 #[path = "../../src/timestamptz.rs"]
 pub mod timestamptz;

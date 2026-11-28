@@ -12,6 +12,8 @@
 //! stops itself: a watcher inside it shuts Postgres down once no client has
 //! been connected for `IDLE_SECONDS`, which happens soon after the last test
 //! process exits, whether the run passed, failed or was killed.
+//! `GNOMON_TEST_IDLE_SECONDS` overrides that time for a container the harness
+//! creates, to keep its databases for a look afterwards.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -26,13 +28,15 @@ use tokio::sync::OnceCell;
 use tokio_postgres::config::Host;
 use tokio_postgres::{Config, NoTls};
 
-/// Seconds with no client connected after which the container stops.
+/// Seconds with no client connected after which the container stops, unless
+/// `GNOMON_TEST_IDLE_SECONDS` says otherwise.
 const IDLE_SECONDS: u32 = 30;
 const PASSWORD: &str = "gnomon-test";
 
 /// Starts Postgres through the image's own entrypoint, then watches for
 /// clients and stops Postgres when none has been connected for a while.
-/// Before the first client it waits up to ten minutes.
+/// Before the first client it waits ten minutes, or the idle time if that is
+/// longer.
 const WRAPPER: &str = r#"
 set -u
 docker-entrypoint.sh "$@" &
@@ -47,7 +51,7 @@ while kill -0 "$pg" 2>/dev/null; do
     2>/dev/null) || continue
   if [ "$n" -gt 0 ]; then seen=1; idle=0; else idle=$((idle + 1)); fi
   limit=$GNOMON_IDLE_SECONDS
-  [ "$seen" = 1 ] || limit=600
+  if [ "$seen" = 0 ] && [ "$limit" -lt 600 ]; then limit=600; fi
   if [ "$idle" -ge "$limit" ]; then kill -INT "$pg"; break; fi
 done
 wait "$pg"
@@ -301,7 +305,7 @@ async fn start_container(image: &TestImage, prefix: &str, container_name: &str) 
         .with_cmd(cmd)
         .with_env_var("POSTGRES_PASSWORD", PASSWORD)
         .with_env_var("GNOMON_ADMIN", image.admin)
-        .with_env_var("GNOMON_IDLE_SECONDS", IDLE_SECONDS.to_string())
+        .with_env_var("GNOMON_IDLE_SECONDS", idle_seconds().to_string())
         .with_container_name(container_name)
         .with_label("gnomon.test-db", prefix)
         .with_startup_timeout(Duration::from_secs(180))
@@ -340,6 +344,19 @@ async fn start_container(image: &TestImage, prefix: &str, container_name: &str) 
         .get_host_port_ipv4(5432.tcp())
         .await
         .expect("the container publishes 5432")
+}
+
+/// The seconds a new container waits with no client before it stops:
+/// `GNOMON_TEST_IDLE_SECONDS`, or [`IDLE_SECONDS`].
+fn idle_seconds() -> u32 {
+    let Some(set) = env("GNOMON_TEST_IDLE_SECONDS") else {
+        return IDLE_SECONDS;
+    };
+    match set.parse() {
+        // At 0 the watcher would stop a server that has a client.
+        Ok(seconds) if seconds > 0 => seconds,
+        _ => panic!("GNOMON_TEST_IDLE_SECONDS={set:?} is not a whole number of seconds above 0"),
+    }
 }
 
 /// A size such as `4g`, `512m` or a plain number of bytes.

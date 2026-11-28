@@ -10,7 +10,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -18,7 +18,7 @@ use tokio_postgres::types::Type;
 
 use super::timestamptz::Timestamptz;
 use super::vectors::Rng;
-use super::{DEFAULT_DIMENSION, Server, TestDb};
+use super::{DEFAULT_DIMENSION, Server, TestDb, plans};
 
 /// The Scope the data set lives in.
 pub const SCOPE: &str = "perf";
@@ -110,9 +110,19 @@ pub fn loaded(before: &Load, after: &Load) -> bool {
 /// prints a summary.
 pub struct Record {
     case: String,
+    db: String,
     environment: Value,
     before: Load,
     started: std::time::Instant,
+}
+
+/// A record on disk, which takes the query plans of the case's calls.
+pub struct Written {
+    db: String,
+    record: Value,
+    pub path: PathBuf,
+    /// Whether the machine was loaded.
+    pub loaded: bool,
 }
 
 impl Record {
@@ -195,6 +205,7 @@ impl Record {
         });
         Record {
             case: case.to_owned(),
+            db: db.to_owned(),
             environment,
             before,
             started: std::time::Instant::now(),
@@ -202,8 +213,8 @@ impl Record {
     }
 
     /// Writes the record to `<target tmp>/performance/` and prints a
-    /// summary. Returns whether the machine was loaded.
-    pub fn finish(self, results: Value) -> bool {
+    /// summary. A case calls it after its last timed call.
+    pub fn finish(self, results: Value) -> Written {
         let after = Load::now();
         let was_loaded = loaded(&self.before, &after);
         let record = json!({
@@ -226,7 +237,7 @@ impl Record {
             .unwrap()
             .replace(['/', ':'], "_");
         let path = dir.join(format!("{stamp}-{}-{image}-cap-{cap}.json", self.case));
-        std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+        write_record(&path, &record);
         println!("--- performance record: {}", self.case);
         println!(
             "environment: {}",
@@ -260,8 +271,43 @@ impl Record {
         }
         println!("results: {}", serde_json::to_string(&results).unwrap());
         println!("record written to {}", path.display());
-        was_loaded
+        Written {
+            db: self.db,
+            record,
+            path,
+            loaded: was_loaded,
+        }
     }
+}
+
+impl Written {
+    /// Takes the plans of one call of `class`, whose query text or mention is
+    /// `text`, on the case's database (see [`plans::of_call`]), and writes the
+    /// record again with them under `plans`. Taking them runs the call again,
+    /// which is why only a written record can: its numbers, machine load and
+    /// wall time are settled, and stay on disk if taking a plan fails.
+    pub async fn take_plans(
+        &mut self,
+        class: &str,
+        text: &str,
+        call: impl AsyncFnOnce(&gnomon::Store),
+    ) {
+        let statements = plans::of_call(&self.db, call).await;
+        println!(
+            "query plans of {class}: {} statements saved",
+            statements.len()
+        );
+        let entry = json!({ "class": class, "text": text, "statements": statements });
+        match self.record["plans"].as_array_mut() {
+            Some(saved) => saved.push(entry),
+            None => self.record["plans"] = json!([entry]),
+        }
+        write_record(&self.path, &self.record);
+    }
+}
+
+fn write_record(path: &Path, record: &Value) {
+    std::fs::write(path, serde_json::to_string_pretty(record).unwrap()).unwrap();
 }
 
 /// The words a data set's texts hold.
@@ -391,6 +437,11 @@ impl Dataset {
 
     pub fn tenant(&self) -> gnomon::TenantId {
         data_tenant()
+    }
+
+    /// The caller the cases search as: a worker of the data set's Scope.
+    pub fn worker<'s>(&self, store: &'s gnomon::Store) -> gnomon::Caller<'s> {
+        store.as_worker(self.tenant(), gnomon::Scope::new(SCOPE), None)
     }
 
     /// The subtopic centres of the data set, to draw query vectors near.
